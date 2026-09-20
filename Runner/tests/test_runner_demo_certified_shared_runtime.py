@@ -25,20 +25,11 @@ def test_runner_demo_runtime_sources_avoid_process_and_module_state() -> None:
     for source_path in RUNTIME_SOURCES:
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         module_assignments = [
-            node
-            for node in tree.body
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            node for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
         ]
         imported_roots = {
-            alias.name.split(".", 1)[0]
-            for node in tree.body
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        } | {
-            node.module.split(".", 1)[0]
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
+            alias.name.split(".", 1)[0] for node in tree.body if isinstance(node, ast.Import) for alias in node.names
+        } | {node.module.split(".", 1)[0] for node in tree.body if isinstance(node, ast.ImportFrom) and node.module}
 
         assert not module_assignments, source_path
         assert not (imported_roots & forbidden_imports), source_path
