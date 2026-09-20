@@ -1,17 +1,17 @@
 """Exercise RunnerDemo dependency admission with the real installed Runtime SDK."""
+
 from __future__ import annotations
 
 import hashlib
 import importlib.metadata
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import yaml
 from langbot_plugin.runtime.plugin.artifact import PluginArtifact
 from langbot_plugin.runtime.plugin.dependency_environment import PluginDependencyEnvironmentStore
-
 
 ROOT = Path(__file__).resolve().parents[1] / "RunnerDemo"
 
@@ -34,7 +34,9 @@ class RunnerDemoDependencyAdmissionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(requirements), [], "SDK must be runtime-provided, not separately installed")
 
             try:
-                ready = await store.prepare(artifact, runtime_fingerprint="test-sdk-" + sdk_version, installer=installer)
+                ready = await store.prepare(
+                    artifact, runtime_fingerprint="test-sdk-" + sdk_version, installer=installer
+                )
                 self.assertEqual(observed, [[]])
                 self.assertEqual(ready.artifact_digest, digest)
                 self.assertIsNotNone(store.get_ready(ready.digest))
