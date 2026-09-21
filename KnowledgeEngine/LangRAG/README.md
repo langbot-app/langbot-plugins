@@ -49,6 +49,14 @@ LangRAG now prefers parser output provided by LangBot Host:
 
 This means LangRAG works best when paired with an external parser plugin.
 
+Parsed-input admission is capped at **4 MiB of UTF-8 bytes**, inclusive: both
+flat text and the aggregate content of all sections must independently fit this
+budget. These alternative representations are not added together. The check runs
+after parsing, before any strategy chunking/offload, LLM, embedding, or vector
+work, for `chunk`, `parent_child`, and `qa`. Over-budget ingestion returns a failed
+result without processing partial sections. This is an input-content limit, not
+a bound on generated Q&A, metadata, or total runtime memory.
+
 ## Configuration
 
 ### Knowledge Base Creation

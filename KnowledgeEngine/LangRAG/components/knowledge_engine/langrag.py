@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterable
 from components.shared_state import SerialState, serialized
 
 from langbot_plugin.api.definition.components.knowledge_engine import (
@@ -27,6 +28,19 @@ logger = logging.getLogger(__name__)
 # Larger batches = fewer round-trips.  Keep under ~64 to avoid IPC response
 # timeouts.
 EMBEDDING_BATCH_SIZE = 32
+PARSED_TEXT_LIMIT_BYTES = 4 * 1024 * 1024
+
+
+def _validate_parsed_text_budget(parts: Iterable[str]) -> None:
+    """Bound aggregate UTF-8 content before strategy work, without joining it."""
+    total_bytes = 0
+    for text in parts:
+        # Encode bounded slices so even a rejected input cannot require a
+        # second, arbitrarily large allocation just to measure its byte size.
+        for offset in range(0, len(text), 64 * 1024):
+            total_bytes += len(text[offset:offset + 64 * 1024].encode("utf-8"))
+            if total_bytes > PARSED_TEXT_LIMIT_BYTES:
+                raise ValueError("Parsed text exceeds the 4 MiB UTF-8 byte limit")
 
 
 def _query_log_ref(query: str | None) -> str:
@@ -380,8 +394,11 @@ class LangRAG(KnowledgeEngine):
                     telemetry.elapsed_ms(stage_started),
                 )
 
-            if text_content and len(text_content) > 4 * 1024 * 1024:
-                raise ValueError("Parsed text exceeds the 4 MiB limit")
+            # Bound both representations independently: strategies consume the
+            # sections when present, not necessarily the parser's flat text.
+            _validate_parsed_text_budget((text_content or "",))
+            if sections:
+                _validate_parsed_text_budget(section.content for section in sections)
             telemetry_text_length = len(text_content) if text_content else 0
             telemetry_content_hash = hash_text(text_content)
 

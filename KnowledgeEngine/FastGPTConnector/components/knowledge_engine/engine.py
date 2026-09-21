@@ -97,7 +97,11 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 response.raise_for_status()
                 result = response.json()
 
-                for record in result.get("data", []):
+                if result.get("code", 200) != 200:
+                    raise ValueError("FastGPT search returned an unsuccessful response")
+                data = result.get("data", [])
+                records = data.get("list", []) if isinstance(data, dict) else data
+                for record in records:
                     content_parts = []
                     if record.get("q"):
                         content_parts.append(record["q"])
@@ -106,6 +110,11 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                     content_text = "\n".join(content_parts) if content_parts else ""
 
                     score = record.get("score")
+                    if isinstance(score, list):
+                        # Current FastGPT returns typed scores; older versions
+                        # returned a scalar. Prefer the final reranker when present.
+                        typed_scores = {item.get("type"): item.get("value") for item in score if isinstance(item, dict)}
+                        score = next((typed_scores[k] for k in ("rerank", "embedding", "fullText") if typed_scores.get(k) is not None), 0.0)
                     if score is None:
                         score = 0.0
 
@@ -240,16 +249,12 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             return False
 
         url = f"{api_base_url}/api/core/dataset/collection/delete"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {"collectionId": document_id}
+        headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
             async with self.http_client() as client:
-                response = await client.post(
-                    url, json=payload, headers=headers, timeout=30.0
+                response = await client.delete(
+                    url, params={"id": document_id}, headers=headers, timeout=30.0
                 )
                 response.raise_for_status()
                 result = response.json()
