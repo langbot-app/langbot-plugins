@@ -1,4 +1,5 @@
 import logging
+from components.shared_state import SerialState, serialized
 
 from langbot_plugin.api.definition.components.knowledge_engine import (
     KnowledgeEngine,
@@ -57,6 +58,10 @@ class LangRAG(KnowledgeEngine):
     - Full integration with Host's embedding models and vector database
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._state = SerialState()
+
     @classmethod
     def get_capabilities(cls) -> list[str]:
         """Declare supported capabilities."""
@@ -68,7 +73,7 @@ class LangRAG(KnowledgeEngine):
     # ========== Lifecycle Hooks ==========
 
     async def on_knowledge_base_create(self, kb_id: str, config: dict) -> None:
-        logger.info(f"Knowledge base created: {kb_id} with config: {config}")
+        logger.info(f"Knowledge base created: {kb_id}")
 
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
         logger.info(f"Knowledge base deleted: {kb_id}")
@@ -89,6 +94,7 @@ class LangRAG(KnowledgeEngine):
 
         Returns the number of vectors stored.
         """
+        telemetry = self.plugin.telemetry
         started_at = telemetry.start_timer()
         status = "failed"
         error = None
@@ -109,13 +115,18 @@ class LangRAG(KnowledgeEngine):
                     stage_durations["embedding"],
                 )
             stage_started = telemetry.start_timer()
-            await self.plugin.vector_upsert(
-                collection_id=collection_id,
-                vectors=vectors,
-                ids=ids,
-                metadata=metas,
-                documents=texts,
-            )
+            try:
+                await self.plugin.vector_upsert(
+                    collection_id=collection_id,
+                    vectors=vectors,
+                    ids=ids,
+                    metadata=metas,
+                    documents=texts,
+                )
+            except BaseException:
+                # Remote mutation may have committed after a transport timeout.
+                self._state.fenced = True
+                raise
             add_stage_duration(
                 stage_durations,
                 "vector_upsert",
@@ -134,7 +145,7 @@ class LangRAG(KnowledgeEngine):
             error = e
             raise
         finally:
-            telemetry.record_embedding_batch(
+            await telemetry.record_embedding_batch(
                 collection_id=collection_id,
                 ids=ids,
                 metas=metas,
@@ -267,6 +278,7 @@ class LangRAG(KnowledgeEngine):
 
     # ========== Core Methods ==========
 
+    @serialized
     async def ingest(self, context: IngestionContext) -> IngestionResult:
         """Handle document ingestion: Read -> Parse -> Chunk -> Embed -> Store.
 
@@ -274,6 +286,7 @@ class LangRAG(KnowledgeEngine):
         incrementally, and each batch is embedded and upserted as soon as it
         is ready.  This ensures partial results are persisted early.
         """
+        telemetry = self.plugin.telemetry
         started_at = telemetry.start_timer()
         trace_id = telemetry.new_trace_id("ingest")
         stage_durations: dict[str, float] = {}
@@ -358,7 +371,7 @@ class LangRAG(KnowledgeEngine):
                         status=DocumentStatus.FAILED,
                         error_message=f"Could not read file: {e}",
                     )
-                parser = FileParser()
+                parser = FileParser(self.plugin.offload)
                 stage_started = telemetry.start_timer()
                 text_content = await parser.parse(content_bytes, filename)
                 add_stage_duration(
@@ -367,6 +380,8 @@ class LangRAG(KnowledgeEngine):
                     telemetry.elapsed_ms(stage_started),
                 )
 
+            if text_content and len(text_content) > 4 * 1024 * 1024:
+                raise ValueError("Parsed text exceeds the 4 MiB limit")
             telemetry_text_length = len(text_content) if text_content else 0
             telemetry_content_hash = hash_text(text_content)
 
@@ -468,7 +483,7 @@ class LangRAG(KnowledgeEngine):
                 error_message=str(e),
             )
         finally:
-            telemetry.record_ingest(
+            await telemetry.record_ingest(
                 document_id=doc_id,
                 filename=filename,
                 collection_id=collection_id,
@@ -491,6 +506,7 @@ class LangRAG(KnowledgeEngine):
 
     async def retrieve(self, context: RetrievalContext) -> RetrievalResponse:
         """Retrieve relevant content with support for vector, full-text, and hybrid search."""
+        telemetry = self.plugin.telemetry
         started_at = telemetry.start_timer()
         trace_id = telemetry.new_trace_id("retrieval")
         stage_durations: dict[str, float] = {}
@@ -811,7 +827,7 @@ class LangRAG(KnowledgeEngine):
             telemetry_status = "failed"
             raise
         finally:
-            telemetry.record_retrieval(
+            await telemetry.record_retrieval(
                 query=query,
                 collection_id=collection_id,
                 status=telemetry_status,
@@ -840,8 +856,10 @@ class LangRAG(KnowledgeEngine):
                 error=telemetry_error,
             )
 
+    @serialized
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a document's vectors by file_id."""
+        telemetry = self.plugin.telemetry
         started_at = telemetry.start_timer()
         trace_id = telemetry.new_trace_id("delete")
         status = "failed"
@@ -849,10 +867,14 @@ class LangRAG(KnowledgeEngine):
         deleted = None
         count = None
         try:
-            count = await self.plugin.vector_delete(
-                collection_id=kb_id,
-                file_ids=[document_id],
-            )
+            try:
+                count = await self.plugin.vector_delete(
+                    collection_id=kb_id,
+                    file_ids=[document_id],
+                )
+            except BaseException:
+                self._state.fenced = True
+                raise
             deleted = count > 0
             status = "completed"
             return deleted
@@ -860,7 +882,7 @@ class LangRAG(KnowledgeEngine):
             error = e
             raise
         finally:
-            telemetry.record_delete(
+            await telemetry.record_delete(
                 collection_id=kb_id,
                 document_id=document_id,
                 status=status,

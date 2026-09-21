@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+
+from components.shared_state import ConfigStore, serialized
 
 import httpx
 
@@ -20,7 +21,7 @@ from langbot_plugin.api.entities.builtin.provider.message import ContentElement
 logger = logging.getLogger(__name__)
 
 
-class FastGPTConnector(KnowledgeEngine):
+class FastGPTConnector(ConfigStore, KnowledgeEngine):
     """Knowledge Engine powered by FastGPT Datasets.
 
     Supports retrieval via FastGPT's search API, document ingestion by
@@ -28,27 +29,23 @@ class FastGPTConnector(KnowledgeEngine):
     collections.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Cache of per-knowledge-base config for use in delete_document,
-        # keyed by kb_id.
-        self._kb_configs: dict[str, dict[str, Any]] = {}
-
     @classmethod
     def get_capabilities(cls) -> list[str]:
         return [KnowledgeEngineCapability.DOC_INGESTION, KnowledgeEngineCapability.DOC_PARSING]
 
     # ========== Lifecycle Hooks ==========
 
+    @serialized
     async def on_knowledge_base_create(self, kb_id: str, config: dict) -> None:
-        """Cache knowledge-base config so delete_document can look it up."""
+        """Persist knowledge-base config in installation-bound Host storage."""
         logger.info(f"[FastGPTKnowledgeEngine] Knowledge base created: {kb_id}")
-        self._kb_configs[kb_id] = config
+        await self._save_config(kb_id, config)
 
+    @serialized
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
-        """Remove cached config when a knowledge base is deleted."""
+        """Tombstone the stored config when a knowledge base is deleted."""
         logger.info(f"[FastGPTKnowledgeEngine] Knowledge base deleted: {kb_id}")
-        self._kb_configs.pop(kb_id, None)
+        await self._save_config(kb_id, None)
 
     async def retrieve(self, context: RetrievalContext) -> RetrievalResponse:
         """Execute retrieval against FastGPT Dataset API."""
@@ -95,7 +92,7 @@ class FastGPTConnector(KnowledgeEngine):
 
         results: list[RetrievalResultEntry] = []
         try:
-            async with httpx.AsyncClient() as client:
+            async with self.http_client() as client:
                 response = await client.post(url, json=payload, headers=headers, timeout=30.0)
                 response.raise_for_status()
                 result = response.json()
@@ -133,6 +130,7 @@ class FastGPTConnector(KnowledgeEngine):
 
         return RetrievalResponse(results=results, total_found=len(results))
 
+    @serialized
     async def ingest(self, context: IngestionContext) -> IngestionResult:
         """Upload a file to FastGPT dataset as a new collection."""
         doc_id = context.file_object.metadata.document_id
@@ -153,6 +151,8 @@ class FastGPTConnector(KnowledgeEngine):
                 status=DocumentStatus.FAILED,
                 error_message="Missing api_key or dataset_id in configuration.",
             )
+
+        await self._save_config(context.get_collection_id(), config)
 
         # 1. Read file content from Host
         try:
@@ -178,7 +178,7 @@ class FastGPTConnector(KnowledgeEngine):
         })
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with self.http_client() as client:
                 response = await client.post(
                     url,
                     headers=headers,
@@ -221,12 +221,13 @@ class FastGPTConnector(KnowledgeEngine):
                 error_message=str(e),
             )
 
+    @serialized
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a collection from FastGPT dataset."""
-        config = self._kb_configs.get(kb_id)
+        config = await self._load_config(kb_id)
         if not config:
             logger.error(
-                f"[FastGPTKnowledgeEngine] No cached config for kb_id={kb_id}. "
+                f"[FastGPTKnowledgeEngine] No stored config for kb_id={kb_id}. "
                 "Cannot delete document."
             )
             return False
@@ -235,7 +236,7 @@ class FastGPTConnector(KnowledgeEngine):
         api_key = config.get("api_key")
 
         if not api_key:
-            logger.error("[FastGPTKnowledgeEngine] Missing api_key in cached config.")
+            logger.error("[FastGPTKnowledgeEngine] Missing api_key in stored config.")
             return False
 
         url = f"{api_base_url}/api/core/dataset/collection/delete"
@@ -246,7 +247,7 @@ class FastGPTConnector(KnowledgeEngine):
         payload = {"collectionId": document_id}
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with self.http_client() as client:
                 response = await client.post(
                     url, json=payload, headers=headers, timeout=30.0
                 )
