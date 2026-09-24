@@ -57,7 +57,7 @@ This plugin uses the Dify Dataset API:
 - Document delete: `DELETE /v1/datasets/{dataset_id}/documents/{document_id}`
 - Documentation: https://docs.dify.ai/
 
-## Shared runtime (SDK 0.6.0b5)
+## Shared runtime (SDK 0.6.1)
 
 This version opts into `shared-runtime-v1`. Runtime admission still requires a
 valid Space-issued certificate; the source declaration alone is not certification.

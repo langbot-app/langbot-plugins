@@ -27,7 +27,7 @@ jobs:
       - name: Install released SDK and test dependencies
         run: |
           uv venv
-          uv pip install langbot-plugin==0.6.0b5 pytest pytest-asyncio \
+          uv pip install langbot-plugin==0.6.1 pytest pytest-asyncio \
             -r KnowledgeEngine/LangRAG/requirements.txt \
             -r KnowledgeEngine/DifyDatasetsConnector/requirements.txt \
             -r KnowledgeEngine/FastGPTConnector/requirements.txt \

@@ -85,7 +85,7 @@ RAGFlow employs a hybrid retrieval approach:
 
 The `vector_similarity_weight` parameter controls the balance between keyword and vector methods.
 
-## Shared runtime (SDK 0.6.0b5)
+## Shared runtime (SDK 0.6.1)
 
 This version opts into `shared-runtime-v1`. Runtime admission still requires a
 valid Space-issued certificate; the source declaration alone is not certification.
