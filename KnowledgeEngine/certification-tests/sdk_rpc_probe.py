@@ -32,7 +32,7 @@ sys.path.insert(0, str(CODE))
 
 
 async def main():
-    assert importlib.metadata.version('langbot-plugin') == '0.6.0b5'
+    assert importlib.metadata.version('langbot-plugin') == '0.6.1'
     before = {str(p.relative_to(CODE)): hashlib.sha256(p.read_bytes()).hexdigest() for p in CODE.rglob('*') if p.is_file()}
     discovery = ComponentDiscoveryEngine()
     manifest = discovery.load_component_manifest('manifest.yaml', no_save=True)
@@ -203,7 +203,7 @@ async def main():
             await retrieve(cb, 'B')
         after = {str(p.relative_to(CODE)): hashlib.sha256(p.read_bytes()).hexdigest() for p in CODE.rglob('*') if p.is_file()}
         assert before == after, 'Runtime wrote into shared artifact tree'
-        report = {'name': NAME, 'sdk': '0.6.0b5', 'artifact_sha256': DIGEST, 'components': kinds,
+        report = {'name': NAME, 'sdk': '0.6.1', 'artifact_sha256': DIGEST, 'components': kinds,
                   'native_installation_bindings': 2, 'concurrent_retrievals': 12,
                   'cross_workspace_denied': True, 'restart_state_recovered': True,
                   'artifact_unchanged': True, 'host_calls': len(calls), 'http_calls': len(http_calls),

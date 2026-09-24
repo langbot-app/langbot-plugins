@@ -2,9 +2,9 @@
 
 These are **unsigned candidates**, not an assertion that Space certification,
 publication, or production Cloud acceptance has completed. IDs are unchanged:
-`langbot-team/DifyDatasetsConnector` 0.1.6, `langbot-team/FastGPTConnector` 0.1.4,
-`langbot-team/LangRAG` 0.1.11, `langbot-team/RAGFlowConnector` 0.1.5.
-All require the shipped `langbot-plugin==0.6.0b5` and opt into
+`langbot-team/DifyDatasetsConnector` 0.1.7, `langbot-team/FastGPTConnector` 0.1.5,
+`langbot-team/LangRAG` 0.1.13, `langbot-team/RAGFlowConnector` 0.1.6.
+All require the shipped `langbot-plugin==0.6.1` and opt into
 `execution.sharedRuntime: shared-runtime-v1`.
 
 ## Scope and state audit
@@ -58,7 +58,7 @@ Use a new virtual environment with Python 3.11+ and the actual released SDK:
 ```sh
 uv venv /tmp/ke-check
 uv pip install --python /tmp/ke-check/bin/python \
-  langbot-plugin==0.6.0b5 pytest pytest-asyncio \
+  langbot-plugin==0.6.1 pytest pytest-asyncio \
   -r KnowledgeEngine/LangRAG/requirements.txt \
   -r KnowledgeEngine/DifyDatasetsConnector/requirements.txt \
   -r KnowledgeEngine/FastGPTConnector/requirements.txt \
