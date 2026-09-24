@@ -201,7 +201,7 @@ We welcome contributions! Feel free to:
 
 Star the repo if you find it useful!
 
-## Shared runtime (SDK 0.6.0b5)
+## Shared runtime (SDK 0.6.1)
 
 This version opts into `shared-runtime-v1`; Space-issued certificate admission is
 a separate release gate. Engine and Page telemetry now belong to the installation
