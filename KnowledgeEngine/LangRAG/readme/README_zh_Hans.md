@@ -142,7 +142,7 @@ python3 -m benchmarks.run
 
 Benchmark 数据集、实验配置、确定性本地适配器和指标代码位于 `benchmarks/`。运行结果会写入 `benchmarks/runs/` 下可追踪的 `results.json` 文件。
 
-可以使用相邻的 `langbot-parser` 仓库对 Parser 集成效果做 benchmark：
+可以使用本仓库的 `misc/GeneralParsers` 对 Parser 集成效果做 benchmark：
 
 ```bash
 python3 -m benchmarks.run \

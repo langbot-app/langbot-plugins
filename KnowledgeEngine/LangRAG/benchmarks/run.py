@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = REPO_ROOT / "benchmarks/datasets/mini_zh.json"
 DEFAULT_CONFIG = REPO_ROOT / "benchmarks/configs/local_retrieval.json"
 DEFAULT_OUT_DIR = REPO_ROOT / "benchmarks/runs"
-DEFAULT_PARSER_REPO = REPO_ROOT.parent / "langbot-parser"
+DEFAULT_PARSER_REPO = REPO_ROOT.parents[1] / "misc/GeneralParsers"
 
 
 def _read_json(path: Path) -> dict[str, Any]:

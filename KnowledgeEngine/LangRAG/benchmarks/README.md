@@ -53,8 +53,8 @@ python3 -m benchmarks.run \
   --run-id parser-compare-local
 ```
 
-The parser repo defaults to `../langbot-parser`. Override it with
-`--parser-repo /path/to/langbot-parser` or the `LANGBOT_PARSER_REPO`
+The parser directory defaults to `misc/GeneralParsers` in this repository. Override it with
+`--parser-repo /path/to/GeneralParsers` or the `LANGBOT_PARSER_REPO`
 environment variable.
 
 The bundled parser comparison dataset uses raw HTML so it can run in a minimal

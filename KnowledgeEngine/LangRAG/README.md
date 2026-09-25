@@ -169,8 +169,7 @@ Benchmark datasets, experiment configs, deterministic local adapters, and metric
 code are stored in `benchmarks/`. Runs write traceable `results.json` files under
 `benchmarks/runs/`.
 
-Parser integration can be benchmarked against the sibling `langbot-parser`
-repository:
+Parser integration can be benchmarked against `misc/GeneralParsers` in this repository:
 
 ```bash
 python3 -m benchmarks.run \

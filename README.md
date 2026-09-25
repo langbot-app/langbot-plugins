@@ -31,6 +31,7 @@ Each plugin is an independent package with its own `manifest.yaml`, dependencies
 - [DifyDatasetsConnector](KnowledgeEngine/DifyDatasetsConnector/README.md)
 - [FastGPTConnector](KnowledgeEngine/FastGPTConnector/README.md)
 - [LangRAG](KnowledgeEngine/LangRAG/README.md)
+- [LongTermMemory](KnowledgeEngine/LongTermMemory/README.md)
 - [RAGFlowConnector](KnowledgeEngine/RAGFlowConnector/README.md)
 
 ## misc
@@ -41,6 +42,7 @@ Each plugin is an independent package with its own `manifest.yaml`, dependencies
 - [DailyLimitPlugin](misc/DailyLimitPlugin/README.md)
 - [EssentialCommands](misc/EssentialCommands/README.md)
 - [FAQManager](misc/FAQManager/README.md)
+- [GeneralParsers](misc/GeneralParsers/README.md)
 - [GitHubKit](misc/GitHubKit/README.md)
 - [GoogleSearch](misc/GoogleSearch/README.md)
 - [GroupChatSummary](misc/GroupChatSummary/README.md)
@@ -48,6 +50,7 @@ Each plugin is an independent package with its own `manifest.yaml`, dependencies
 - [HumanTakeover](misc/HumanTakeover/README.md)
 - [KeywordAlert](misc/KeywordAlert/README.md)
 - [MCBotPlugin](misc/MCBotPlugin/README.md)
+- [PowerContext](misc/PowerContext/README.md)
 - [QWeather](misc/QWeather/README.md)
 - [ScheNotify](misc/ScheNotify/README.md)
 - [SysStatPlugin](misc/SysStatPlugin/README.md)
