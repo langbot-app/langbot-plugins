@@ -142,7 +142,7 @@ python3 -m benchmarks.run
 
 Benchmark データセット、実験設定、決定的なローカルアダプター、メトリクスコードは `benchmarks/` にあります。実行結果は `benchmarks/runs/` 配下の追跡可能な `results.json` に書き込まれます。
 
-隣接する `langbot-parser` リポジトリと組み合わせて Parser 連携を benchmark できます。
+このリポジトリの `misc/GeneralParsers` と組み合わせて Parser 連携を benchmark できます。
 
 ```bash
 python3 -m benchmarks.run \

@@ -3,7 +3,7 @@ kind: Plugin
 metadata:
   author: langbot-team
   name: LongTermMemory
-  repository: https://github.com/langbot-app/langbot-longterm-memory
+  repository: https://github.com/langbot-app/langbot-plugins/tree/main/KnowledgeEngine/LongTermMemory
   version: 0.2.5
   description:
     en_US: Long-term memory plugin for LangBot. Dual-layer architecture - L1 

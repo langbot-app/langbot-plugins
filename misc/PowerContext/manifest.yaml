@@ -3,7 +3,7 @@ kind: Plugin
 metadata:
   author: langbot-team
   name: PowerContext
-  repository: https://github.com/langbot-app/langbot-powercontext
+  repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/PowerContext
   version: 0.1.0
   label:
     en_US: PowerContext
