@@ -152,7 +152,19 @@ PluginRuntimeController.initialize_slot = observed
 @pytest.mark.parametrize('folder', FOLDERS)
 async def test_two_workspace_same_archive_shared_worker(folder, tmp_path):
     assert Version(importlib.metadata.version('langbot-plugin')) >= Version('0.7.3')
-    installed, digest = package(folder, tmp_path)
+    proof_artifacts = os.environ.get('LANGBOT_RUNNER_PROOF_ARTIFACTS')
+    if proof_artifacts:
+        archive_paths = list((Path(proof_artifacts) / folder / 'built').glob('*.lbpkg'))
+        assert len(archive_paths) == 1
+        data = archive_paths[0].read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        installed = tmp_path / 'installed'
+        installed.mkdir()
+        with zipfile.ZipFile(io.BytesIO(data)) as zipf:
+            assert zipf.comment == b'' and zipf.testzip() is None
+            zipf.extractall(installed)
+    else:
+        installed, digest = package(folder, tmp_path)
     a, b = binding(digest, 'A'), binding(digest, 'B')
     worker = await launch(installed, tmp_path)
     try:
