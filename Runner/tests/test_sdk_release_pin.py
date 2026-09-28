@@ -7,6 +7,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SDK_REQUIREMENT = "langbot-plugin==0.6.1"
+STATELESS_SDK_REQUIREMENT = "langbot-plugin>=0.7.3,<0.8"
+STATELESS_PLUGINS = {"LocalAgent", "RunnerDemo", "deerflow-agent", "weknora-agent"}
 CODING_PLUGINS = {"acp-agent-runner", "claude-code-agent", "codex-agent"}
 HTTP_PLUGINS = {
     "coze-agent",
@@ -19,6 +21,7 @@ HTTP_PLUGINS = {
     "weknora-agent",
 }
 EXPECTED_SDK = dict.fromkeys(CODING_PLUGINS | HTTP_PLUGINS | {"LocalAgent", "RunnerDemo"}, SDK_REQUIREMENT)
+EXPECTED_SDK.update(dict.fromkeys(STATELESS_PLUGINS, STATELESS_SDK_REQUIREMENT))
 PLUGINS = sorted(p.parent for p in ROOT.glob("*/manifest.yaml"))
 
 
@@ -33,8 +36,8 @@ def test_plugin_requirements_pin_released_sdk(plugin):
     assert sum(line.startswith("langbot-plugin") for line in requirements) == 1
 
 
-@pytest.mark.parametrize("project", [ROOT, ROOT / "LocalAgent"], ids=["runners", "localagent"])
-def test_project_uses_released_sdk_without_local_override(project):
+@pytest.mark.parametrize("project,requirement", [(ROOT, SDK_REQUIREMENT), (ROOT / "LocalAgent", STATELESS_SDK_REQUIREMENT)], ids=["runners", "localagent"])
+def test_project_uses_released_sdk_without_local_override(project, requirement):
     config = tomllib.loads((project / "pyproject.toml").read_text())
-    assert SDK_REQUIREMENT in config["project"]["dependencies"]
+    assert requirement in config["project"]["dependencies"]
     assert "langbot-plugin" not in config.get("tool", {}).get("uv", {}).get("sources", {})
