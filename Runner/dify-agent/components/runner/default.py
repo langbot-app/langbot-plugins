@@ -1309,7 +1309,7 @@ class DefaultRunner(Runner):
         if active is None:
             active = self._active_resumes = set()
         from langbot_plugin.api.proxies.invocation import current_binding
-        binding = current_binding(self._plugin_runtime_handler)
+        binding = current_binding(getattr(self, "_plugin_runtime_handler", None))
         key = (binding, self._continuation_owner(ctx), str(submission.interaction_id))
         if key in active:
             raise DifyAPIError("Dify continuation is already being resumed", code="dify.interaction_invalid")
