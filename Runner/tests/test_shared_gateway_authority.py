@@ -11,7 +11,7 @@ from langbot_plugin.entities.io.context import InstallationBinding
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("folder", ["coze-agent", "langflow-agent", "n8n-agent"])
+@pytest.mark.parametrize("folder", ["coze-agent", "langflow-agent", "n8n-agent", "dashscope-agent"])
 def test_two_bindings_revoke_only_their_own_gateway_authority(folder):
     async def check():
         root = ROOT / folder

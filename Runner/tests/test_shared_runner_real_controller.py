@@ -11,7 +11,7 @@ from langbot_plugin.entities.io.context import InstallationBinding
 
 ROOT = Path(__file__).resolve().parents[1]
 
-@pytest.mark.parametrize("folder", ["coze-agent", "langflow-agent", "n8n-agent"])
+@pytest.mark.parametrize("folder", ["coze-agent", "langflow-agent", "n8n-agent", "dashscope-agent", "tbox-agent"])
 def test_two_workspace_slots_share_real_plugin_and_runner(folder, monkeypatch):
     async def check():
         root = ROOT / folder

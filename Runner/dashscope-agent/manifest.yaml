@@ -3,7 +3,7 @@ kind: Plugin
 metadata:
   author: langbot-team
   name: DashScopeAgent
-  version: 0.1.10
+  version: 0.1.11
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/Runner/dashscope-agent
   label:
     en_US: Dashscope Agent
@@ -36,3 +36,4 @@ execution:
     path: main.py
     attr: DashScopeAgentPlugin
   sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1
