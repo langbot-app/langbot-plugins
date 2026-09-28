@@ -17,6 +17,9 @@ def test_two_workspace_slots_share_real_plugin_and_runner(folder, monkeypatch):
         root = ROOT / folder
         monkeypatch.chdir(root)
         sys.path.insert(0, str(root))
+        for name in list(sys.modules):
+            if name == "pkg" or name.startswith("pkg.") or name in ("main", "components.runner.default"):
+                sys.modules.pop(name, None)
         try:
             plugin = ComponentManifest(owner="langbot-team", manifest=yaml.safe_load((root / "manifest.yaml").read_text()), rel_path="manifest.yaml")
             runner = ComponentManifest(owner="langbot-team", manifest=yaml.safe_load((root / "components/runner/default.yaml").read_text()), rel_path="components/runner/default.yaml")
