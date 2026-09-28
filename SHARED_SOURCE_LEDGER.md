@@ -1,6 +1,6 @@
 # 4.11 official Runner + KnowledgeEngine source ledger
 
-Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (fetched before integration). Each `source tree` is the Git tree object for the indicated plugin directory in the **current PR head** `180587a4ef2267c56f11596a4baae55e7253ab68`; it identifies committed source, not a built ZIP, normalized artifact digest, signature, or public marketplace version. Versions below are the integration manifest versions, **not verified live versions**. Author namespace is `langbot-team` for all 18 IDs.
+Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (fetched before integration). Each `source tree` is the Git tree object for the indicated plugin directory in the **current PR head** (resolve its commit at review time); it identifies committed source, not a built ZIP, normalized artifact digest, signature, or public marketplace version. Versions below are the integration manifest versions, **not verified live versions**. Author namespace is `langbot-team` for all 18 IDs.
 
 | Official ID | Manifest version | Source tree | Placement claim | Source lane |
 | --- | --- | --- | --- | --- |
