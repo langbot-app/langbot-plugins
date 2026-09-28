@@ -1,38 +1,25 @@
-# KnowledgeEngine shared-worker readiness (local source candidate)
+# KnowledgeEngine shared-runtime source gate
 
-**Decision: 0/5 ready for a signed `stateless-v1` / `shared-runtime-v1` release.**
-The five manifests remain dedicated: no certificate, marketplace publication, or
-Cloud shared-worker execution is claimed. The previous SDK 0.6.1 fixture used
-separate plugin/component graphs and is not one-worker/two-Workspace evidence.
-Do not restore `execution.sharedRuntime` merely because state is labeled by KB or
-because the SDK provides task-local Host proxies. The SDK 0.7.4 contract requires
-one actual BasePlugin and one instance of each declared component per digest;
-`initialize()` runs once without tenant configuration.
+**Only LangRAG is an opt-in local source candidate.** No signature, marketplace publication, Cloud admission, sandbox, real-provider execution, or production readiness is claimed. LongTermMemory and all three external connectors remain dedicated.
 
-| Plugin | Integrated source correction | Remaining blocker / release gate |
-| --- | --- | --- |
-| DifyDatasetsConnector | Current main returns the real Dify upload document ID, fails ingestion if absent, and persists KB config through the SDK Host proxy. | `ConfigStore._state` is one component-wide lock/fence and `SerialState.run` dispatches tenant-bearing `create_task()` across cancellation. Host must persist the exact Host-file → upstream-document mapping and delete with that ID, requiring real upstream absence verification; a Host file UUID is not a substitute. Shared placement blocked. |
-| FastGPTConnector | Current main returns the real collection ID, rejects missing ID, reads `data.list` with typed scores and uses `DELETE .../collection/delete?id=...`. | Same singleton/global mutation fence, detached task, and Host-file → collection-ID lifecycle blocker. Shared placement blocked. |
-| RAGFlowConnector | Upload now treats an acknowledged empty document list as **ambiguous remote outcome requiring reconciliation**, not a failed upload that is safe to retry; nonempty real document IDs continue to be returned. | Same component-wide fence and detached task. Parsing can fail after upload, so deletion/reconciliation must use the returned upstream ID and actual dataset, not Host UUID. Shared placement blocked. |
-| LangRAG | Candidate moves telemetry history/Page reads to invocation-bound Host storage, removes initialize-time tenant reads and shared telemetry store, scopes serialization/fence by installation binding, and runs parser threads with an empty context while waiting for settlement. | Still no real one-worker A/B subprocess proof; CPU threads carry document content until completion and mutation uncertainty/cancellation must be reconciled with Host. Telemetry errors cannot be called a durable accounting ledger. Shared placement blocked. |
-| LongTermMemory | Candidate removes KB/profile caches from the singleton, resolves profile limits through invocation config instead of `initialize()`, and serializes/fences selected storage RMW paths per binding. | Audit every Host vector/storage path and nested episode operation for ambiguous partial commits, cancellation and config revision; establish same-object A/B proof across Page/Tool/Command/Engine/EventListener with distinct limits and storage. Shared placement blocked. |
+## LangRAG evidence and limits
 
-The three connector fixes above are **not** proof of real provider lifecycle. A
-successful-looking upload with no upstream ID must not be replaced with a Host
-file UUID; transport failure after remote commit can create an orphan. The
-binding-local storage key is an SDK proxy, not an independently authenticated
-provider account. If two installations deliberately configure one provider
-account/dataset, the connector cannot manufacture provider-side isolation.
+The SDK 0.7.4 subprocess probe `certification-tests/shared_subprocess_probe.py` launches a separate Python worker, creates exactly one `PluginRuntimeController` / `BasePlugin` / each declared component object, attaches two distinct `InstallationBinding` Workspaces on the same WebSocket transport and asserts the object identities coincide inside that child. Both Workspaces successfully ingest and retrieve distinct markers with the same Host IDs; the Page snapshot succeeds for both. The Host vector/storage/embedding APIs are local scoped fixtures, not production services. Reproduce from repository root:
 
-Before opting in, replace connector tenant-bearing detached operations with an
-SDK-owned revocable/settled invocation lifecycle or a bounded in-invocation
-operation with fail-closed reconciliation. Scope mutation ordering and fencing
-by complete installation binding; verify that same-binding config writes and
-KB tombstones cannot reorder. Add durable, Workspace/KB/file-scoped upstream ID
-mapping and make Host deletion retain its row until actual upstream success.
-Reconcile ambiguous retries rather than creating a second remote document.
-Then run an actual released-SDK worker with two Workspace bindings on the same
-PID, BasePlugin, and component identities, plus representative successful A/B
-invocations, storage and config-revision isolation, cancellation/revocation,
-and provider document absence after deletion. These are release gates, not
-claims established by this source-only change. No new unit tests were added.
+```sh
+PYTHONDONTWRITEBYTECODE=1 /home/rock/work/ke-shared-test-venv/bin/python KnowledgeEngine/certification-tests/shared_subprocess_probe.py KnowledgeEngine/LangRAG
+```
+
+The single run does not establish revocation races, production persistence, config revision, or deterministic vector repair following ambiguous partial commits. The previous source correction preserves binding-local fences, invocation-bound telemetry, and settled CPU offload; telemetry is diagnostic only, not an accounting ledger. Keep release/certification gated on those separate checks.
+
+## LongTermMemory
+
+The same real-child probe temporarily overrides the in-memory manifest to shared mode (without changing the dedicated artifact), attaches two Workspace slots and invokes both Page `/summary` endpoints with distinct task-local profile limits, proving the SDK object graph can host both slots. It does **not** exercise representative writes through Tool, Command, KnowledgeEngine and EventListener, nor interrupted nested episode operations, so its manifest remains dedicated. Run the probe with `KnowledgeEngine/LongTermMemory` to reproduce the limited evidence.
+
+## External connectors: still blocked
+
+Dify, FastGPT, and RAGFlow now serialize mutations and fence ambiguous errors by the complete installation binding, without creating a tenant-bearing detached task. A durable plugin-storage intent precedes upload; Host file ID, KB ID, upstream ID, dataset, and state are recorded under an installation-bound key when returned. Deletion refuses missing/pending mappings and mismatched datasets, resolves either the Host ID or an exact previously recorded upstream ID, and records a tombstone after upstream acknowledgement. **Do not enable shared placement or claim integrated deletion.**
+
+The Host may already persist `IngestionResult.document_id` and pass that upstream ID on delete, but this source alone cannot prove which deployed Host revision is used. Provider DELETE acknowledgements here are not yet verified with an authoritative upstream list/readback, and an upload timeout after remote commit leaves a durable pending intent requiring manual reconciliation. Config KB tombstones must not precede cleanup of outstanding mappings; the Host needs to retain the file row until verified upstream absence. For RAGFlow, an acknowledged upload followed by failed parse needs reconciliation rather than blind reupload. Existing connector fixture tests written for deleting arbitrary unrecorded IDs now fail by design; cancellation fixtures with deliberately detached Host commits no longer model the SDK-owned revocable action. No replacement unit tests were added. Real upstream A/B ingestion, deletion absence and cancellation/revision proof remain release gates.
+
+No published certification or shared claim is made for those four plugins.
