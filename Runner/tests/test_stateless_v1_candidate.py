@@ -38,7 +38,7 @@ def test_eligibility_is_only_claimed_for_audited_stateless_components(folder):
     data = yaml.safe_load((ROOT / folder / "manifest.yaml").read_text())
     execution = Execution.model_validate(data["execution"])
     assert data["metadata"]["author"] == "langbot-team"
-    assert execution.shared_runtime == "shared-runtime-v1"
+    assert (execution.shared_runtime == "shared-runtime-v1") == (folder in SAFE)
     assert (execution.component_model == "stateless-v1") == (folder in SAFE)
     assert "Runner" in data["spec"]["components"]
 
