@@ -72,5 +72,3 @@ execution:
   python:
     path: main.py
     attr: AcpRunnerPlugin
-  sharedRuntime: shared-runtime-v1
-  componentModel: stateless-v1

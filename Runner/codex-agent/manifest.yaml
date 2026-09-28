@@ -63,5 +63,3 @@ execution:
   python:
     path: main.py
     attr: CodexAgentPlugin
-  sharedRuntime: shared-runtime-v1
-  componentModel: stateless-v1
