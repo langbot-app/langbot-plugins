@@ -39,7 +39,12 @@ async def main():
     components = discover_plugin_components(manifest, discovery)
     kinds = sorted(c.kind for c in components)
     assert kinds == (['KnowledgeEngine', 'Page'] if NAME == 'LangRAG' else ['KnowledgeEngine'])
-    assert manifest.execution.shared_runtime is None, 'These four candidates remain dedicated'
+    shared = NAME == 'LangRAG'
+    if shared:
+        assert manifest.execution.shared_runtime == 'shared-runtime-v1'
+        assert manifest.execution.component_model == 'stateless-v1'
+    else:
+        assert manifest.execution.shared_runtime is None
     stores, vectors, calls = {}, {}, []
     http_calls = []
     async def provider(request):
@@ -89,6 +94,10 @@ async def main():
             handler = PluginRuntimeHandler(WebSocketConnection(ws), controller.initialize)
             controller.handler = handler
             handler.plugin_container = controller.plugin_container
+            if shared:
+                handler._slot_initialize_callback = controller.initialize_slot
+                handler._slot_detach_callback = controller.detach_slot
+                handler._slot_cancel_callback = controller.invalidate_slot
             ready.set_result(handler)
             await handler.run()
         async with websockets.serve(connected, '127.0.0.1', 0) as server:
@@ -141,9 +150,18 @@ async def main():
                 async def call(action, data, context=scope):
                     return await host.call_action(action, data, action_context=context, timeout=8)
                 try:
-                    await call(R.INITIALIZE_PLUGIN, {'plugin_settings': {'enabled': True, 'priority': 0, 'plugin_config': {'marker': label}}})
-                    assert controller.plugin_container.plugin_instance.get_config() == {'marker': label}
-                    assert handler.require_bound_action_context() == scope
+                    settings = {'plugin_settings': {'enabled': True, 'priority': 0, 'plugin_config': {'marker': label}}}
+                    if shared:
+                        await call(R.ATTACH_PLUGIN_SLOT, settings)
+                        slot = await call(R.GET_PLUGIN_SLOT_CONTAINER, {})
+                        assert slot['plugin_config'] == {'marker': label}
+                    else:
+                        await call(R.INITIALIZE_PLUGIN, settings)
+                        assert controller.plugin_container.plugin_instance.get_config() == {'marker': label}
+                    if shared:
+                        assert controller.plugin_container_for_slot(scope.installation_uuid).binding == scope
+                    else:
+                        assert handler.require_bound_action_context() == scope
                     yield call, controller
                 finally:
                     await host.close()
@@ -194,12 +212,12 @@ async def main():
             if NAME == 'LangRAG':
                 assert (await page(ca, '/snapshot'))['data']['counters'] == {}
                 assert (await page(cb, '/snapshot'))['data']['counters']['ingest.total'] == 1
-            result = await ca(R.DELETE_DOCUMENT, {'kb_id': 'same-kb', 'document_id': 'remote-doc'})
+            result = await ca(R.DELETE_DOCUMENT, {'kb_id': 'same-kb', 'document_id': 'same-doc'})
             assert result['success']
             if NAME != 'LangRAG':
                 assert http_calls[-1][2] == 'A'
                 await ca(R.ON_KB_DELETE, {'kb_id': 'same-kb'})
-                assert not (await ca(R.DELETE_DOCUMENT, {'kb_id': 'same-kb', 'document_id': 'remote-doc'}))['success']
+                assert not (await ca(R.DELETE_DOCUMENT, {'kb_id': 'same-kb', 'document_id': 'same-doc'}))['success']
             await retrieve(cb, 'B')
         after = {str(p.relative_to(CODE)): hashlib.sha256(p.read_bytes()).hexdigest() for p in CODE.rglob('*') if p.is_file()}
         assert before == after, 'Runtime wrote into shared artifact tree'
