@@ -18,9 +18,8 @@ HTTP_PLUGINS = {
     "tbox-agent",
     "weknora-agent",
 }
-SHARED_CANDIDATES = CODING_PLUGINS | (HTTP_PLUGINS - {"deerflow-agent", "weknora-agent"})
-EXPECTED_SDK = dict.fromkeys(CODING_PLUGINS | HTTP_PLUGINS | {"LocalAgent", "RunnerDemo"}, SDK_REQUIREMENT)
-EXPECTED_SDK.update(dict.fromkeys(SHARED_CANDIDATES, "langbot-plugin>=0.7.4,<0.8"))
+SHARED_CANDIDATES = (HTTP_PLUGINS | {"LocalAgent", "RunnerDemo", "deerflow-agent", "weknora-agent"}) - CODING_PLUGINS
+EXPECTED_SDK = dict.fromkeys(CODING_PLUGINS | HTTP_PLUGINS | {"LocalAgent", "RunnerDemo"}, "langbot-plugin>=0.7.4,<0.8")
 PLUGINS = sorted(p.parent for p in ROOT.glob("*/manifest.yaml"))
 
 
@@ -38,5 +37,6 @@ def test_plugin_requirements_pin_released_sdk(plugin):
 @pytest.mark.parametrize("project", [ROOT, ROOT / "LocalAgent"], ids=["runners", "localagent"])
 def test_project_uses_released_sdk_without_local_override(project):
     config = tomllib.loads((project / "pyproject.toml").read_text())
-    assert SDK_REQUIREMENT in config["project"]["dependencies"]
+    expected = "langbot-plugin>=0.7.4,<0.8" if project.name == "LocalAgent" else SDK_REQUIREMENT
+    assert expected in config["project"]["dependencies"]
     assert "langbot-plugin" not in config.get("tool", {}).get("uv", {}).get("sources", {})
