@@ -5,9 +5,9 @@ import json
 import time
 import uuid
 import logging
-from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
+from store.serialization import BindingWrites, serialized_write
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +69,13 @@ class MemoryStore:
         max_profile_preferences: int = 10,
     ):
         self.plugin = plugin
-        self.max_profile_traits = max_profile_traits
-        self.max_profile_preferences = max_profile_preferences
-        self._kb_config_cache: dict[str, dict[str, Any]] | None = None
-        # L1 profile cache: storage_key -> (monotonic_timestamp, profile_dict)
-        self._profile_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
-        self._PROFILE_CACHE_TTL = 30  # seconds
+        self._writes = BindingWrites()
+        # Explicit limits are retained for standalone legacy/store fixtures only.
+        # The actual plugin resolves them through SDK task-local get_config().
+        self._default_max_profile_traits = max_profile_traits
+        self._default_max_profile_preferences = max_profile_preferences
+        # Storage is invocation-bound. Never retain profiles or KB configuration
+        # on the singleton: identical keys may belong to different installations.
 
     @staticmethod
     def _preview_text(value: str, max_len: int = 120) -> str:
@@ -274,10 +275,11 @@ class MemoryStore:
         return normalized
 
     def _profile_field_limit(self, field: str) -> int:
+        config = self.plugin.get_config() if hasattr(self.plugin, "get_config") else {}
         return (
-            self.max_profile_traits
+            config.get("max_profile_traits", self._default_max_profile_traits)
             if field == "traits"
-            else self.max_profile_preferences
+            else config.get("max_profile_preferences", self._default_max_profile_preferences)
         )
 
     def _compose_field_values(
@@ -629,23 +631,20 @@ class MemoryStore:
 
     _KB_CONFIGS_KEY = "kb_configs"
 
+    @serialized_write
     async def save_kb_config(self, kb_id: str, config: dict[str, Any]) -> None:
         configs = await self._read_json(self._KB_CONFIGS_KEY) or {}
         configs[kb_id] = config
         await self._write_json(self._KB_CONFIGS_KEY, configs)
-        self._kb_config_cache = configs
 
+    @serialized_write
     async def remove_kb_config(self, kb_id: str) -> None:
         configs = await self._read_json(self._KB_CONFIGS_KEY) or {}
         configs.pop(kb_id, None)
         await self._write_json(self._KB_CONFIGS_KEY, configs)
-        self._kb_config_cache = configs
 
     async def get_kb_configs(self) -> dict[str, dict[str, Any]]:
-        if self._kb_config_cache is not None:
-            return self._kb_config_cache
-        self._kb_config_cache = await self._read_json(self._KB_CONFIGS_KEY) or {}
-        return self._kb_config_cache
+        return await self._read_json(self._KB_CONFIGS_KEY) or {}
 
     async def get_kb_config(self) -> tuple[str, dict[str, Any]] | None:
         """Return (kb_id, config) for the single registered KB, or None."""
@@ -674,7 +673,7 @@ class MemoryStore:
     async def _read_json(self, key: str) -> Any:
         try:
             data = await self.plugin.get_plugin_storage(key)
-        except Exception:
+        except KeyError:
             logger.debug("storage key %s not found", key)
             return None
         if not data:
@@ -682,13 +681,17 @@ class MemoryStore:
         try:
             return json.loads(data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.warning("storage key %s has corrupted data: %s", key, e)
-            return None
+            raise ValueError(f"storage key {key} contains corrupt JSON") from e
 
     async def _write_json(self, key: str, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        await self.plugin.set_plugin_storage(key, data)
+        try:
+            await self.plugin.set_plugin_storage(key, data)
+        except BaseException:
+            self._writes.fence(self.plugin)
+            raise
 
+    @serialized_write
     async def append_audit_entry(
         self,
         scope_key: str,
@@ -751,6 +754,7 @@ class MemoryStore:
     def _injection_snapshot_key(scope_key: str) -> str:
         return f"inj:{scope_key}"
 
+    @serialized_write
     async def save_injection_snapshot(
         self,
         scope_key: str,
@@ -770,6 +774,7 @@ class MemoryStore:
             return None
         return snapshot
 
+    @serialized_write
     async def append_memory_candidate(
         self,
         scope_key: str,
@@ -842,6 +847,7 @@ class MemoryStore:
                 return copy.deepcopy(entry)
         return None
 
+    @serialized_write
     async def _update_memory_candidate(
         self,
         scope_key: str,
@@ -879,6 +885,7 @@ class MemoryStore:
             self.CANDIDATE_STATUS_REJECTED,
         )
 
+    @serialized_write
     async def accept_memory_candidate(
         self,
         scope_key: str,
@@ -957,38 +964,11 @@ class MemoryStore:
         await self._write_json(key, entries)
         return candidate
 
-    def _get_cached_profile(self, storage_key: str) -> dict[str, Any] | None:
-        now = time.monotonic()
-        cached = self._profile_cache.get(storage_key)
-        if not cached:
-            return None
-
-        cached_at, profile = cached
-        if now - cached_at >= self._PROFILE_CACHE_TTL:
-            self._profile_cache.pop(storage_key, None)
-            return None
-
-        self._profile_cache.move_to_end(storage_key)
-        return profile
-
-    def _set_cached_profile(self, storage_key: str, profile: dict[str, Any]) -> None:
-        self._profile_cache[storage_key] = (time.monotonic(), profile)
-        self._profile_cache.move_to_end(storage_key)
-        while len(self._profile_cache) > self._MAX_PROFILE_CACHE_SIZE:
-            self._profile_cache.popitem(last=False)
-
     async def _load_profile_by_storage_key(self, storage_key: str) -> dict[str, Any]:
-        cached = self._get_cached_profile(storage_key)
-        if cached is not None:
-            return cached
-
         profile = await self._read_json(storage_key)
         if not profile:
             profile = _default_profile()
-            await self._write_json(storage_key, profile)
-        profile = self._normalize_profile(profile)
-        self._set_cached_profile(storage_key, profile)
-        return profile
+        return self._normalize_profile(profile)
 
     async def _save_profile_by_storage_key(
         self, storage_key: str, profile: dict[str, Any]
@@ -996,7 +976,6 @@ class MemoryStore:
         profile = self._normalize_profile(profile)
         profile["updated_at"] = self._now_timestamp()
         await self._write_json(storage_key, profile)
-        self._set_cached_profile(storage_key, profile)
         return profile
 
     async def load_session_profile(self, scope_key: str) -> dict[str, Any]:
@@ -1013,6 +992,7 @@ class MemoryStore:
             self._speaker_profile_key(scope_key, sender_id)
         )
 
+    @serialized_write
     async def _update_profile_field_by_storage_key(
         self,
         storage_key: str,
@@ -1123,11 +1103,13 @@ class MemoryStore:
             previous_value,
         )
 
+    @serialized_write
     async def clear_session_profile(self, scope_key: str) -> None:
         await self._save_profile_by_storage_key(
             self._session_profile_key(scope_key), _default_profile()
         )
 
+    @serialized_write
     async def clear_speaker_profile(self, scope_key: str, sender_id: str) -> None:
         await self._save_profile_by_storage_key(
             self._speaker_profile_key(scope_key, sender_id), _default_profile()
@@ -1181,6 +1163,7 @@ class MemoryStore:
 
     _SUPERSEDE_IMPORTANCE_FACTOR = 0.1  # multiplied onto old importance
 
+    @serialized_write
     async def _auto_supersede(
         self,
         collection_id: str,
@@ -1266,6 +1249,7 @@ class MemoryStore:
 
         return superseded
 
+    @serialized_write
     async def add_episode(
         self,
         collection_id: str,
@@ -1520,6 +1504,7 @@ class MemoryStore:
             ep.pop("_exact_match_score", None)
         return episodes[:top_k]
 
+    @serialized_write
     async def delete_episodes_by_user(
         self, collection_id: str, user_key: str
     ) -> int:
@@ -1643,6 +1628,7 @@ class MemoryStore:
                 break
         return exported
 
+    @serialized_write
     async def import_episodes_for_user(
         self,
         collection_id: str,
@@ -1729,6 +1715,7 @@ class MemoryStore:
 
         return imported
 
+    @serialized_write
     async def delete_episodes_by_filters(
         self,
         collection_id: str,
@@ -1883,6 +1870,7 @@ class MemoryStore:
             "max_candidates": max_candidates,
         }
 
+    @serialized_write
     async def apply_consolidation(
         self,
         collection_id: str,
@@ -1932,6 +1920,7 @@ class MemoryStore:
             "profile_updates_applied": [],
         }
 
+    @serialized_write
     async def delete_episode_by_id(
         self,
         collection_id: str,
@@ -1993,6 +1982,7 @@ class MemoryStore:
             if total >= 0 and offset >= total:
                 return None
 
+    @serialized_write
     async def update_episode_status(
         self,
         collection_id: str,
@@ -2067,6 +2057,7 @@ class MemoryStore:
         rank = {"ERROR": 0, "WARN": 1, "OK": 2}
         return min(current, candidate, key=lambda s: rank.get(s, 1))
 
+    @serialized_write
     async def run_metadata_filter_probe(
         self,
         collection_id: str,

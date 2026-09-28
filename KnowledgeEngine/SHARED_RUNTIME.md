@@ -1,86 +1,38 @@
-# KnowledgeEngine shared-runtime candidates
+# KnowledgeEngine shared-worker readiness (local source candidate)
 
-These are **unsigned candidates**, not an assertion that Space certification,
-publication, or production Cloud acceptance has completed. IDs are unchanged:
-`langbot-team/DifyDatasetsConnector` 0.1.7, `langbot-team/FastGPTConnector` 0.1.5,
-`langbot-team/LangRAG` 0.1.13, `langbot-team/RAGFlowConnector` 0.1.6.
-All require the shipped `langbot-plugin==0.6.1` and opt into
-`execution.sharedRuntime: shared-runtime-v1`.
+**Decision: 0/5 ready for a signed `stateless-v1` / `shared-runtime-v1` release.**
+The five manifests remain dedicated: no certificate, marketplace publication, or
+Cloud shared-worker execution is claimed. The previous SDK 0.6.1 fixture used
+separate plugin/component graphs and is not one-worker/two-Workspace evidence.
+Do not restore `execution.sharedRuntime` merely because state is labeled by KB or
+because the SDK provides task-local Host proxies. The SDK 0.7.4 contract requires
+one actual BasePlugin and one instance of each declared component per digest;
+`initialize()` runs once without tenant configuration.
 
-## Scope and state audit
-
-The native SDK contract is **one process/BasePlugin/component set per immutable
-InstallationBinding**, not many tenants sharing an arbitrary plugin singleton.
-The Runtime can share the verified read-only artifact/dependency trees. Only
-Host-bound SDK proxies carry tenant authority; a KB ID, collection ID, request
-field, environment override, or plugin-generated workspace label is not a scope.
-
-| Surface | State and isolation | Concurrency/failure behavior |
+| Plugin | Integrated source correction | Remaining blocker / release gate |
 | --- | --- | --- |
-| All plugin configuration | SDK injects `BasePlugin.config` per installation | Never stored in a module or a cross-install cache |
-| Dify/FastGPT/RAGFlow retrieval | Request-local settings, auth headers, HTTP client and response | Four HTTP sessions per component; 150-second total client-block deadline including queue/body; existing per-request inactivity timeouts retained |
-| Connector create/ingest/delete | `ke.config.v1.<sha256(kb_id)>` in **SDK plugin storage**, not filesystem or invented tenant keys | One component mutation lock; defensive JSON snapshot; 64 KiB max configuration; null tombstone on KB deletion |
-| Connector restart | Delete loads persisted settings using SDK proxy | Only authoritative key-list absence counts as missing; RPC/JSON failures propagate, not empty credentials |
-| Connector cancellation | Dispatched mutation continues under its lock | Repeated caller cancellation cannot release the lock ahead of a remote commit; ambiguous storage failure fences later mutations |
-| Connector external provider state | Dify document, FastGPT collection, RAGFlow upload/parse/GraphRAG/RAPTOR remain provider-owned | No automatic retry of ambiguous provider mutations; SDK installation isolation cannot isolate users who intentionally configure the same provider credential/dataset |
-| LangRAG parsing/chunking | Per-operation bytes, text, strategy and metadata; per-plugin CPU executor admission | Two admitted thread jobs; cancellation retains the slot until the thread settles; 16 MiB internal parser input / 4 MiB parsed-text limits; text decoding and all strategy splitting off-loop |
-| LangRAG vectors/embedding/rewrite/rerank | Only SDK Host proxies; collection/model settings stay request-local | Progressive embedding batches retained; ingest/delete serialized through completion; ambiguous vector mutations fence future mutations; retrieval remains concurrent |
-| LangRAG telemetry and Page | One async telemetry store owned by `BasePlugin`, shared by its own Engine and Page | SDK storage, at most 100 persisted events and 192 KiB; serialized/shielded commits and clear; failed persistence visible in snapshot and mutation-fenced |
-| LangRAG pure telemetry aggregator | Explicit-path JSONL support retained only for offline tooling/tests | No runtime singleton instance, import-time load, cwd writer or observability-directory environment override; production adapter configures **no file path** |
-| Files and RPC transfers | Files read through SDK knowledge-file proxy | Real SDK owns installation-private transfer directories; no writes to artifact directory |
-| Benchmark fixtures | Explicit offline Host/model/vector/storage substitutes | Not imported by the deployed runtime; never reported as external-provider E2E |
+| DifyDatasetsConnector | Current main returns the real Dify upload document ID, fails ingestion if absent, and persists KB config through the SDK Host proxy. | `ConfigStore._state` is one component-wide lock/fence and `SerialState.run` dispatches tenant-bearing `create_task()` across cancellation. Host must persist the exact Host-file → upstream-document mapping and delete with that ID, requiring real upstream absence verification; a Host file UUID is not a substitute. Shared placement blocked. |
+| FastGPTConnector | Current main returns the real collection ID, rejects missing ID, reads `data.list` with typed scores and uses `DELETE .../collection/delete?id=...`. | Same singleton/global mutation fence, detached task, and Host-file → collection-ID lifecycle blocker. Shared placement blocked. |
+| RAGFlowConnector | Upload now treats an acknowledged empty document list as **ambiguous remote outcome requiring reconciliation**, not a failed upload that is safe to retry; nonempty real document IDs continue to be returned. | Same component-wide fence and detached task. Parsing can fail after upload, so deletion/reconciliation must use the returned upstream ID and actual dataset, not Host UUID. Shared placement blocked. |
+| LangRAG | Candidate moves telemetry history/Page reads to invocation-bound Host storage, removes initialize-time tenant reads and shared telemetry store, scopes serialization/fence by installation binding, and runs parser threads with an empty context while waiting for settlement. | Still no real one-worker A/B subprocess proof; CPU threads carry document content until completion and mutation uncertainty/cancellation must be reconciled with Host. Telemetry errors cannot be called a durable accounting ledger. Shared placement blocked. |
+| LongTermMemory | Candidate removes KB/profile caches from the singleton, resolves profile limits through invocation config instead of `initialize()`, and serializes/fences selected storage RMW paths per binding. | Audit every Host vector/storage path and nested episode operation for ambiguous partial commits, cancellation and config revision; establish same-object A/B proof across Page/Tool/Command/Engine/EventListener with distinct limits and storage. Shared placement blocked. |
 
-The mutation fence is intentionally fail-closed. After an ambiguous remote
-commit, reconcile/quiesce Host activity before restarting the installation; an
-ordinary read does not establish that no late commit remains. Parser threads
-are bounded, not forcibly killable; production worker cgroup/rlimits remain
-Runtime-owned.
+The three connector fixes above are **not** proof of real provider lifecycle. A
+successful-looking upload with no upstream ID must not be replaced with a Host
+file UUID; transport failure after remote commit can create an orphan. The
+binding-local storage key is an SDK proxy, not an independently authenticated
+provider account. If two installations deliberately configure one provider
+account/dataset, the connector cannot manufacture provider-side isolation.
 
-### Upgrade notes
-
-- The old connectors never persisted their in-memory KB credentials. There is
-  no historical credential cache to migrate. Existing KBs acquire durable
-  deletion settings on the next create/ingest call; deletion without those
-  settings continues to return false rather than guessing credentials.
-- LangRAG no longer reads the old cwd-relative JSONL history or arbitrary
-  `LANGRAG_OBSERVABILITY_DIR`. Operational history starts anew in installation
-  storage. Knowledge documents/vectors are Host-owned and are not migrated,
-  erased or renamed. The bounded history/counters are diagnostic, not a durable
-  accounting ledger; retained events are replayed after restart.
-- No claims of cross-account provider dataset separation, real external model
-  quality, Cloud installation, certificate verification or hard sandbox limits
-  can be derived from these local fixtures.
-
-## Reproduce local verification
-
-Use a new virtual environment with Python 3.11+ and the actual released SDK:
-
-```sh
-uv venv /tmp/ke-check
-uv pip install --python /tmp/ke-check/bin/python \
-  langbot-plugin==0.6.1 pytest pytest-asyncio \
-  -r KnowledgeEngine/LangRAG/requirements.txt \
-  -r KnowledgeEngine/DifyDatasetsConnector/requirements.txt \
-  -r KnowledgeEngine/FastGPTConnector/requirements.txt \
-  -r KnowledgeEngine/RAGFlowConnector/requirements.txt
-/tmp/ke-check/bin/python -m pytest KnowledgeEngine/certification-tests -q
-(cd KnowledgeEngine/LangRAG && /tmp/ke-check/bin/python -m unittest discover -s tests -v)
-/tmp/ke-check/bin/python KnowledgeEngine/certification-tests/verify_candidates.py \
-  --evidence /tmp/ke-evidence
-```
-
-The last command builds with the real b5 `lbp`, verifies unsigned ZIPs through
-`PluginArtifactStore`, runs genuine `PluginDependencyEnvironmentStore.prepare()`
-using the SDK's **direct pip installer**, and verifies immutable dependency/cache
-readback with no shadow SDK. It checks installed SDK Python files against wheel
-RECORD hashes. Each exact extracted archive then runs genuine discovery,
-initialization, proxy and bidirectional WebSocket RPC tests with two native
-InstallationBindings. The Host and loopback HTTP provider are explicitly fake;
-this checks protocol/config/storage isolation, not live Cloud or provider E2E.
-The direct installer is not the production nsjail installer.
-
-The JSON inventory must contain exactly all four plugin names, source-file and
-archive hashes, dependency-environment digests, and successful per-artifact RPC
-reports. Preserve these exact bytes for independent review; rebuilding ZIPs can
-change raw hashes. Signing/publication and real two-Workspace Cloud acceptance
-are separate release gates and are deliberately not performed here.
+Before opting in, replace connector tenant-bearing detached operations with an
+SDK-owned revocable/settled invocation lifecycle or a bounded in-invocation
+operation with fail-closed reconciliation. Scope mutation ordering and fencing
+by complete installation binding; verify that same-binding config writes and
+KB tombstones cannot reorder. Add durable, Workspace/KB/file-scoped upstream ID
+mapping and make Host deletion retain its row until actual upstream success.
+Reconcile ambiguous retries rather than creating a second remote document.
+Then run an actual released-SDK worker with two Workspace bindings on the same
+PID, BasePlugin, and component identities, plus representative successful A/B
+invocations, storage and config-revision isolation, cancellation/revocation,
+and provider document absence after deletion. These are release gates, not
+claims established by this source-only change. No new unit tests were added.

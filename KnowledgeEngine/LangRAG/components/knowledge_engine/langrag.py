@@ -139,7 +139,7 @@ class LangRAG(KnowledgeEngine):
                 )
             except BaseException:
                 # Remote mutation may have committed after a transport timeout.
-                self._state.fenced = True
+                self._state.fence(self.plugin)
                 raise
             add_stage_duration(
                 stage_durations,
@@ -893,7 +893,7 @@ class LangRAG(KnowledgeEngine):
                     raise ValueError("Host vector_delete must return a nonnegative integer count")
                 count = result_count
             except BaseException:
-                self._state.fenced = True
+                self._state.fence(self.plugin)
                 raise
             # An authoritative no-op also confirms absence (empty ingest or retry).
             deleted = True

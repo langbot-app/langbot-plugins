@@ -256,12 +256,7 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # Extract the document ID returned by RAGFlow
                 docs = upload_data.get("data", [])
                 if not docs:
-                    logger.error("[RAGFlowKnowledgeEngine] Upload returned no document data")
-                    return IngestionResult(
-                        document_id=doc_id,
-                        status=DocumentStatus.FAILED,
-                        error_message="RAGFlow upload returned empty document list.",
-                    )
+                    raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
 
                 ragflow_doc_id = docs[0].get("id")
                 if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
