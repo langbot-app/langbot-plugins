@@ -85,15 +85,9 @@ RAGFlow employs a hybrid retrieval approach:
 
 The `vector_similarity_weight` parameter controls the balance between keyword and vector methods.
 
-## Shared runtime (SDK 0.6.1)
+## Runtime placement
 
-This version opts into `shared-runtime-v1`. Runtime admission still requires a
-valid Space-issued certificate; the source declaration alone is not certification.
-KB deletion credentials now use installation-bound SDK plugin storage and survive
-worker restarts. Create/ingest and delete are serialized; ambiguous storage
-failures fence further mutations until Host activity is reconciled. Retrieval
-keeps credentials request-local, with bounded HTTP concurrency and a total deadline.
-Existing versions' in-memory credentials cannot be migrated: an existing KB needs
-a create/ingest call before deletion can recover its configuration after upgrade.
-External datasets are isolated only as far as their configured provider credentials
-and dataset IDs; do not share those across Workspaces that must remain separated.
+This version remains dedicated. SDK 0.7.4 shared singleton placement requires a
+signed `stateless-v1` component model, not just `shared-runtime-v1`.
+The existing per-installation mutation state and cancellation model have
+not passed that contract. See [the audit](../SHARED_RUNTIME.md).

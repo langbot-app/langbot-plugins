@@ -200,17 +200,9 @@ We welcome contributions! Feel free to:
 
 Star the repo if you find it useful!
 
-## Shared runtime (SDK 0.6.1)
+## Runtime placement
 
-This version opts into `shared-runtime-v1`; Space-issued certificate admission is
-a separate release gate. Engine and Page telemetry now belong to the installation
-and persist through SDK plugin storage (100 events, at most 192 KiB), not the
-read-only artifact directory. Old local JSONL history is not imported; documents
-and vectors remain unchanged in Host storage. `LANGRAG_OBSERVABILITY_DIR` no longer
-controls runtime persistence.
-
-Internal parsing accepts up to 16 MiB; parsed text accepts up to 4 MiB. Parsing and
-chunk splitting use two bounded off-loop jobs per installation. Ingest/delete
-retain serialization through caller cancellation. Ambiguous vector/storage
-mutations are fenced and require Host quiescence/reconciliation before restart.
-This does not replace the Runtime's process/cgroup limits.
+This version remains dedicated. SDK 0.7.4 shared singleton placement requires a
+signed `stateless-v1` component model, not just `shared-runtime-v1`.
+The existing per-installation mutation state and cancellation model have
+not passed that contract. See [the audit](../SHARED_RUNTIME.md).

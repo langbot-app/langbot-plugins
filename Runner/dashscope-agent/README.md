@@ -101,6 +101,6 @@ Migrated from `dashscope-app-api` in LangBot.
 `timeout` defaults to 120 seconds and must be finite and positive. Generated text (including hidden reasoning) is limited to 1 MiB characters; Coze and Tbox uploads are limited to 10 MiB per file. Existing remote conversation IDs require an explicit scoped import or reset when migrating from native runners. These source changes do not publish or install a new plugin version.
 
 
-## SDK 0.6.1 shared-runtime candidate
+## Dedicated runtime placement
 
-See [shared-runtime boundaries and upgrade notes](SHARED_RUNTIME.md) before upgrading.
+This release is unsigned and dedicated. Historical shared-runtime notes in [SHARED_RUNTIME.md](SHARED_RUNTIME.md) do not grant shared-worker eligibility.

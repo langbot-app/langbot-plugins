@@ -236,7 +236,9 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                 resp_data = response.json()
 
             dify_document = resp_data.get("document", {})
-            dify_doc_id = dify_document.get("id", doc_id)
+            dify_doc_id = dify_document.get("id")
+            if not isinstance(dify_doc_id, str) or not dify_doc_id:
+                raise ValueError("Dify upload omitted upstream document ID; outcome requires reconciliation")
 
             logger.info(
                 f"[DifyDatasetsConnector] File uploaded: {filename} -> "

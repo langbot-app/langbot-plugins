@@ -209,6 +209,8 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
 
             resp_data = result.get("data", {})
             collection_id = resp_data.get("collectionId", "")
+            if not isinstance(collection_id, str) or not collection_id:
+                raise ValueError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
             insert_len = resp_data.get("results", {}).get("insertLen", 0)
 
             logger.info(

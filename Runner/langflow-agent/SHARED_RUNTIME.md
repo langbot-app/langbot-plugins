@@ -1,6 +1,6 @@
 # Shared runtime candidate (SDK 0.6.1)
 
-This source declares the SDK shared-runtime contract. That declaration is not a
+Previous source declared the SDK shared-runtime contract; this dedicated release removes that declaration. It is not a
 certificate or a claim of live vendor acceptance. Exact archives require a separate
 independent review, signer approval, and two-Workspace acceptance.
 

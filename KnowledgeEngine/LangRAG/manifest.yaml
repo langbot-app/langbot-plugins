@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: LangRAG
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/KnowledgeEngine/LangRAG
-  version: 0.1.13
+  version: 0.1.14
   description:
     en_US: LangBot Knowledge Engine - Document ingestion and vector retrieval 
       using Host infrastructure
@@ -38,7 +38,6 @@ spec:
       - path: components/pages/
         maxDepth: 1
 execution:
-  sharedRuntime: shared-runtime-v1
   python:
     path: main.py
     attr: LangRAG

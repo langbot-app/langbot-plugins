@@ -102,6 +102,6 @@ does not create or update the flow's MCP component.
 Migrated from `langflow-api` in LangBot.
 
 
-## SDK 0.6.1 shared-runtime candidate
+## Dedicated runtime placement
 
-See [shared-runtime boundaries and upgrade notes](SHARED_RUNTIME.md) before upgrading.
+This release is unsigned and dedicated. Historical shared-runtime notes in [SHARED_RUNTIME.md](SHARED_RUNTIME.md) do not grant shared-worker eligibility.

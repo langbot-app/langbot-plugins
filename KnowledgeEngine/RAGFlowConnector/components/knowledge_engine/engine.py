@@ -263,7 +263,9 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                         error_message="RAGFlow upload returned empty document list.",
                     )
 
-                ragflow_doc_id = docs[0].get("id", doc_id)
+                ragflow_doc_id = docs[0].get("id")
+                if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
+                    raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
 
                 # 3. Trigger parsing
                 chunks_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/chunks"
