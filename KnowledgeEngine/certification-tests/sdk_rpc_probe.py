@@ -39,7 +39,7 @@ async def main():
     components = discover_plugin_components(manifest, discovery)
     kinds = sorted(c.kind for c in components)
     assert kinds == (['KnowledgeEngine', 'Page'] if NAME == 'LangRAG' else ['KnowledgeEngine'])
-    assert manifest.execution.shared_runtime == 'shared-runtime-v1'
+    assert manifest.execution.shared_runtime is None, 'These four candidates remain dedicated'
     stores, vectors, calls = {}, {}, []
     http_calls = []
     async def provider(request):
