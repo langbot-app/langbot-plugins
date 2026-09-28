@@ -73,9 +73,9 @@ jobs:
         run: uv run --no-sync python -m pytest http-certification-tests -q --junitxml="${RUNNER_EVIDENCE_DIR}/http-certification.xml"
       - name: Certified RunnerDemo SDK admission and package tests
         run: |
-          uv run --no-project --with langbot-plugin==0.7.4 --with pyyaml python certification-tests/test_runner_demo_dependency_admission.py -v
+          "$RUNNER_TEMP/coding-074/bin/python" certification-tests/test_runner_demo_dependency_admission.py -v
           cd RunnerDemo
-          uv run --no-project --with langbot-plugin==0.7.4 --with pyyaml python -m unittest discover -s tests -v
+          "$RUNNER_TEMP/coding-074/bin/python" -m unittest discover -s tests -v
       - name: Upload test evidence
         if: always()
         uses: actions/upload-artifact@v4
