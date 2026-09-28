@@ -3,7 +3,7 @@ kind: Plugin
 metadata:
   author: langbot-team
   name: LocalAgent
-  version: 0.1.10
+  version: 0.1.11
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/Runner/LocalAgent
   label:
     en_US: Local Agent
@@ -33,6 +33,7 @@ spec:
   pages: []
 execution:
   sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1
   python:
     path: main.py
     attr: LocalAgentPlugin

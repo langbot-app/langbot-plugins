@@ -200,6 +200,9 @@ async def sdk_runtime(monkeypatch, tmp_path):
         async with websockets.connect(f"ws://127.0.0.1:{port}") as socket:
             handler = PluginRuntimeHandler(WebSocketConnection(socket), controller.initialize)
             handler.plugin_container = controller.plugin_container
+            handler._slot_initialize_callback = controller.initialize_slot
+            handler._slot_detach_callback = controller.detach_slot
+            handler._slot_cancel_callback = controller.invalidate_slot
             controller.handler = handler
             task = asyncio.create_task(handler.run())
             backend = await asyncio.wait_for(host_ready, 3)

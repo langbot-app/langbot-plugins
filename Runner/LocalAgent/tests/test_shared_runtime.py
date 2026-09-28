@@ -28,6 +28,7 @@ class ScopedHost(base.BackendProtocolFixture):
     def __init__(self, host):
         super().__init__(host)
         self.owners = {}
+        self.attached = set()
         self.storage = {}
         self.cancel_runs = set()
         self.fail_runs = set()
@@ -176,6 +177,14 @@ class ScopedHost(base.BackendProtocolFixture):
             runtime_revision=1,
             artifact_digest="1" * 64,
         )
+        if binding.installation_uuid not in self.attached:
+            await self.host.call_action(
+                R.ATTACH_PLUGIN_SLOT,
+                {"plugin_settings": {"enabled": True, "priority": 0, "plugin_config": {}}},
+                timeout=3,
+                action_context=binding,
+            )
+            self.attached.add(binding.installation_uuid)
         return [
             RunnerResult.model_validate(item)
             async for item in self.host.call_action_generator(
