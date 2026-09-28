@@ -84,16 +84,21 @@ async def test_telemetry_cancellation_clear_and_failure_fencing():
     task.cancel()
     clear = asyncio.create_task(plugin.telemetry.clear())
     await asyncio.sleep(.01)
-    assert not clear.done()
+    with pytest.raises(RuntimeError, match='fenced'):
+        await clear
     store.release.set()
     await asyncio.gather(task, return_exceptions=True)
-    await clear
     other = bind(pc, store)
     await other.initialize()
-    assert (await other.telemetry.snapshot())['recent']['delete'] == []
+    # A fresh reader may see the detached commit, but a failed clear cannot
+    # acknowledge deletion or introduce a later event.
+    assert all(event['document_id'] != 'new' for event in (await other.telemetry.snapshot())['recent']['delete'])
     store.fail = True
-    await plugin.telemetry.record_delete(collection_id='kb', document_id='new', status='completed', duration_ms=1)
-    assert (await plugin.telemetry.snapshot())['persistence']['error']
+    with pytest.raises(RuntimeError, match='fenced'):
+        await plugin.telemetry.record_delete(collection_id='kb', document_id='new', status='completed', duration_ms=1)
+    with pytest.raises(RuntimeError, match='fenced'):
+        await plugin.telemetry.snapshot()
     store.fail = False
     with pytest.raises(RuntimeError, match='fenced'):
         await plugin.telemetry.clear()
+    assert all(event['document_id'] != 'new' for event in (await other.telemetry.snapshot())['recent']['delete'])

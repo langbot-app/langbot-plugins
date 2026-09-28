@@ -92,13 +92,19 @@ async def test_connector_restart_isolation_and_delete(name, monkeypatch):
     await eb.on_knowledge_base_create('same-kb', configuration('B'))
     restarted = ec()
     restarted.plugin = bind(pc, a)
+    # No acknowledged ingestion mapping exists; guessing a provider ID is unsafe.
+    assert await restarted.delete_document('same-kb', 'doc') is False
+    assert await eb.delete_document('same-kb', 'doc') is False
+    assert not any(request.method == 'DELETE' for request in calls)
+    await restarted._save_document('same-kb', 'doc', {'upstream_id': 'upstream-A', 'dataset_id': 'A', 'status': 'created'})
+    await eb._save_document('same-kb', 'doc', {'upstream_id': 'upstream-B', 'dataset_id': 'B', 'status': 'created'})
     assert await restarted.delete_document('same-kb', 'doc') is True
     assert calls[-1].headers['authorization'] == 'Bearer A'
     assert await eb.delete_document('same-kb', 'doc') is True
     assert calls[-1].headers['authorization'] == 'Bearer B'
     await restarted.on_knowledge_base_delete('same-kb')
     assert await restarted.delete_document('same-kb', 'doc') is False
-    assert await eb.delete_document('same-kb', 'doc') is True
+    assert await eb.delete_document('same-kb', 'doc') is False
 
 
 @pytest.mark.asyncio
@@ -118,11 +124,14 @@ async def test_cancelled_config_commit_cannot_resurrect_deleted_kb(name):
         write.cancel()
         delete = asyncio.create_task(engine.on_knowledge_base_delete('kb'))
         await asyncio.sleep(.01)
-        assert not delete.done()
+        # Cancellation makes the Host write outcome ambiguous: fail closed.
+        with pytest.raises(RuntimeError, match='fenced'):
+            await delete
         store.release.set()
         with pytest.raises(asyncio.CancelledError):
             await write
-        await delete
+        with pytest.raises(RuntimeError, match='fenced'):
+            await engine.on_knowledge_base_create('kb', {'marker': 'B'})
         restarted = ec()
         restarted.plugin = bind(pc, store)
         assert await restarted.delete_document('kb', 'doc') is False

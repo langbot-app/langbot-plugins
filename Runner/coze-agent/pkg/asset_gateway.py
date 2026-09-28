@@ -10,15 +10,15 @@ import json
 import math
 import secrets
 import time
+from contextvars import copy_context
 
 from langbot_plugin.api.agent_tools.asset_gateway import (
     LANGBOT_AGENT_GATEWAY_INFO,
     LANGBOT_AGENT_GATEWAY_INSTRUCTIONS,
 )
 from langbot_plugin.api.agent_tools.external_tools import AgentRunExternalTools
-from contextvars import copy_context
-from langbot_plugin.api.proxies.invocation import invocation_capability
 from langbot_plugin.api.agent_tools.mcp_protocol import handle_mcp_payload, mcp_tool_error
+from langbot_plugin.api.proxies.invocation import invocation_capability
 
 MAX_BODY = 1024 * 1024
 MAX_CONNECTIONS = 16
@@ -58,7 +58,12 @@ class Gateway:
 
     def _registration_for_token(self, token):
         r = self.registrations.get(token)
-        if r is not None and r.authority.active and time.monotonic() < r.expires_at and hmac.compare_digest(r.token, token):
+        if (
+            r is not None
+            and r.authority.active
+            and time.monotonic() < r.expires_at
+            and hmac.compare_digest(r.token, token)
+        ):
             return r
         return None
 
