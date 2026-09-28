@@ -1,12 +1,13 @@
-"""Offline two-Workspace proof against unmodified Git-built Runner archives.
+"""Offline two-Workspace proof against Git-built Runner archives and a released SDK.
 
-Run separately with the stateless SDK checkout on PYTHONPATH; no credentials,
-production tenants, marketplace signing, or external provider calls are used.
+Run with the installed langbot-plugin wheel >=0.7.3; no credentials, production
+tenants, marketplace signing, or external provider calls are used.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.version import Version
 from langbot_plugin.entities.io.actions.enums import (
     PluginToRuntimeAction,
     RuntimeToPluginAction,
@@ -26,7 +28,6 @@ from langbot_plugin.entities.io.actions.enums import (
 from langbot_plugin.entities.io.context import InstallationBinding
 
 ROOT = Path(__file__).resolve().parents[2]
-SDK = Path('/home/rock/work/langbot-sdk-stateless-shared')
 FOLDERS = ('RunnerDemo', 'LocalAgent', 'deerflow-agent', 'weknora-agent')
 
 
@@ -47,7 +48,7 @@ def package(folder: str, dest: Path) -> tuple[Path, str]:
         else:
             shutil.copy2(entry, target)
     env = os.environ.copy()
-    env['PYTHONPATH'] = str(SDK / 'src')
+    env.pop('PYTHONPATH', None)  # Require the released wheel in this interpreter.
     subprocess.run([sys.executable, '-m', 'langbot_plugin.cli.__init__', 'build', '-o', str(dest / 'built')], cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
     packages = list((dest / 'built').glob('*.lbpkg'))
     assert len(packages) == 1
@@ -127,7 +128,7 @@ async def observed(self, binding, settings):
 PluginRuntimeController.initialize_slot = observed
 ''')
     env = os.environ.copy()
-    env.update(PYTHONPATH=f'{hook}:{SDK / "src"}', LANGBOT_PLUGIN_REGISTRATION_CAPABILITY='x' * 40,
+    env.update(PYTHONPATH=str(hook), LANGBOT_PLUGIN_REGISTRATION_CAPABILITY='x' * 40,
                LANGBOT_PLUGIN_RUNTIME_PROFILE='shared', LANGBOT_PLUGIN_FILE_STORAGE_DIR=str(dest / 'transfer'),
                PROOF_GRAPH_LOG=str(dest / 'graph.jsonl'), PYTHONUNBUFFERED='1')
     proc = await asyncio.create_subprocess_exec(sys.executable, '-m', 'langbot_plugin.cli.__init__', 'run', '-s', '--prod',
@@ -150,6 +151,7 @@ PluginRuntimeController.initialize_slot = observed
 @pytest.mark.asyncio
 @pytest.mark.parametrize('folder', FOLDERS)
 async def test_two_workspace_same_archive_shared_worker(folder, tmp_path):
+    assert Version(importlib.metadata.version('langbot-plugin')) >= Version('0.7.3')
     installed, digest = package(folder, tmp_path)
     a, b = binding(digest, 'A'), binding(digest, 'B')
     worker = await launch(installed, tmp_path)
