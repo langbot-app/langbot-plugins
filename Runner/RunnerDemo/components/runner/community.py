@@ -261,7 +261,7 @@ class CommunityProcessor(Runner):
             if tool not in available:
                 continue
             try:
-                await self.plugin.call_tool(tool, {})
+                await ctx.call_tool(tool, {})
                 await ctx.log(text(ctx, f"Lookup completed: {tool}", f"资料查询完成：{tool}"))
             except Exception as exc:
                 # Optional enrichment should not prevent a welcome reply on adapters without lookup support.

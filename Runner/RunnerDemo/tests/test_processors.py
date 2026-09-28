@@ -7,8 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import yaml
 from components.runner.community import CommunityProcessor
 from components.runner.observer import ObserverProcessor
+from langbot_plugin.api.definition.components.manifest import Execution
 from langbot_plugin.api.definition.components.runner import RunnerContext
 from langbot_plugin.api.proxies.langbot_api import LangBotAPIProxy
 
@@ -61,6 +63,16 @@ class ProcessorTests(unittest.IsolatedAsyncioTestCase):
         results = [item async for item in component.invoke(ctx)]
         return results, api
 
+    async def test_stateless_manifest_and_both_event_components(self):
+        manifest = yaml.safe_load((ROOT / "manifest.yaml").read_text())
+        execution = Execution.model_validate(manifest["execution"])
+        self.assertEqual(execution.component_model, "stateless-v1")
+        self.assertEqual(execution.shared_runtime, "shared-runtime-v1")
+        for component in (CommunityProcessor(), ObserverProcessor()):
+            await component.initialize()
+            self.assertTrue(component.registered_handlers)
+            self.assertFalse(any(isinstance(value, asyncio.Task) for value in vars(component).values()))
+
     async def test_all_success_examples_complete_once(self):
         scenarios = json.loads((ROOT / "examples/scenarios.json").read_text())
         for scenario in scenarios:
@@ -70,6 +82,44 @@ class ProcessorTests(unittest.IsolatedAsyncioTestCase):
                 component = ObserverProcessor() if scenario["component"] == "observer" else CommunityProcessor()
                 results, _ = await self.execute(scenario["file"], component=component)
                 self.assertEqual(sum(r.type == "run.completed" for r in results), 1)
+
+    async def test_profile_uses_invocation_api_not_process_plugin_proxy(self):
+        component = CommunityProcessor()
+        await component.initialize()
+        payload = json.loads((ROOT / "examples/01-member-joined.json").read_text())
+        calls = []
+        apis = {}
+        component.get_run_api = Mock(side_effect=lambda ctx: apis[ctx.run_id])
+
+        async def exercise(label):
+            async def call_tool(tool, parameters):
+                await asyncio.sleep(0)
+                calls.append((label, tool))
+                return {"mock": True}
+
+            api = SimpleNamespace(
+                call_tool=call_tool,
+                list_tools=AsyncMock(return_value=[{"name": "event_get_actor"}, {"name": "event_get_group"}]),
+            )
+            apis[label] = api
+            ctx = run_context(
+                run_id=label,
+                config={"welcome_text": label},
+                event=SimpleNamespace(data={"type": payload["event_type"], **payload["data"]}),
+            )
+            return [r async for r in component.invoke(ctx)]
+
+        # The process plugin proxy must never service a run-scoped tool call.
+        component.plugin = SimpleNamespace(call_tool=AsyncMock(side_effect=AssertionError("process proxy used")))
+        first, second = await asyncio.gather(exercise("A"), exercise("B"))
+        self.assertEqual(sum(r.type == "run.completed" for r in first), 1)
+        self.assertEqual(sum(r.type == "run.completed" for r in second), 1)
+        self.assertCountEqual(
+            calls,
+            [(label, tool) for label in ("A", "B")
+             for tool in ("event_get_actor", "event_get_group", "event_reply")],
+        )
+        component.plugin.call_tool.assert_not_called()
 
     async def test_welcome_has_three_traced_actions(self):
         results, api = await self.execute("01-member-joined.json")
