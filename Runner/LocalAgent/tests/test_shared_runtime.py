@@ -41,6 +41,7 @@ class ScopedHost(base.BackendProtocolFixture):
         self.peak = 0
         self.compact = False
         self.barrier = False
+        self.host_slots = set()
 
         @host.action(P.RUN_GET)
         async def run_get(data):
@@ -176,6 +177,14 @@ class ScopedHost(base.BackendProtocolFixture):
             runtime_revision=1,
             artifact_digest="1" * 64,
         )
+        if binding.installation_uuid not in self.host_slots:
+            await self.host.call_action(
+                R.ATTACH_PLUGIN_SLOT,
+                {"plugin_settings": {"enabled": True, "priority": 0, "plugin_config": {}}},
+                timeout=5,
+                action_context=binding,
+            )
+            self.host_slots.add(binding.installation_uuid)
         return [
             RunnerResult.model_validate(item)
             async for item in self.host.call_action_generator(

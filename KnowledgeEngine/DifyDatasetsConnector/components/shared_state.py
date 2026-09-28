@@ -8,6 +8,7 @@ import json
 from functools import wraps
 from contextlib import asynccontextmanager
 import httpx
+from weakref import WeakValueDictionary
 
 HTTP_TOTAL_TIMEOUT = 150.0
 
@@ -30,27 +31,44 @@ async def settle(task):
 
 class SerialState:
     def __init__(self):
-        self.lock = asyncio.Lock()
-        self.fenced = False
+        self._locks = WeakValueDictionary()
+        self._fenced = set()
 
-    async def run(self, operation):
-        async with self.lock:
-            if self.fenced:
+    @staticmethod
+    def binding(plugin):
+        binding = plugin.get_installation_binding()
+        return binding if binding is not None else ('dedicated',)
+
+    def fence(self, plugin):
+        self._fenced.add(self.binding(plugin))
+
+    async def run(self, plugin, operation):
+        binding = self.binding(plugin)
+        lock = self._locks.get(binding)
+        if lock is None:
+            lock = self._locks[binding] = asyncio.Lock()
+        async with lock:
+            if binding in self._fenced:
                 raise RuntimeError("Installation state fenced after ambiguous storage failure; reconcile before restart")
-            return await settle(asyncio.create_task(operation()))
+            try:
+                # Host RPCs must remain in the SDK-owned, revocable invocation.
+                return await operation()
+            except BaseException:
+                self._fenced.add(binding)
+                raise
 
     async def write(self, plugin, key, value):
         try:
             await plugin.set_plugin_storage(key, value)
         except BaseException:
-            self.fenced = True
+            self.fence(plugin)
             raise
 
 
 def serialized(method):
     @wraps(method)
     async def call(self, *args, **kwargs):
-        return await self._state.run(lambda: method(self, *args, **kwargs))
+        return await self._state.run(self.plugin, lambda: method(self, *args, **kwargs))
     return call
 
 
@@ -93,3 +111,36 @@ class ConfigStore:
         if value is not None and not isinstance(value, dict):
             raise ValueError("Invalid persisted knowledge-base configuration")
         return value
+
+    @staticmethod
+    def _document_key(kb_id, host_document_id):
+        return "ke.document.v1." + hashlib.sha256(
+            json.dumps([kb_id, host_document_id]).encode()
+        ).hexdigest()
+
+    async def _load_document(self, kb_id, host_document_id):
+        key = self._document_key(kb_id, host_document_id)
+        keys = await self.plugin.get_plugin_storage_keys()
+        if key in keys:
+            value = json.loads(await self.plugin.get_plugin_storage(key))
+        else:
+            # Current Host passes the durable upstream ID on delete; older Host
+            # revisions pass its file UUID. Resolve either without trusting an
+            # arbitrary unrecorded identifier.
+            matches = []
+            for candidate in keys:
+                if candidate.startswith('ke.document.v1.'):
+                    item = json.loads(await self.plugin.get_plugin_storage(candidate))
+                    if item.get('kb_id') == kb_id and item.get('upstream_id') == host_document_id:
+                        matches.append(item)
+            if len(matches) > 1:
+                raise ValueError('Ambiguous upstream document ID')
+            return matches[0] if matches else None
+        if not isinstance(value, dict) or not isinstance(value.get('upstream_id'), str):
+            raise ValueError('Invalid upstream document mapping; reconcile installation')
+        return value
+
+    async def _save_document(self, kb_id, host_document_id, value):
+        value = {**value, 'kb_id': kb_id, 'host_document_id': host_document_id}
+        await self._state.write(self.plugin, self._document_key(kb_id, host_document_id),
+                                json.dumps(value).encode())

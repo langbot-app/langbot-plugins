@@ -200,6 +200,8 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
         # Persist config for deletion after worker restart
         kb_id = context.get_collection_id()
         await self._save_config(kb_id, config)
+        if await self._load_document(kb_id, doc_id) is not None:
+            raise RuntimeError('Existing upload intent; reconcile before retry')
 
         # 1. Read file content from Host
         try:
@@ -212,6 +214,10 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                 error_message=f"Could not read file: {e}",
             )
 
+        # Intent is durable before remote I/O; an ambiguous timeout cannot create
+        # a second document on retry without explicit upstream reconciliation.
+        await self._save_document(kb_id, doc_id, {'upstream_id': '', 'dataset_id': dataset_id,
+            'status': 'pending'})
         # 2. Upload to Dify dataset
         url = f"{api_base_url}/datasets/{dataset_id}/document/create-by-file"
         headers = {
@@ -239,6 +245,8 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             dify_doc_id = dify_document.get("id")
             if not isinstance(dify_doc_id, str) or not dify_doc_id:
                 raise ValueError("Dify upload omitted upstream document ID; outcome requires reconciliation")
+            await self._save_document(kb_id, doc_id, {'upstream_id': dify_doc_id,
+                'dataset_id': dataset_id, 'status': 'created'})
 
             logger.info(
                 f"[DifyDatasetsConnector] File uploaded: {filename} -> "
@@ -272,6 +280,9 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
     @serialized
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a document from a Dify dataset."""
+        mapping = await self._load_document(kb_id, document_id)
+        if not mapping or not mapping['upstream_id'] or mapping['status'] != 'created':
+            return False
         config = await self._load_config(kb_id)
         if not config:
             logger.warning(
@@ -291,7 +302,9 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             )
             return False
 
-        url = f"{api_base_url}/datasets/{dataset_id}/documents/{document_id}"
+        if mapping['dataset_id'] != dataset_id:
+            raise RuntimeError('Dataset changed; reconcile before deletion')
+        url = f"{api_base_url}/datasets/{dataset_id}/documents/{mapping['upstream_id']}"
         headers = {
             "Authorization": f"Bearer {api_key}",
         }
@@ -300,6 +313,7 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             async with self.http_client() as client:
                 response = await client.delete(url, headers=headers, timeout=30.0)
                 if response.status_code == 204:
+                    await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
                     logger.info(
                         f"[DifyDatasetsConnector] Document deleted: {document_id} "
                         f"from dataset {dataset_id}"
@@ -307,6 +321,7 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                     return True
                 response.raise_for_status()
                 # Some Dify versions may return 200 instead of 204
+                await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
                 logger.info(
                     f"[DifyDatasetsConnector] Document deleted: {document_id} "
                     f"from dataset {dataset_id} (status={response.status_code})"

@@ -326,6 +326,7 @@ def test_codex_run_drains_steering() -> None:
     native = sys.modules["pkg.native_cli"]
     runner = object.__new__(module.DefaultRunner)
     runner._plugin_config = {}
+    runner._plugin_runtime_handler = None
     calls = _patch_turn(runner, "_run_local_or_ssh", native.SESSION_STATE_KEY)
     api = _FakeRunApi([["second message"], []])
     runner.get_run_api = lambda ctx: api
@@ -342,6 +343,7 @@ def test_claude_run_drains_steering() -> None:
     native = sys.modules["pkg.native_cli"]
     runner = object.__new__(module.DefaultRunner)
     runner._plugin_config = {}
+    runner._plugin_runtime_handler = None
     calls = _patch_turn(runner, "_run_local_or_ssh", native.SESSION_STATE_KEY, emit_session=False)
     api = _FakeRunApi([["second message"], []])
     runner.get_run_api = lambda ctx: api
@@ -361,6 +363,7 @@ def test_acp_run_drains_steering() -> None:
     module = _load_plugin("acp-agent-runner")
     runner = object.__new__(module.DefaultRunner)
     runner._plugin_config = {}
+    runner._plugin_runtime_handler = None
     calls = _patch_turn(runner, "_run_acp_turn", module.ACP_SESSION_STATE_KEY)
     api = _FakeRunApi([["second message"], []])
     runner.get_run_api = lambda ctx: api

@@ -22,6 +22,7 @@ from langbot_plugin.cli.run.controller import PluginRuntimeController
 from langbot_plugin.cli.run.handler import PluginRuntimeHandler
 from langbot_plugin.cli.utils.page_components import discover_plugin_components
 from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction, RuntimeToPluginAction
+from langbot_plugin.entities.io.context import InstallationBinding
 from langbot_plugin.entities.io.resp import ActionResponse
 from langbot_plugin.runtime.io.connections.ws import WebSocketConnection
 from langbot_plugin.runtime.io.handler import Handler
@@ -152,6 +153,9 @@ class BackendProtocolFixture:
         return await asyncio.wait_for(collect(), timeout=5)
 
 
+ORIGINAL_BACKEND_FIXTURE = BackendProtocolFixture
+
+
 def run_context(*, streaming=True, tools=False):
     return RunnerContext.model_validate(
         {
@@ -181,6 +185,10 @@ async def sdk_runtime(monkeypatch, tmp_path):
     discovery = ComponentDiscoveryEngine()
     manifest = discovery.load_component_manifest("manifest.yaml")
     assert manifest is not None
+    shared = BackendProtocolFixture is not ORIGINAL_BACKEND_FIXTURE
+    if shared:
+        manifest.execution.shared_runtime = "shared-runtime-v1"
+        manifest.execution.component_model = "stateless-v1"
     components = discover_plugin_components(manifest, discovery)
     assert [(item.kind, item.metadata.name) for item in components] == [("Runner", "default")]
     controller = PluginRuntimeController(manifest, components, stdio=False, ws_debug_url="")
@@ -200,15 +208,35 @@ async def sdk_runtime(monkeypatch, tmp_path):
         async with websockets.connect(f"ws://127.0.0.1:{port}") as socket:
             handler = PluginRuntimeHandler(WebSocketConnection(socket), controller.initialize)
             handler.plugin_container = controller.plugin_container
+            if shared:
+                handler._slot_initialize_callback = controller.initialize_slot
+                handler._slot_detach_callback = controller.detach_slot
+                handler._slot_cancel_callback = controller.invalidate_slot
             controller.handler = handler
             task = asyncio.create_task(handler.run())
             backend = await asyncio.wait_for(host_ready, 3)
             try:
-                await backend.host.call_action(
-                    RuntimeToPluginAction.INITIALIZE_PLUGIN,
-                    {"plugin_settings": {"enabled": True, "priority": 0, "plugin_config": {}}},
-                    timeout=3,
-                )
+                if shared:
+                    backend.host_slots = set()
+                    await backend.host.call_action(
+                        RuntimeToPluginAction.ATTACH_PLUGIN_SLOT,
+                        {"plugin_settings": {"enabled": True, "priority": 0, "plugin_config": {}}},
+                        timeout=3,
+                        action_context=InstallationBinding(
+                            instance_uuid="fixture",
+                            workspace_uuid="workspace-a",
+                            installation_uuid="installation-a",
+                            runtime_revision=1,
+                            artifact_digest="1" * 64,
+                        ),
+                    )
+                    backend.host_slots.add("installation-a")
+                else:
+                    await backend.host.call_action(
+                        RuntimeToPluginAction.INITIALIZE_PLUGIN,
+                        {"plugin_settings": {"enabled": True, "priority": 0, "plugin_config": {}}},
+                        timeout=3,
+                    )
                 container = controller.plugin_container
                 assert container.status == RuntimeContainerStatus.INITIALIZED
                 assert type(container.plugin_instance).__name__ == "LocalAgentPlugin"

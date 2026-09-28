@@ -1,5 +1,6 @@
 """Bound CPU/file parsing work per installation, including cancelled callers."""
 import asyncio
+import contextvars
 from components.shared_state import settle
 
 
@@ -9,6 +10,11 @@ class BoundedOffload:
 
     async def run(self, function, *args, **kwargs):
         async with self._slots:
-            # Cancellation cannot terminate a Python thread. Keep its slot until
-            # completion; never launch replacement work beyond the bound.
-            return await settle(asyncio.create_task(asyncio.to_thread(function, *args, **kwargs)))
+            # A worker cannot be interrupted. Run with an empty context so it
+            # never inherits the invocation's revocable tenant capability.
+            # Settle before releasing the slot; discard the result on cancel.
+            worker_context = contextvars.Context()
+            task = asyncio.create_task(
+                asyncio.to_thread(worker_context.run, function, *args, **kwargs)
+            )
+            return await settle(task)

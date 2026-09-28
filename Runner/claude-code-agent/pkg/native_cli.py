@@ -467,6 +467,8 @@ class NativeClaudeCodeRunner(Runner):
         daemon_id = str(data.get("daemon-id") or data.get("daemon_id") or "").strip()
         if location == "daemon" and not daemon_id:
             raise NativeCliError("daemon-id is required when location=daemon", code="claude_code.config_invalid")
+        if location == "daemon" and os.environ.get("LANGBOT_PLUGIN_RUNTIME_PROFILE") == "shared":
+            raise NativeCliError("daemon mode is unavailable in shared runtime", code="claude_code.config_invalid")
         return {
             "location": location,
             "workspace": workspace,

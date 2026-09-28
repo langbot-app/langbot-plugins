@@ -42,11 +42,14 @@ async def test_cancelled_ingest_cannot_commit_after_delete():
     deleted = asyncio.create_task(engine.delete_document('kb', 'doc'))
     try:
         await asyncio.sleep(.01)
-        assert not deleted.done(), 'Delete must not overtake an in-flight vector commit'
+        with pytest.raises(RuntimeError, match='fenced'):
+            await deleted
     finally:
         release.set()
         await asyncio.gather(task, deleted, return_exceptions=True)
-    assert not rows
+    # A detached Host may still commit; fenced state cannot claim safe deletion.
+    with pytest.raises(RuntimeError, match='fenced'):
+        await engine.delete_document('kb', 'doc')
 
 
 @pytest.mark.asyncio

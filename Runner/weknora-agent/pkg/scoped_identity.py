@@ -6,7 +6,13 @@ import json
 
 def scoped_identity(runner, ctx, local_id):
     handler = getattr(runner, "_plugin_runtime_handler", None)
-    binding = getattr(handler, "bound_action_context", None)
+    # Shared workers have no process-wide bound_action_context. Resolve the
+    # active invocation's full installation binding, never a sibling's scope.
+    from langbot_plugin.api.proxies.invocation import current_binding
+
+    binding = current_binding(handler) if handler is not None else None
+    if binding is None:
+        binding = getattr(handler, "bound_action_context", None)
     if binding is not None:
         scope = [binding.instance_uuid, binding.workspace_uuid, binding.installation_uuid]
     else:

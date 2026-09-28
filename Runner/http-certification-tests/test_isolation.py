@@ -21,6 +21,7 @@ from langbot_plugin.api.entities.builtin.runner import (
     DeliveryContext,
     RunnerContext,
 )
+from langbot_plugin.api.proxies.invocation import bind_invocation
 
 ROOT = Path(os.environ.get("HTTP_RUNNER_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
 GATEWAYS = ["coze", "dashscope", "dify", "langflow", "n8n"]
@@ -66,6 +67,13 @@ def context(workspace="A"):
 
 def identity(runner, ctx):
     return (getattr(runner, "_get_user_tag", None) or runner._get_user_id)(ctx)
+
+
+@contextmanager
+def gateway_invocation(runner):
+    # Registration must be owned by the same revocable authority as a real run.
+    with bind_invocation(runner._plugin_runtime_handler):
+        yield
 
 
 @pytest.mark.parametrize("name", IDENTITIES)
@@ -126,7 +134,8 @@ def test_gateway_overlap_has_independent_timeout_and_tokens(name):
                         registration.gateway.stop()
 
     with load(name) as (_, runner):
-        asyncio.run(run(runner))
+        with gateway_invocation(runner):
+            asyncio.run(run(runner))
 
 
 def test_dify_storage_transport_failure_not_misreported_absent():

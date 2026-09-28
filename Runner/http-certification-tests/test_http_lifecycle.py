@@ -3,7 +3,7 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from test_isolation import GATEWAYS, context, load
+from test_isolation import GATEWAYS, context, gateway_invocation, load
 
 
 @pytest.mark.parametrize("name", GATEWAYS)
@@ -54,7 +54,8 @@ def test_gateway_actual_http_revocation_limits_and_close(name):
                 await client.get(reg.endpoint)
 
     with load(name) as (_, runner):
-        asyncio.run(run(runner))
+        with gateway_invocation(runner):
+            asyncio.run(run(runner))
 
 
 @pytest.mark.parametrize("name", ["deerflow", "weknora", "dify", "langflow"])
@@ -208,7 +209,8 @@ def test_same_installation_gateway_overlap_keeps_other_token_alive(name):
                 await b.stop()
 
     with load(name) as (_, runner):
-        asyncio.run(run(runner))
+        with gateway_invocation(runner):
+            asyncio.run(run(runner))
 
 
 @pytest.mark.parametrize("name", GATEWAYS)

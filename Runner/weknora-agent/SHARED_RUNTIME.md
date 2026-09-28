@@ -1,4 +1,4 @@
-# Shared runtime candidate (SDK 0.6.1)
+# Shared runtime candidate (SDK >=0.7.4)
 
 This source declares the SDK shared-runtime contract. That declaration is not a
 certificate or a claim of live vendor acceptance. Exact archives require a separate

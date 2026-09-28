@@ -161,7 +161,10 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 error_message="Missing api_key or dataset_id in configuration.",
             )
 
-        await self._save_config(context.get_collection_id(), config)
+        kb_id = context.get_collection_id()
+        await self._save_config(kb_id, config)
+        if await self._load_document(kb_id, doc_id) is not None:
+            raise RuntimeError('Existing upload intent; reconcile before retry')
 
         # 1. Read file content from Host
         try:
@@ -174,6 +177,8 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 error_message=f"Could not read file: {e}",
             )
 
+        await self._save_document(kb_id, doc_id, {'upstream_id': '', 'dataset_id': dataset_id,
+            'status': 'pending'})
         # 2. Upload file to FastGPT dataset
         url = f"{api_base_url}/api/core/dataset/collection/create/localFile"
         headers = {
@@ -211,6 +216,8 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             collection_id = resp_data.get("collectionId", "")
             if not isinstance(collection_id, str) or not collection_id:
                 raise ValueError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
+            await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
+                'dataset_id': dataset_id, 'status': 'created'})
             insert_len = resp_data.get("results", {}).get("insertLen", 0)
 
             logger.info(
@@ -235,6 +242,9 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
     @serialized
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a collection from FastGPT dataset."""
+        mapping = await self._load_document(kb_id, document_id)
+        if not mapping or not mapping['upstream_id'] or mapping['status'] != 'created':
+            return False
         config = await self._load_config(kb_id)
         if not config:
             logger.error(
@@ -251,12 +261,14 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             return False
 
         url = f"{api_base_url}/api/core/dataset/collection/delete"
+        if mapping['dataset_id'] != config.get('dataset_id'):
+            raise RuntimeError('Dataset changed; reconcile before deletion')
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
             async with self.http_client() as client:
                 response = await client.delete(
-                    url, params={"id": document_id}, headers=headers, timeout=30.0
+                    url, params={"id": mapping['upstream_id']}, headers=headers, timeout=30.0
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -268,6 +280,7 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 )
                 return False
 
+            await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
             logger.info(
                 f"[FastGPTKnowledgeEngine] Collection deleted: {document_id}"
             )

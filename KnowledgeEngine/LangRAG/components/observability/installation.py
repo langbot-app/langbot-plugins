@@ -1,8 +1,7 @@
-"""Async, bounded telemetry persisted via the installation-bound SDK proxy.
+"""Binding-local telemetry backed exclusively by the SDK Host storage API.
 
-No cwd writes, process environment path overrides, or global mutable store.
-Telemetry is diagnostic: failures are surfaced in snapshots, not allowed to
-turn an acknowledged vector operation into a failed/retried ingestion.
+The plugin and its Page can be singletons: no tenant event, error, fence, or
+initialization flag is retained in this object between invocations.
 """
 import json
 
@@ -23,54 +22,54 @@ class InstallationTelemetry:
     def __init__(self, plugin):
         self.plugin = plugin
         self._state = SerialState()
-        self._store = LangRAGTelemetry(max_history_events=MAX_EVENTS)
-        self._error = None
-        self._initialized = False
+
+    async def _transaction(self, operation):
+        return await self._state.run(self.plugin, operation)
 
     async def initialize(self):
-        async def load():
-            if self._initialized:
-                return
-            if KEY in await self.plugin.get_plugin_storage_keys():
-                raw = await self.plugin.get_plugin_storage(KEY)
-                if len(raw) > MAX_BYTES:
-                    raise ValueError('Telemetry snapshot too large')
-                events = json.loads(raw)
-                if not isinstance(events, list) or len(events) > MAX_EVENTS:
-                    raise ValueError('Invalid telemetry snapshot')
-                for event in events:
-                    if not isinstance(event, dict) or not event.get('operation'):
-                        raise ValueError('Invalid telemetry event')
-                    self._store._record_event(event, persist=False)
-                self._store._loaded_event_count = len(events)
-            self._initialized = True
-        try:
-            await self._state.run(load)
-        except Exception as exc:
-            self._state.fenced = True
-            self._error = type(exc).__name__
-            raise
+        """Process-scoped initialization cannot read tenant storage."""
 
-    async def _persist(self):
-        events = list(self._store._events)[-MAX_EVENTS:]
+    async def _load(self):
+        events = []
+        if KEY in await self.plugin.get_plugin_storage_keys():
+            raw = await self.plugin.get_plugin_storage(KEY)
+            if len(raw) > MAX_BYTES:
+                raise ValueError('Telemetry snapshot too large')
+            events = json.loads(raw)
+            if not isinstance(events, list) or len(events) > MAX_EVENTS:
+                raise ValueError('Invalid telemetry snapshot')
+        store = LangRAGTelemetry(max_history_events=MAX_EVENTS)
+        for event in events:
+            if not isinstance(event, dict) or not event.get('operation'):
+                raise ValueError('Invalid telemetry event')
+            store._record_event(event, persist=False)
+        store._loaded_event_count = len(events)
+        return store
+
+    async def _persist(self, store):
+        events = list(store._events)[-MAX_EVENTS:]
         while True:
             raw = json.dumps(events, ensure_ascii=False).encode()
             if len(raw) <= MAX_BYTES:
                 break
             events.pop(0)
-        await self._state.write(self.plugin, KEY, raw)
+        try:
+            await self.plugin.set_plugin_storage(KEY, raw)
+        except BaseException:
+            self._state.fence(self.plugin)
+            raise
 
     async def _record(self, method, kwargs):
         async def record():
-            if not self._initialized:
-                raise RuntimeError('Telemetry is not initialized')
-            # Pure bounded in-memory aggregation; no file I/O is configured.
-            getattr(self._store, method)(**kwargs)
-            await self._persist()
-        try:
-            await self._state.run(record)
-        except Exception as exc:
-            self._error = type(exc).__name__
+            try:
+                store = await self._load()
+                getattr(store, method)(**kwargs)
+                await self._persist(store)
+            except Exception:
+                # Diagnostic failure must not retry an acknowledged vector mutation.
+                # No installation-specific error is retained on the singleton.
+                pass
+        await self._transaction(record)
 
     async def record_ingest(self, **kwargs):
         await self._record('record_ingest', kwargs)
@@ -85,25 +84,32 @@ class InstallationTelemetry:
         await self._record('record_delete', kwargs)
 
     async def snapshot(self):
-        # Bounded CPU work off-loop; RLock protects the pure aggregation store.
-        result = await self.plugin.offload.run(self._store.snapshot)
+        return await self._transaction(self._snapshot)
+
+    async def _snapshot(self):
+        store = await self._load()
+        result = store.snapshot()
         result['persistence'] = {
             'enabled': True, 'path': 'sdk:plugin-storage',
-            'loaded_events': self._store._loaded_event_count,
-            'history_events': len(self._store._events), 'error': self._error,
+            'loaded_events': store._loaded_event_count,
+            'history_events': len(store._events), 'error': None,
         }
         result['alerts'] = [a for a in result['alerts'] if a['code'] != 'persistence_disabled']
-        if self._error:
-            result['alerts'].append({'severity': 'warning', 'code': 'persistence_error', 'message': self._error})
-        result['health'] = self._store._health(result['alerts'])
+        result['health'] = store._health(result['alerts'])
         return result
 
     async def prometheus(self):
-        snapshot = await self.snapshot()
-        return await self.plugin.offload.run(self._store.prometheus, snapshot)
+        return await self._transaction(self._prometheus)
+
+    async def _prometheus(self):
+        store = await self._load()
+        return store.prometheus(await self._snapshot())
 
     async def clear(self):
         async def clear():
-            await self._state.write(self.plugin, KEY, b'[]')
-            self._store.clear()
-        await self._state.run(clear)
+            try:
+                await self.plugin.set_plugin_storage(KEY, b'[]')
+            except BaseException:
+                self._state.fence(self.plugin)
+                raise
+        await self._transaction(clear)

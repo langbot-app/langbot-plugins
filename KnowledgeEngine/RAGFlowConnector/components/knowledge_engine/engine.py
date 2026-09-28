@@ -218,7 +218,10 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
         # Use the first dataset as the ingestion target
         target_dataset_id = dataset_ids[0]
 
-        await self._save_config(context.get_collection_id(), config)
+        kb_id = context.get_collection_id()
+        await self._save_config(kb_id, config)
+        if await self._load_document(kb_id, doc_id) is not None:
+            raise RuntimeError('Existing upload intent; reconcile before retry')
 
         # 1. Read file content from Host
         try:
@@ -231,6 +234,8 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 error_message=f"Could not read file: {e}",
             )
 
+        await self._save_document(kb_id, doc_id, {'upstream_id': '',
+            'dataset_id': target_dataset_id, 'status': 'pending'})
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
@@ -256,16 +261,13 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # Extract the document ID returned by RAGFlow
                 docs = upload_data.get("data", [])
                 if not docs:
-                    logger.error("[RAGFlowKnowledgeEngine] Upload returned no document data")
-                    return IngestionResult(
-                        document_id=doc_id,
-                        status=DocumentStatus.FAILED,
-                        error_message="RAGFlow upload returned empty document list.",
-                    )
+                    raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
 
                 ragflow_doc_id = docs[0].get("id")
                 if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
                     raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
+                await self._save_document(kb_id, doc_id, {'upstream_id': ragflow_doc_id,
+                    'dataset_id': target_dataset_id, 'status': 'created'})
 
                 # 3. Trigger parsing
                 chunks_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/chunks"
@@ -367,6 +369,9 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
     @serialized
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a document from RAGFlow."""
+        mapping = await self._load_document(kb_id, document_id)
+        if not mapping or not mapping['upstream_id'] or mapping['status'] != 'created':
+            return False
         config = await self._load_config(kb_id)
         if not config:
             logger.error(
@@ -395,6 +400,8 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
         target_dataset_id = dataset_ids[0]
 
         try:
+            if mapping['dataset_id'] != target_dataset_id:
+                raise RuntimeError('Dataset changed; reconcile before deletion')
             async with self.http_client() as client:
                 url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
                 headers = {
@@ -403,7 +410,7 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 }
                 resp = await client.request(
                     "DELETE", url, headers=headers,
-                    json={"ids": [document_id]},
+                    json={"ids": [mapping['upstream_id']]},
                     timeout=30.0,
                 )
                 resp.raise_for_status()
@@ -416,6 +423,7 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                     )
                     return False
 
+                await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
                 logger.info(
                     f"[RAGFlowKnowledgeEngine] Document {document_id} deleted from "
                     f"dataset {target_dataset_id}"

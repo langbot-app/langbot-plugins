@@ -1,4 +1,4 @@
-"""Build exact unsigned archives and exercise genuine SDK 0.6.1 admission.
+"""Build exact unsigned archives and exercise genuine SDK 0.7.4 admission.
 
 Uses SDK ArtifactStore, DependencyEnvironmentStore.prepare and its real direct
 pip installer. This is NOT nsjail/cgroup certification or a production install.
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 async def verify(out):
-    assert importlib.metadata.version('langbot-plugin') == '0.6.1'
+    assert importlib.metadata.version('langbot-plugin') == '0.7.4'
     out.mkdir(parents=True, exist_ok=True)
     dist = importlib.metadata.distribution('langbot-plugin')
     verified = []

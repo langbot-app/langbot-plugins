@@ -1,8 +1,7 @@
-# Shared runtime candidate (SDK 0.6.1)
+# Shared runtime source candidate (SDK >=0.7.4)
 
-Previous source declared the SDK shared-runtime contract; this dedicated release removes that declaration. It is not a
-certificate or a claim of live vendor acceptance. Exact archives require a separate
-independent review, signer approval, and two-Workspace acceptance.
+This source declares shared-runtime-v1 and stateless-v1. It is not certified or a claim of live vendor acceptance.
+The exact archive requires independent review, signer approval, and two-Workspace invocation acceptance.
 
 - Configuration and credentials are read per invocation. No SDK process-global
   settings are modified.
@@ -21,12 +20,11 @@ independent review, signer approval, and two-Workspace acceptance.
 
 ## Optional asset gateway
 
-The listener belongs to the SDK-created Runner component (one installation), not
+The listener belongs to the SDK-created Runner component (one per artifact), not
 a process-global SDK singleton. Concurrent runs with identical host/port/timeout
-share only that component's listener, with distinct expiring tokens. Last release
+share the component listener, with distinct revocable invocation capabilities and expiring tokens. Last release
 closes the listener and drains accepted tasks. Conflicting fixed-port settings fail
-instead of silently reusing or mutating an active listener. Separate installations
-need distinct network namespaces or nonconflicting ports and explicit ingress routing.
+instead of silently reusing or mutating an active listener. Separate installations require an explicit ingress route to their individual run tokens.
 Limits: 16 accepted connections, 16 KiB headers, 1 MiB request/response, 32-message
 MCP batches, finite request timeout <=120s and token TTL <=3600s. Tool RPC cancellation
 does not promise rollback of an already-dispatched Host operation.
