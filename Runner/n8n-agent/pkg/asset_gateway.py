@@ -16,6 +16,8 @@ from langbot_plugin.api.agent_tools.asset_gateway import (
     LANGBOT_AGENT_GATEWAY_INSTRUCTIONS,
 )
 from langbot_plugin.api.agent_tools.external_tools import AgentRunExternalTools
+from contextvars import copy_context
+from langbot_plugin.api.proxies.invocation import invocation_capability
 from langbot_plugin.api.agent_tools.mcp_protocol import handle_mcp_payload, mcp_tool_error
 
 MAX_BODY = 1024 * 1024
@@ -23,7 +25,9 @@ MAX_CONNECTIONS = 16
 
 
 class Registration:
-    def __init__(self, gateway, api, ctx, ttl):
+    def __init__(self, gateway, api, ctx, ttl, authority, context):
+        self.context = context
+        self.authority = authority
         self.gateway = gateway
         self.token = secrets.token_urlsafe(32)
         self.tools = AgentRunExternalTools(api, ctx)
@@ -54,7 +58,7 @@ class Gateway:
 
     def _registration_for_token(self, token):
         r = self.registrations.get(token)
-        if r is not None and time.monotonic() < r.expires_at and hmac.compare_digest(r.token, token):
+        if r is not None and r.authority.active and time.monotonic() < r.expires_at and hmac.compare_digest(r.token, token):
             return r
         return None
 
@@ -120,7 +124,19 @@ class Gateway:
                         task = asyncio.current_task()
                         gateway.call_tasks[task] = token
                         try:
-                            return await registration.tools.call_mcp_tool(name, arguments)
+                            registration.authority.require_active()
+                            task = registration.context.run(
+                                asyncio.create_task,
+                                registration.tools.call_mcp_tool(name, arguments),
+                            )
+                            try:
+                                result = await task
+                            except asyncio.CancelledError:
+                                task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+                                raise
+                            registration.authority.require_active()
+                            return result
                         finally:
                             gateway.call_tasks.pop(task, None)
 
@@ -198,6 +214,9 @@ async def register_assets(owner, api, ctx, config):
         raise ValueError("asset gateway token TTL must be in (0, 3600]")
     # This owner is the SDK-created component, NOT a config-supplied tenant name.
     # One worker/component per installation; no process-global gateway/config.
+    authority = invocation_capability(owner._plugin_runtime_handler)
+    if authority is None:
+        raise RuntimeError("Asset gateway requires an active run-scoped authority")
     if not hasattr(owner, "_asset_gateway_pool"):
         owner._asset_gateway_pool = {}
         owner._asset_gateway_lock = asyncio.Lock()
@@ -217,6 +236,7 @@ async def register_assets(owner, api, ctx, config):
             except BaseException:
                 await gateway.stop()
                 raise
-        registration = Registration(gateway, api, ctx, ttl)
+        authority.require_active()
+        registration = Registration(gateway, api, ctx, ttl, authority, copy_context())
         gateway.registrations[registration.token] = registration
         return registration
