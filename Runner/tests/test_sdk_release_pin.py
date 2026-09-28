@@ -18,7 +18,9 @@ HTTP_PLUGINS = {
     "tbox-agent",
     "weknora-agent",
 }
+SHARED_CANDIDATES = CODING_PLUGINS | (HTTP_PLUGINS - {"deerflow-agent", "weknora-agent"})
 EXPECTED_SDK = dict.fromkeys(CODING_PLUGINS | HTTP_PLUGINS | {"LocalAgent", "RunnerDemo"}, SDK_REQUIREMENT)
+EXPECTED_SDK.update(dict.fromkeys(SHARED_CANDIDATES, "langbot-plugin>=0.7.4,<0.8"))
 PLUGINS = sorted(p.parent for p in ROOT.glob("*/manifest.yaml"))
 
 

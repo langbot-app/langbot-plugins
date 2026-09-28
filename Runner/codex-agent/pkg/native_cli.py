@@ -764,6 +764,8 @@ class NativeCodexRunner(Runner):
         daemon_id = str(data.get("daemon-id") or data.get("daemon_id") or "").strip()
         if location == "daemon" and not daemon_id:
             raise NativeCliError("daemon-id is required when location=daemon", code="codex.config_invalid")
+        if location == "daemon" and os.environ.get("LANGBOT_PLUGIN_RUNTIME_PROFILE") == "shared":
+            raise NativeCliError("daemon mode is unavailable in shared runtime", code="codex.config_invalid")
         approval_policy = str(data.get("approval-policy", "never") or "never").strip()
         if approval_policy not in {"inherit", "untrusted", "on-request", "never"}:
             raise NativeCliError(

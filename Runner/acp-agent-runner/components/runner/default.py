@@ -402,6 +402,11 @@ class DefaultRunner(Runner):
         daemon_id = _first_config_value(config, DAEMON_ID_CONFIG_KEYS)
         if location == "daemon" and not daemon_id:
             raise AcpError("daemon-id is required when location=daemon", code="acp.config_invalid")
+        # The daemon hub is a process-wide socket keyed by daemon ID. Until it
+        # can bind clients and jobs to a full installation capability, accepting
+        # daemon runs in a shared Worker would grant another tenant access.
+        if location == "daemon" and os.environ.get("LANGBOT_PLUGIN_RUNTIME_PROFILE") == "shared":
+            raise AcpError("daemon mode is unavailable in shared runtime", code="acp.config_invalid")
 
         remote_shell = str(config.get("remote-shell", "bash") or "bash").strip()
         if remote_shell not in SUPPORTED_REMOTE_SHELLS:
