@@ -1,10 +1,10 @@
 # 4.11 official Runner + KnowledgeEngine source ledger
 
-Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (fetched before integration). Each `source tree` is the Git tree object for the indicated plugin directory at commit `bb34232fd` (the shared-placement commit); resolve it at review time; it identifies committed source, not a built ZIP, normalized artifact digest, signature, or public marketplace version. Versions below are the integration manifest versions, **not verified live versions**. Author namespace is `langbot-team` for all 18 IDs.
+Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (fetched before integration). Each `source tree` is the Git tree object for the indicated plugin directory at commit `bb34232fd` (the shared-placement commit), unless the row says otherwise; resolve it at review time; it identifies committed source, not a built ZIP, normalized artifact digest, signature, or public marketplace version. Versions below are the integration manifest versions, **not verified live versions**. Author namespace is `langbot-team` for all 18 IDs.
 
 | Official ID | Manifest version | Source tree | Placement claim | Source lane |
 | --- | --- | --- | --- | --- |
-| LocalAgent | 0.2.0 | `6bbc1122301b1e4193a033a28d9dec280cd4b4f0` | shared candidate | four Runner `8bb55ec` |
+| LocalAgent | 0.2.1 | `3c30db89ad68360b1e21f47f4ceee672fe6836be` | shared candidate | four Runner `8bb55ec` |
 | RunnerDemo | 0.2.0 | `0b8179f6c5d054bca080cd333602fb05972abd78` | shared candidate | four Runner `8bb55ec` |
 | ACPAgentRunner | 0.1.16 | `a5fcac59610a67957cc7c2b136eb55bb3dfb6d43` | dedicated only | nine Runner `ede6756` |
 | ClaudeCodeAgent | 0.1.14 | `d7e7442551d333166fc6fd6c2b863b3a1d4d89bb` | dedicated only | nine Runner `ede6756` |
@@ -19,9 +19,11 @@ Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (f
 | WeKnoraAgent | 0.2.0 | `b86401e05e285e9fd1080ea2395176b94ade2c2d` | shared candidate | four Runner `8bb55ec` |
 | DifyDatasetsConnector | 0.2.0 | `fb516e590cd025d109d68980c0bdc6b337bb5931` | shared candidate | KE `ee265c0` |
 | FastGPTConnector | 0.2.0 | `79112c601820cedd0004c114ef304c51faa1b9c6` | shared candidate | KE `ee265c0` |
-| LangRAG | 0.2.0 | `18729150f356eb43d21e1412b22e91eec5d097f2` | shared candidate | KE `ee265c0` |
+| LangRAG | 0.2.1 | `6ff50a5a4455e44fbc816ebed6596b8427cbd7b8` | shared candidate | KE `ee265c0` |
 | LongTermMemory | 0.2.0 | `7cb613ebb9632b7945e51274ba31d78cfdd51340` | shared candidate | KE `ee265c0` |
 | RAGFlowConnector | 0.2.0 | `0af91f67a482a3a7f0aab487d5e12ffa0245c7a9` | shared candidate | KE `ee265c0` |
+
+Two rows were re-integrated after `bb34232fd` and are recorded at `9c68078`: **LangRAG** and **LocalAgent**, both 0.2.1. LangRAG fences a cancelled caller's dispatched vector mutation and a reply whose count is not a nonnegative integer again, and telemetry failures no longer fail the operation they describe; LocalAgent's tree differs only in removed tests and its lockfile version. `misc/GeneralParsers` sits outside this ledger: its trimmed test tree moved it to 0.1.9.
 
 Fifteen source candidates declare both `shared-runtime-v1` and `stateless-v1`; three stay dedicated (the three native coding Runners, whose process-local daemon hubs, shared workspace root and worker-HOME credentials cannot serve two installations from one process). The four KnowledgeEngine plugins moved from dedicated to shared candidate: their locks and fences are keyed by (installation binding, knowledge-base identity), persisted in installation-bound Host storage, released on installation revocation, and only a dispatched mutation with an unknown outcome fences. Ambiguous upstream mutations still need manual reconciliation, but that requirement is identical under dedicated and shared placement and is not a placement blocker. None is asserted certified or production-shared. The source tree identities include integration-only SDK requirement corrections: the four Runner candidates from `8bb55ec` now require `langbot-plugin>=0.7.4,<0.8`, and LangRAG now requires the same instead of `==0.6.1`; their source trees therefore intentionally differ from the lane tips. CI and contract corrections later changed some source trees; the per-plugin tree column identifies the current PR head, not the earlier lane tips.
 
