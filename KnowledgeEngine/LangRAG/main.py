@@ -16,5 +16,19 @@ class LangRAG(BasePlugin):
     async def initialize(self) -> None:
         await self.telemetry.initialize()
 
+    async def on_installation_revoked(self, binding) -> None:
+        """Release process-local state keyed by one revoked installation.
+
+        One object graph serves every installation of the artifact, so a revoked
+        installation's in-process locks and fences are only released here. Needs
+        an SDK whose runtime calls this hook (langbot-plugin 0.7.4 never does).
+        """
+
+        for attribute in ('knowledge_engine_serial_state', 'telemetry_serial_state'):
+            state = getattr(self, attribute, None)
+            release = getattr(state, 'release_binding', None)
+            if release is not None:
+                release(binding)
+
     def __del__(self) -> None:
         pass

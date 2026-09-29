@@ -76,6 +76,17 @@ class LangRAG(KnowledgeEngine):
         super().__init__(*args, **kwargs)
         self._state = SerialState()
 
+    async def initialize(self) -> None:
+        await super().initialize()
+        # The runtime dispatches installation revocation to the plugin instance,
+        # which holds no back-reference to its components; hand it this
+        # component's state so the revocation hook can drop per-binding locks and
+        # fences. Without the hook (langbot-plugin 0.7.4) this attribute is simply
+        # never read.
+        plugin = getattr(self, 'plugin', None)
+        if plugin is not None:
+            plugin.knowledge_engine_serial_state = self._state
+
     @classmethod
     def get_capabilities(cls) -> list[str]:
         """Declare supported capabilities."""
@@ -91,6 +102,9 @@ class LangRAG(KnowledgeEngine):
 
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
         logger.info(f"Knowledge base deleted: {kb_id}")
+        # Deleting a knowledge base resolves its pending ambiguity, so this is the
+        # operator path out of a fence; a fresh knowledge base starts unfenced.
+        await self._state.clear_fence(self.plugin, kb_id)
 
     # ========== Helpers ==========
 
@@ -129,18 +143,18 @@ class LangRAG(KnowledgeEngine):
                     stage_durations["embedding"],
                 )
             stage_started = telemetry.start_timer()
-            try:
-                await self.plugin.vector_upsert(
+            await self._state.mutate(
+                self.plugin,
+                collection_id,
+                lambda: self.plugin.vector_upsert(
                     collection_id=collection_id,
                     vectors=vectors,
                     ids=ids,
                     metadata=metas,
                     documents=texts,
-                )
-            except BaseException:
-                # Remote mutation may have committed after a transport timeout.
-                self._state.fence(self.plugin)
-                raise
+                ),
+                'Host vector_upsert outcome unknown',
+            )
             add_stage_duration(
                 stage_durations,
                 "vector_upsert",
@@ -884,17 +898,20 @@ class LangRAG(KnowledgeEngine):
         deleted = None
         count = None
         try:
-            try:
-                result_count = await self.plugin.vector_delete(
+            result_count = await self._state.mutate(
+                self.plugin,
+                kb_id,
+                lambda: self.plugin.vector_delete(
                     collection_id=kb_id,
                     file_ids=[document_id],
-                )
-                if type(result_count) is not int or result_count < 0:
-                    raise ValueError("Host vector_delete must return a nonnegative integer count")
-                count = result_count
-            except BaseException:
-                self._state.fence(self.plugin)
-                raise
+                ),
+                'Host vector_delete outcome unknown',
+            )
+            # The Host answered, so a malformed count is deterministic rather than
+            # ambiguous and must not fence the knowledge base.
+            if type(result_count) is not int or result_count < 0:
+                raise ValueError("Host vector_delete must return a nonnegative integer count")
+            count = result_count
             # An authoritative no-op also confirms absence (empty ingest or retry).
             deleted = True
             status = "completed"

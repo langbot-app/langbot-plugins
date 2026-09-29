@@ -4,9 +4,12 @@ The plugin and its Page can be singletons: no tenant event, error, fence, or
 initialization flag is retained in this object between invocations.
 """
 import json
+import logging
 
 from components.shared_state import SerialState
 from .telemetry import LangRAGTelemetry
+
+logger = logging.getLogger(__name__)
 
 KEY = 'langrag.telemetry.v1'
 MAX_BYTES = 192 * 1024
@@ -24,10 +27,18 @@ class InstallationTelemetry:
         self._state = SerialState()
 
     async def _transaction(self, operation):
-        return await self._state.run(self.plugin, operation)
+        # Telemetry is installation-scoped, not knowledge-base-scoped.
+        return await self._state.run(self.plugin, None, operation)
 
     async def initialize(self):
         """Process-scoped initialization cannot read tenant storage."""
+        # The runtime dispatches installation revocation to the plugin instance,
+        # which holds no back-reference to this helper; hand it the state so the
+        # revocation hook can drop per-binding locks. Without the hook
+        # (langbot-plugin 0.7.4) this attribute is simply never read.
+        plugin = getattr(self, 'plugin', None)
+        if plugin is not None:
+            plugin.telemetry_serial_state = self._state
 
     async def _load(self):
         events = []
@@ -55,8 +66,10 @@ class InstallationTelemetry:
             events.pop(0)
         try:
             await self.plugin.set_plugin_storage(KEY, raw)
-        except BaseException:
-            self._state.fence(self.plugin)
+        except Exception:
+            # Diagnostics must never fence business work: drop the write and let
+            # the next record start from the durable history.
+            logger.warning('Could not persist LangRAG telemetry', exc_info=True)
             raise
 
     async def _record(self, method, kwargs):
@@ -109,7 +122,7 @@ class InstallationTelemetry:
         async def clear():
             try:
                 await self.plugin.set_plugin_storage(KEY, b'[]')
-            except BaseException:
-                self._state.fence(self.plugin)
+            except Exception:
+                logger.warning('Could not clear LangRAG telemetry', exc_info=True)
                 raise
         await self._transaction(clear)

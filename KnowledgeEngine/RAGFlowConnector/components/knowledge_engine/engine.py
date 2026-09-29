@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import logging
 
-from components.shared_state import ConfigStore, serialized
+from components.shared_state import (
+    AmbiguousMutationError,
+    ConfigStore,
+    is_ambiguous_http_failure,
+    serialized,
+)
 
 import httpx
 
@@ -80,11 +85,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
         except Exception as e:
             logger.warning(f"[RAGFlowKnowledgeEngine] Dataset validation failed: {e}")
 
-    @serialized
+    @serialized(allow_fenced=True)
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
-        """Tombstone the stored configuration for the deleted knowledge base."""
+        """Tombstone the stored configuration and clear any fence for this KB."""
         logger.info(f"[RAGFlowKnowledgeEngine] Knowledge base deleted: {kb_id}")
         await self._save_config(kb_id, None)
+        # Deleting the knowledge base is the operator path out of a fence: the
+        # pending ambiguity is moot once it no longer exists.
+        await self._state.clear_fence(self.plugin, kb_id)
 
     async def retrieve(self, context: RetrievalContext) -> RetrievalResponse:
         """Execute retrieval against RAGFlow API."""
@@ -261,11 +269,11 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # Extract the document ID returned by RAGFlow
                 docs = upload_data.get("data", [])
                 if not docs:
-                    raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
+                    raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
 
                 ragflow_doc_id = docs[0].get("id")
                 if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
-                    raise ValueError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
+                    raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
                 await self._save_document(kb_id, doc_id, {'upstream_id': ragflow_doc_id,
                     'dataset_id': target_dataset_id, 'status': 'created'})
 
@@ -358,7 +366,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                     status=DocumentStatus.PROCESSING,
                 )
 
+        except AmbiguousMutationError:
+            # Already-dispatched upload with an unknown outcome: fence this KB.
+            raise
         except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"RAGFlow upload outcome unknown: {e!r}"
+                )
             logger.error(f"[RAGFlowKnowledgeEngine] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -399,9 +414,10 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
 
         target_dataset_id = dataset_ids[0]
 
+        if mapping['dataset_id'] != target_dataset_id:
+            # Local validation before any remote call: deterministic, no fence.
+            raise RuntimeError('Dataset changed; reconcile before deletion')
         try:
-            if mapping['dataset_id'] != target_dataset_id:
-                raise RuntimeError('Dataset changed; reconcile before deletion')
             async with self.http_client() as client:
                 url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
                 headers = {
@@ -430,7 +446,17 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 )
                 return True
 
-        except Exception:
+        except httpx.HTTPStatusError as e:
+            # The provider answered, so the delete was rejected deterministically.
+            logger.error(
+                f"[RAGFlowKnowledgeEngine] Delete rejected for doc={document_id}: {e}"
+            )
+            return False
+        except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"RAGFlow delete outcome unknown: {e!r}"
+                )
             logger.exception(
                 f"[RAGFlowKnowledgeEngine] Error deleting document {document_id}"
             )

@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import logging
 
-from components.shared_state import ConfigStore, serialized
+from components.shared_state import (
+    AmbiguousMutationError,
+    ConfigStore,
+    is_ambiguous_http_failure,
+    serialized,
+)
 
 import httpx
 
@@ -40,10 +45,13 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
         await self._save_config(kb_id, config)
         logger.info(f"[DifyDatasetsConnector] Knowledge base created: {kb_id}")
 
-    @serialized
+    @serialized(allow_fenced=True)
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
-        """Tombstone the stored config when a knowledge base is deleted."""
+        """Tombstone the stored config and clear any fence for this knowledge base."""
         await self._save_config(kb_id, None)
+        # Deleting the knowledge base is the operator path out of a fence: the
+        # pending ambiguity is moot once it no longer exists.
+        await self._state.clear_fence(self.plugin, kb_id)
         logger.info(f"[DifyDatasetsConnector] Knowledge base deleted: {kb_id}")
 
     # ========== Helper Methods ==========
@@ -244,7 +252,7 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             dify_document = resp_data.get("document", {})
             dify_doc_id = dify_document.get("id")
             if not isinstance(dify_doc_id, str) or not dify_doc_id:
-                raise ValueError("Dify upload omitted upstream document ID; outcome requires reconciliation")
+                raise AmbiguousMutationError("Dify upload omitted upstream document ID; outcome requires reconciliation")
             await self._save_document(kb_id, doc_id, {'upstream_id': dify_doc_id,
                 'dataset_id': dataset_id, 'status': 'created'})
 
@@ -259,6 +267,7 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             )
 
         except httpx.HTTPStatusError as e:
+            # The provider answered, so this rejection is deterministic: no fence.
             error_body = e.response.text
             logger.error(
                 f"[DifyDatasetsConnector] Dify API error during ingestion: "
@@ -269,7 +278,14 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                 status=DocumentStatus.FAILED,
                 error_message=f"Dify API error {e.response.status_code}: {error_body}",
             )
+        except AmbiguousMutationError:
+            # Already-dispatched upload with an unknown outcome: fence this KB.
+            raise
         except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"Dify upload outcome unknown: {e!r}"
+                )
             logger.error(f"[DifyDatasetsConnector] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -327,7 +343,17 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                     f"from dataset {dataset_id} (status={response.status_code})"
                 )
                 return True
+        except httpx.HTTPStatusError as e:
+            # The provider answered, so the delete was rejected deterministically.
+            logger.error(
+                f"[DifyDatasetsConnector] Failed to delete document {document_id}: {e}"
+            )
+            return False
         except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"Dify delete outcome unknown: {e!r}"
+                )
             logger.error(
                 f"[DifyDatasetsConnector] Failed to delete document {document_id}: {e}"
             )

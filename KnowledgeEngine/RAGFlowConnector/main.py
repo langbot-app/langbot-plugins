@@ -10,6 +10,21 @@ class RAGFlowConnector(BasePlugin):
         # Will be called when plugin is launching
         pass
 
+    async def on_installation_revoked(self, binding) -> None:
+        """Release process-local state keyed by this binding.
+
+        Dispatched by SDK revisions that implement installation revocation
+        (``BasePlugin.on_installation_revoked``); on langbot-plugin 0.7.4 the
+        hook does not exist and is never called, so older SDKs are unaffected.
+        There is no invocation context, so Host APIs are unavailable: only the
+        in-process lock table and fence cache for this binding are dropped.
+        Persisted fences stay in Host storage and are re-read on the next
+        invocation.
+        """
+        state = getattr(self, 'knowledge_engine_serial_state', None)
+        if state is not None:
+            state.release_binding(binding)
+
     def __del__(self) -> None:
         # Will be called when plugin is terminating
         pass

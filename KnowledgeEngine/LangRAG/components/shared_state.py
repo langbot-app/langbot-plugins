@@ -1,14 +1,47 @@
-"""Binding-scoped serialization for ambiguous Host mutations.
+"""Installation- and knowledge-base-scoped state for LangRAG.
 
-A cancelled caller waits for its dispatched operation while the lock remains
-held. The SDK invocation capability is still authoritative at every Host call.
+Locks and fences are keyed by ``(installation binding, knowledge-base identity)``
+so an ambiguous failure for one knowledge base never blocks the other knowledge
+bases that share the same installation. The platform storage key spans a whole
+installation, so the knowledge-base id is always folded into our keys.
+
+Only a dispatched mutation whose outcome is unknown fences: a deterministic
+error raised after the Host answered, a validation error raised before any call
+is dispatched, and ordinary cancellation before dispatch do not. Fences are
+persisted (key includes the knowledge-base identity) behind an in-process cache,
+so a restarted worker still recognises them.
 """
 import asyncio
+import hashlib
+import inspect
+import json
+import logging
 from functools import wraps
 from weakref import WeakValueDictionary
 
+logger = logging.getLogger(__name__)
+
+FENCE_KEY_PREFIX = 'ke.fence.v1.'
+# Fallback fence scope when the wrapped method carries no knowledge-base identity.
+_INSTALLATION_FENCE_KEY = FENCE_KEY_PREFIX + 'installation'
+_IDENTITY_ARGUMENTS = ('collection_id', 'kb_id', 'knowledge_base_id')
+
+
+class AmbiguousMutationError(RuntimeError):
+    """A dispatched mutation's outcome is unknown and requires reconciliation.
+
+    Raise this from a call site when a mutation may have taken effect but its
+    result is unknown. Only these failures fence a knowledge base.
+    """
+
 
 async def settle(task):
+    """Wait for a detached worker and return its result.
+
+    Used by the bounded offload helper: a caller cancellation never abandons the
+    thread that is already running, so the result is still awaited before the
+    slot is released.
+    """
     cancelled = False
     while not task.done():
         try:
@@ -22,46 +55,212 @@ async def settle(task):
     return task.result()
 
 
+async def _settle_commit(task):
+    """Wait for a dispatched commit and report its outcome.
+
+    Returns ``(caller_cancelled, failure)``; ``failure`` is the commit's
+    exception, or ``asyncio.CancelledError`` when the commit itself was
+    cancelled. Unlike :func:`settle` this never re-raises, because the caller has
+    to fence an unknown outcome before propagating anything.
+    """
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            # The commit raised; its outcome is read from the state below.
+            pass
+    if task.cancelled():
+        return cancelled, asyncio.CancelledError()
+    return cancelled, task.exception()
+
+
+def _kb_identity(method, instance, args, kwargs):
+    """Extract the knowledge-base identity from a serialized method's arguments.
+
+    Reads a ``collection_id`` / ``kb_id`` / ``knowledge_base_id`` argument first,
+    then an argument exposing ``get_collection_id()`` or ``knowledge_base_id``
+    (retrieval passes the whole context). Returns ``None`` when the wrapped
+    method carries no knowledge-base identity, in which case the caller falls
+    back to an installation-wide lock and fence.
+    """
+    try:
+        bound = inspect.signature(method).bind_partial(instance, *args, **kwargs)
+    except (TypeError, ValueError):
+        return None
+    for name in _IDENTITY_ARGUMENTS:
+        value = bound.arguments.get(name)
+        if isinstance(value, str) and value:
+            return value
+    for value in bound.arguments.values():
+        getter = getattr(value, 'get_collection_id', None)
+        if callable(getter):
+            try:
+                identity = getter()
+            except Exception:
+                continue
+            if isinstance(identity, str) and identity:
+                return identity
+        identity = getattr(value, 'knowledge_base_id', None)
+        if isinstance(identity, str) and identity:
+            return identity
+    return None
+
+
+def _kb_fence_key(kb_identity):
+    if kb_identity is None:
+        return _INSTALLATION_FENCE_KEY
+    return FENCE_KEY_PREFIX + hashlib.sha256(kb_identity.encode()).hexdigest()
+
+
 class SerialState:
     def __init__(self):
         self._locks = WeakValueDictionary()
-        self._fenced = set()
+        # binding -> set of fence keys; cache in front of persisted fences.
+        self._fenced = {}
+        self._fence_loaded = set()
 
     @staticmethod
     def binding(plugin):
         getter = getattr(plugin, 'get_installation_binding', None)
-        binding = getter() if getter else None
-        # Dedicated mode is a single installation per component instance.
+        try:
+            binding = getter() if getter else None
+        except Exception:
+            # Revocation has no invocation context; fall back to dedicated scope.
+            binding = None
         return binding if binding is not None else ('dedicated',)
 
-    async def run(self, plugin, operation):
+    @staticmethod
+    def _scope(binding, kb_identity):
+        return (binding, kb_identity)
+
+    def _fenced_keys(self, binding):
+        return self._fenced.setdefault(binding, set())
+
+    def is_fenced(self, binding, kb_identity):
+        fenced = self._fenced_keys(binding)
+        return _kb_fence_key(kb_identity) in fenced or _INSTALLATION_FENCE_KEY in fenced
+
+    async def _load_fences(self, plugin, binding):
+        """Read persisted fences once per binding, best effort.
+
+        A failed fence read must not introduce a new failure mode: a Host
+        mutation that follows fails closed on its own, and the read is retried
+        rather than cached.
+        """
+        if binding in self._fence_loaded:
+            return
+        try:
+            keys = await plugin.get_plugin_storage_keys()
+            fenced = self._fenced_keys(binding)
+            for key in keys:
+                if not key.startswith(FENCE_KEY_PREFIX):
+                    continue
+                try:
+                    marker = json.loads(await plugin.get_plugin_storage(key))
+                except Exception:
+                    # Unreadable marker: fail closed on this knowledge base.
+                    marker = {'reason': 'unreadable fence record'}
+                if marker is not None:
+                    fenced.add(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning('Could not read persisted fences for %r', binding, exc_info=True)
+            return
+        self._fence_loaded.add(binding)
+
+    async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
         binding = self.binding(plugin)
-        lock = self._locks.get(binding)
+        key = self._scope(binding, kb_identity)
+        lock = self._locks.get(key)
         if lock is None:
-            lock = self._locks[binding] = asyncio.Lock()
+            lock = self._locks[key] = asyncio.Lock()
         async with lock:
-            if binding in self._fenced:
-                raise RuntimeError('Installation state fenced after ambiguous Host mutation')
+            await self._load_fences(plugin, binding)
+            if not allow_fenced and self.is_fenced(binding, kb_identity):
+                raise RuntimeError(
+                    f'Knowledge base {kb_identity!r} fenced after an ambiguous mutation; '
+                    'reconcile before retrying'
+                )
             try:
-                # Never detach Host work from its revocable SDK invocation.
                 return await operation()
-            except BaseException:
-                self._fenced.add(binding)
+            except AmbiguousMutationError:
+                await self.fence(plugin, kb_identity, 'ambiguous mutation')
                 raise
 
-    def fence(self, plugin):
-        self._fenced.add(self.binding(plugin))
+    async def mutate(self, plugin, kb_identity, operation, reason):
+        """Run a mutation that was dispatched to the Host.
 
-    async def write(self, plugin, key, value):
-        try:
-            await plugin.set_plugin_storage(key, value)
-        except BaseException:
-            self.fence(plugin)
-            raise
+        A dispatched call whose outcome is unknown fences this knowledge base; a
+        caller cancellation cancels the caller only after the dispatched call has
+        settled, so the lock is never released over an unknown outcome.
+        """
+        task = asyncio.create_task(operation())
+        cancelled, failure = await _settle_commit(task)
+        if failure is not None:
+            await self.fence(plugin, kb_identity, f'{reason}: {failure!r}')
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+        return task.result()
+
+    async def fence(self, plugin, kb_identity, reason):
+        """Mark one knowledge base as requiring reconciliation.
+
+        The in-process marker is set synchronously; persisting it is best effort
+        so a caller cancellation cannot lose the fence.
+        """
+        binding = self.binding(plugin)
+        fence_key = _kb_fence_key(kb_identity)
+        self._fenced_keys(binding).add(fence_key)
+        payload = json.dumps({'kb_id': kb_identity, 'reason': reason}).encode()
+        cancelled, failure = await _settle_commit(
+            asyncio.create_task(plugin.set_plugin_storage(fence_key, payload))
+        )
+        if failure is not None:
+            logger.warning('Could not persist fence for %r: %r', kb_identity, failure)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def clear_fence(self, plugin, kb_identity):
+        """Drop the fence for one knowledge base, in process and in storage.
+
+        Used when a knowledge base is deleted: its pending ambiguity is moot, so
+        deletion is the operator path out of a fence.
+        """
+        binding = self.binding(plugin)
+        fence_key = _kb_fence_key(kb_identity)
+        self._fenced_keys(binding).discard(fence_key)
+        cancelled, failure = await _settle_commit(
+            asyncio.create_task(plugin.set_plugin_storage(fence_key, b'null'))
+        )
+        if failure is not None:
+            logger.warning('Could not clear fence for %r: %r', kb_identity, failure)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    def release_binding(self, binding):
+        """Drop process-local state keyed by one installation binding."""
+        for key in [k for k in self._locks if k[0] == binding]:
+            self._locks.pop(key, None)
+        self._fenced.pop(binding, None)
+        self._fence_loaded.discard(binding)
 
 
-def serialized(method):
-    @wraps(method)
-    async def call(self, *args, **kwargs):
-        return await self._state.run(self.plugin, lambda: method(self, *args, **kwargs))
-    return call
+def serialized(method=None, *, allow_fenced=False):
+    def decorate(func):
+        @wraps(func)
+        async def call(self, *args, **kwargs):
+            return await self._state.run(
+                self.plugin,
+                _kb_identity(func, self, args, kwargs),
+                lambda: func(self, *args, **kwargs),
+                allow_fenced=allow_fenced,
+            )
+        return call
+
+    return decorate if method is None else decorate(method)

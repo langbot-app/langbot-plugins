@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import logging
 
-from components.shared_state import ConfigStore, serialized
+from components.shared_state import (
+    AmbiguousMutationError,
+    ConfigStore,
+    is_ambiguous_http_failure,
+    serialized,
+)
 
 import httpx
 
@@ -41,11 +46,14 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
         logger.info(f"[FastGPTKnowledgeEngine] Knowledge base created: {kb_id}")
         await self._save_config(kb_id, config)
 
-    @serialized
+    @serialized(allow_fenced=True)
     async def on_knowledge_base_delete(self, kb_id: str) -> None:
-        """Tombstone the stored config when a knowledge base is deleted."""
+        """Tombstone the stored config and clear any fence for this knowledge base."""
         logger.info(f"[FastGPTKnowledgeEngine] Knowledge base deleted: {kb_id}")
         await self._save_config(kb_id, None)
+        # Deleting the knowledge base is the operator path out of a fence: the
+        # pending ambiguity is moot once it no longer exists.
+        await self._state.clear_fence(self.plugin, kb_id)
 
     async def retrieve(self, context: RetrievalContext) -> RetrievalResponse:
         """Execute retrieval against FastGPT Dataset API."""
@@ -215,7 +223,7 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             resp_data = result.get("data", {})
             collection_id = resp_data.get("collectionId", "")
             if not isinstance(collection_id, str) or not collection_id:
-                raise ValueError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
+                raise AmbiguousMutationError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
             await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
                 'dataset_id': dataset_id, 'status': 'created'})
             insert_len = resp_data.get("results", {}).get("insertLen", 0)
@@ -231,7 +239,14 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 chunks_created=insert_len,
             )
 
+        except AmbiguousMutationError:
+            # Already-dispatched upload with an unknown outcome: fence this KB.
+            raise
         except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"FastGPT upload outcome unknown: {e!r}"
+                )
             logger.error(f"[FastGPTKnowledgeEngine] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -286,7 +301,17 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             )
             return True
 
-        except Exception:
+        except httpx.HTTPStatusError as e:
+            # The provider answered, so the delete was rejected deterministically.
+            logger.error(
+                f"[FastGPTKnowledgeEngine] Delete rejected for collection={document_id}: {e}"
+            )
+            return False
+        except Exception as e:
+            if is_ambiguous_http_failure(e):
+                await self._state.fence(
+                    self.plugin, kb_id, f"FastGPT delete outcome unknown: {e!r}"
+                )
             logger.exception(
                 f"[FastGPTKnowledgeEngine] Error deleting collection={document_id}"
             )
