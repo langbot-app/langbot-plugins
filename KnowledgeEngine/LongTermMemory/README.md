@@ -543,9 +543,21 @@ The console is organized into a scope sidebar plus tabbed panels:
 - **Injection** — load the **last memory-injection snapshot** for the scope: whether anything was injected on the latest turn, how many blocks and characters, which speaker, the session/speaker profiles that were used, and the L2 episodes that were auto-recalled. This answers "what did the bot actually remember on the last turn?" without scraping logs.
 - **Audit** — browse (paginated) and export the scoped audit log.
 - **Export** — export L1 profiles and L2 episodes for the current scope as JSON.
-- **Diagnostics** — **Run Health Check** executes the same metadata-isolation probe as `!memory health` directly from the UI (KB config, embedding model, and `user_key` filter isolation on search / list / delete), rendered as red/amber/green status cards. Use this before trusting scoped recall, especially on backends listed as unsupported above. Note: the console cannot verify that the KB is attached to a specific pipeline — run `!memory health` inside a pipeline to confirm that part.
+- **Diagnostics** — **Run Health Check** executes the same metadata-isolation probe as `!memory health` directly from the UI (KB config, embedding model, and `user_key` filter isolation on search / list / delete), rendered as red/amber/green status cards. Use this before trusting scoped recall, especially on backends listed as unsupported above. Note: the console cannot verify that the KB is attached to a specific pipeline — run `!memory health` inside a pipeline to confirm that part. **Clear Fence** acknowledges reconciliation for the selected memory space / knowledge base after a Host write whose outcome was unknown; see [Write serialization and fences](#write-serialization-and-fences).
 
 The console is i18n-aware (`en_US`, `zh_Hans`) and follows the host LangBot light/dark theme.
+
+## Write serialization and fences
+
+L1 records are grouped by `scope_key` (session/subject scope) and L2 episodes by collection id, so writes are serialized per **installation binding + memory scope**: an in-flight ambiguity for one memory space never blocks the other spaces that share the installation. The single installation-wide `kb_configs` map is serialized on the installation scope, because every KB shares that one record.
+
+A Host write that was **dispatched with an unknown outcome** (timeout, lost connection, cancelled call) fences only that memory scope, and the marker is persisted in installation storage, so a restarted worker still refuses writes to it — a retry could double-apply. The fence does not block reads (recall, listing, export, health). Deterministic failures never fence: a validation error raised before the call, an error detected after the Host answered authoritatively, and ordinary cancellation before a write is dispatched all leave the scope writable.
+
+To get a fenced space writable again:
+
+- **Clear Fence** in the Memory Console's **Diagnostics** tab — clears the fence for the selected memory space and knowledge base. Use it after checking the affected records (the console's Profiles / Episodes / Audit tabs, and `!memory list` / `!memory audit`).
+- Unregistering a memory KB (`remove_kb_config`) clears that collection's fence, because the fenced object is gone and its pending ambiguity became moot.
+- For an installation-wide fence (an unknown outcome on the shared `kb_configs` map) the console clears it only when the request explicitly asks for the installation scope, because it blocks every memory space.
 
 ## Logging
 

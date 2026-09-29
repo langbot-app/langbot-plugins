@@ -79,7 +79,7 @@ async def verify(args):
         generated = yaml.safe_dump(manifest.manifest, allow_unicode=True, sort_keys=False).encode()
         assert archive.read("manifest.yaml") == generated
         assert manifest.manifest["execution"]["sharedRuntime"] == "shared-runtime-v1"
-        assert manifest.metadata.version == "0.1.11"
+        assert manifest.metadata.version == "0.2.0"
     sdk = verify_sdk()
     artifact_store = PluginArtifactStore(evidence / "runtime")
     artifact = artifact_store.install_package(raw, digest)

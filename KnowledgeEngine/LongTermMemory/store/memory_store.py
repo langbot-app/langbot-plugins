@@ -7,9 +7,21 @@ import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Any
-from store.serialization import BindingWrites, serialized_write
+from store.serialization import FENCE_KEY_PREFIX, BindingWrites, serialized_write
 
 logger = logging.getLogger(__name__)
+
+_SUPERSEDE_TAGS = {"correction", "fact-update", "clarification"}
+
+
+def _installation_scope(_store, _args, _kwargs):
+    """Serialization identity for a write that carries no memory-scope identity.
+
+    ``kb_configs`` is one installation-wide map shared by every memory KB, so its
+    read-modify-write must stay on the installation scope; keying it by the
+    collection id would let two KBs overwrite each other's entry.
+    """
+    return None
 
 
 def _default_profile() -> dict[str, Any]:
@@ -631,17 +643,20 @@ class MemoryStore:
 
     _KB_CONFIGS_KEY = "kb_configs"
 
-    @serialized_write
+    @serialized_write(scope=_installation_scope)
     async def save_kb_config(self, kb_id: str, config: dict[str, Any]) -> None:
         configs = await self._read_json(self._KB_CONFIGS_KEY) or {}
         configs[kb_id] = config
-        await self._write_json(self._KB_CONFIGS_KEY, configs)
+        await self._write_json(self._KB_CONFIGS_KEY, configs, None)
 
-    @serialized_write
+    @serialized_write(scope=_installation_scope, allow_fenced=True)
     async def remove_kb_config(self, kb_id: str) -> None:
         configs = await self._read_json(self._KB_CONFIGS_KEY) or {}
         configs.pop(kb_id, None)
-        await self._write_json(self._KB_CONFIGS_KEY, configs)
+        await self._write_json(self._KB_CONFIGS_KEY, configs, None)
+        # Unregistering the KB deletes the fenced object, so whatever its last
+        # ambiguous write was is moot and the collection starts unfenced.
+        await self._writes.clear_fence(self.plugin, kb_id)
 
     async def get_kb_configs(self) -> dict[str, dict[str, Any]]:
         return await self._read_json(self._KB_CONFIGS_KEY) or {}
@@ -683,13 +698,50 @@ class MemoryStore:
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise ValueError(f"storage key {key} contains corrupt JSON") from e
 
-    async def _write_json(self, key: str, obj: Any) -> None:
+    async def _write_json(self, key: str, obj: Any, scope: str | None) -> None:
+        """Persist one JSON record; an unknown Host write outcome fences *scope*."""
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        await self._writes.mutate(
+            self.plugin,
+            scope,
+            lambda: self.plugin.set_plugin_storage(key, data),
+            f"Host set_plugin_storage outcome unknown for {key}",
+        )
+
+    def is_fenced(self, identity: str | None = None) -> bool:
+        """Whether one memory scope currently requires reconciliation."""
+        return self._writes.is_fenced(self._writes.binding(self.plugin), identity)
+
+    async def clear_fence(self, identity: str | None = None) -> None:
+        """Acknowledge reconciliation for one memory scope after an ambiguous write."""
+        await self._writes.clear_fence(self.plugin, identity)
+
+    async def list_fences(self) -> list[dict[str, Any]]:
+        """The persisted fence records for this installation, best effort."""
         try:
-            await self.plugin.set_plugin_storage(key, data)
-        except BaseException:
-            self._writes.fence(self.plugin)
-            raise
+            keys = await self.plugin.get_plugin_storage_keys()
+        except Exception:
+            logger.warning("Could not list persisted fences", exc_info=True)
+            return []
+        records: list[dict[str, Any]] = []
+        for key in keys:
+            if not key.startswith(FENCE_KEY_PREFIX):
+                continue
+            try:
+                marker = json.loads(await self.plugin.get_plugin_storage(key))
+            except Exception:
+                marker = None
+            if isinstance(marker, dict):
+                records.append({
+                    "scope": str(marker.get("scope", "") or ""),
+                    "reason": str(marker.get("reason", "") or ""),
+                })
+        return records
+
+    def release_binding(self, binding) -> None:
+        """Drop process-local lock/fence state for one revoked installation."""
+        self._writes.release_binding(binding)
+        logger.info("[LongTermMemory] released process-local state for %r", binding)
 
     @serialized_write
     async def append_audit_entry(
@@ -727,7 +779,7 @@ class MemoryStore:
             entries = []
         entries.append(entry)
         entries = entries[-self._MAX_AUDIT_ENTRIES_PER_SCOPE:]
-        await self._write_json(key, entries)
+        await self._write_json(key, entries, scope_key)
         return entry
 
     async def list_audit_entries(
@@ -766,7 +818,7 @@ class MemoryStore:
         memory console can show "what the bot actually remembered last turn"
         without depending on log scraping or the live query lifecycle.
         """
-        await self._write_json(self._injection_snapshot_key(scope_key), snapshot)
+        await self._write_json(self._injection_snapshot_key(scope_key), snapshot, scope_key)
 
     async def get_injection_snapshot(self, scope_key: str) -> dict[str, Any] | None:
         snapshot = await self._read_json(self._injection_snapshot_key(scope_key))
@@ -810,7 +862,7 @@ class MemoryStore:
             entries = []
         entries.append(entry)
         entries = entries[-self._MAX_CANDIDATES_PER_SCOPE:]
-        await self._write_json(key, entries)
+        await self._write_json(key, entries, scope_key)
         return entry
 
     async def list_memory_candidates(
@@ -871,7 +923,7 @@ class MemoryStore:
             break
         if updated is None:
             return None
-        await self._write_json(key, entries)
+        await self._write_json(key, entries, scope_key)
         return updated
 
     async def reject_memory_candidate(
@@ -961,7 +1013,7 @@ class MemoryStore:
         candidate["status"] = self.CANDIDATE_STATUS_ACCEPTED
         candidate["updated_at"] = self._now_timestamp()
         candidate["accepted_result"] = result
-        await self._write_json(key, entries)
+        await self._write_json(key, entries, scope_key)
         return candidate
 
     async def _load_profile_by_storage_key(self, storage_key: str) -> dict[str, Any]:
@@ -971,11 +1023,11 @@ class MemoryStore:
         return self._normalize_profile(profile)
 
     async def _save_profile_by_storage_key(
-        self, storage_key: str, profile: dict[str, Any]
+        self, storage_key: str, profile: dict[str, Any], scope_key: str
     ) -> dict[str, Any]:
         profile = self._normalize_profile(profile)
         profile["updated_at"] = self._now_timestamp()
-        await self._write_json(storage_key, profile)
+        await self._write_json(storage_key, profile, scope_key)
         return profile
 
     async def load_session_profile(self, scope_key: str) -> dict[str, Any]:
@@ -1001,6 +1053,8 @@ class MemoryStore:
         value: str,
         fact_key: str = "",
         previous_value: str = "",
+        *,
+        scope_key: str,
     ) -> dict[str, Any]:
         profile = copy.deepcopy(
             await self._load_profile_by_storage_key(storage_key)
@@ -1063,7 +1117,7 @@ class MemoryStore:
             elif action == "remove":
                 profile["notes"] = ""
 
-        profile = await self._save_profile_by_storage_key(storage_key, profile)
+        profile = await self._save_profile_by_storage_key(storage_key, profile, scope_key)
         return profile
 
     async def update_session_profile_field(
@@ -1082,6 +1136,7 @@ class MemoryStore:
             value,
             fact_key,
             previous_value,
+            scope_key=scope_key,
         )
 
     async def update_speaker_profile_field(
@@ -1101,18 +1156,19 @@ class MemoryStore:
             value,
             fact_key,
             previous_value,
+            scope_key=scope_key,
         )
 
     @serialized_write
     async def clear_session_profile(self, scope_key: str) -> None:
         await self._save_profile_by_storage_key(
-            self._session_profile_key(scope_key), _default_profile()
+            self._session_profile_key(scope_key), _default_profile(), scope_key
         )
 
     @serialized_write
     async def clear_speaker_profile(self, scope_key: str, sender_id: str) -> None:
         await self._save_profile_by_storage_key(
-            self._speaker_profile_key(scope_key, sender_id), _default_profile()
+            self._speaker_profile_key(scope_key, sender_id), _default_profile(), scope_key
         )
 
     async def export_profiles_by_scope(
@@ -1230,12 +1286,17 @@ class MemoryStore:
                 [old_content],
             )
 
-            await self.plugin.vector_upsert(
-                collection_id=collection_id,
-                vectors=old_vectors,
-                ids=[rid],
-                metadata=[meta],
-                documents=[old_content],
+            await self._writes.mutate(
+                self.plugin,
+                collection_id,
+                lambda: self.plugin.vector_upsert(
+                    collection_id=collection_id,
+                    vectors=old_vectors,
+                    ids=[rid],
+                    metadata=[meta],
+                    documents=[old_content],
+                ),
+                "Host vector_upsert outcome unknown",
             )
             superseded += 1
             logger.info(
@@ -1293,12 +1354,17 @@ class MemoryStore:
 
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, [content])
 
-        await self.plugin.vector_upsert(
-            collection_id=collection_id,
-            vectors=vectors,
-            ids=[episode_id],
-            metadata=[metadata],
-            documents=[content],
+        await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_upsert(
+                collection_id=collection_id,
+                vectors=vectors,
+                ids=[episode_id],
+                metadata=[metadata],
+                documents=[content],
+            ),
+            "Host vector_upsert outcome unknown",
         )
         logger.info(
             "[LongTermMemory] add_episode stored: collection_id=%s episode_id=%s timestamp=%s",
@@ -1310,7 +1376,6 @@ class MemoryStore:
         # Auto-supersede: when the new episode is a correction / fact-update /
         # clarification, search for similar older episodes in the same scope and
         # mark them as superseded by lowering their importance.
-        _SUPERSEDE_TAGS = {"correction", "fact-update", "clarification"}
         if _SUPERSEDE_TAGS & set(tags):
             try:
                 await self._auto_supersede(
@@ -1509,9 +1574,14 @@ class MemoryStore:
         self, collection_id: str, user_key: str
     ) -> int:
         """Delete all episodes for a user_key."""
-        return await self.plugin.vector_delete(
-            collection_id=collection_id,
-            filters={"user_key": user_key},
+        return await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_delete(
+                collection_id=collection_id,
+                filters={"user_key": user_key},
+            ),
+            "Host vector_delete outcome unknown",
         )
 
     async def list_episodes(
@@ -1691,12 +1761,17 @@ class MemoryStore:
                 metadata["imported_episode_id"] = imported_episode_id
 
             vectors = await self.plugin.invoke_embedding(embedding_model_uuid, [content])
-            await self.plugin.vector_upsert(
-                collection_id=collection_id,
-                vectors=vectors,
-                ids=[episode_id],
-                metadata=[metadata],
-                documents=[content],
+            await self._writes.mutate(
+                self.plugin,
+                collection_id,
+                lambda: self.plugin.vector_upsert(
+                    collection_id=collection_id,
+                    vectors=vectors,
+                    ids=[episode_id],
+                    metadata=[metadata],
+                    documents=[content],
+                ),
+                "Host vector_upsert outcome unknown",
             )
             imported.append({
                 "id": episode_id,
@@ -1933,10 +2008,15 @@ class MemoryStore:
                 {"user_key": user_key},
             ]
         }
-        return await self.plugin.vector_delete(
-            collection_id=collection_id,
-            file_ids=[episode_id],
-            filters=filters,
+        return await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_delete(
+                collection_id=collection_id,
+                file_ids=[episode_id],
+                filters=filters,
+            ),
+            "Host vector_delete outcome unknown",
         )
 
     def _episode_from_vector_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -2009,12 +2089,17 @@ class MemoryStore:
             meta.pop("superseded_by", None)
 
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, [content])
-        await self.plugin.vector_upsert(
-            collection_id=collection_id,
-            vectors=vectors,
-            ids=[episode_id],
-            metadata=[meta],
-            documents=[content],
+        await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_upsert(
+                collection_id=collection_id,
+                vectors=vectors,
+                ids=[episode_id],
+                metadata=[meta],
+                documents=[content],
+            ),
+            "Host vector_upsert outcome unknown",
         )
         updated = dict(episode)
         updated["status"] = normalized_status
@@ -2094,25 +2179,30 @@ class MemoryStore:
                 [text_a, text_b],
             )
             timestamp = self._now_timestamp()
-            await self.plugin.vector_upsert(
-                collection_id=collection_id,
-                vectors=vectors,
-                ids=ids,
-                metadata=[
-                    {
-                        "content": text_a,
-                        "user_key": user_a,
-                        "source": "health_probe",
-                        "timestamp": timestamp,
-                    },
-                    {
-                        "content": text_b,
-                        "user_key": user_b,
-                        "source": "health_probe",
-                        "timestamp": timestamp,
-                    },
-                ],
-                documents=[text_a, text_b],
+            await self._writes.mutate(
+                self.plugin,
+                collection_id,
+                lambda: self.plugin.vector_upsert(
+                    collection_id=collection_id,
+                    vectors=vectors,
+                    ids=ids,
+                    metadata=[
+                        {
+                            "content": text_a,
+                            "user_key": user_a,
+                            "source": "health_probe",
+                            "timestamp": timestamp,
+                        },
+                        {
+                            "content": text_b,
+                            "user_key": user_b,
+                            "source": "health_probe",
+                            "timestamp": timestamp,
+                        },
+                    ],
+                    documents=[text_a, text_b],
+                ),
+                "Host vector_upsert outcome unknown",
             )
             add("write", "OK", "wrote temporary metadata probe records")
 
@@ -2148,9 +2238,14 @@ class MemoryStore:
                 add("list", "WARN", f"vector_list probe failed: {exc}")
 
             try:
-                deleted = await self.plugin.vector_delete(
-                    collection_id=collection_id,
-                    filters={"user_key": user_a},
+                deleted = await self._writes.mutate(
+                    self.plugin,
+                    collection_id,
+                    lambda: self.plugin.vector_delete(
+                        collection_id=collection_id,
+                        filters={"user_key": user_a},
+                    ),
+                    "Host vector_delete outcome unknown",
                 )
                 if deleted == 1:
                     add("delete", "OK", "vector_delete respects user_key metadata filter")
@@ -2165,9 +2260,14 @@ class MemoryStore:
         finally:
             for episode_id in ids:
                 try:
-                    await self.plugin.vector_delete(
-                        collection_id=collection_id,
-                        file_ids=[episode_id],
+                    await self._writes.mutate(
+                        self.plugin,
+                        collection_id,
+                        lambda: self.plugin.vector_delete(
+                            collection_id=collection_id,
+                            file_ids=[episode_id],
+                        ),
+                        "Host vector_delete outcome unknown",
                     )
                 except Exception as exc:
                     add("cleanup", "WARN", f"failed to clean probe record {episode_id}: {exc}")

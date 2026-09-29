@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_shared_release_metadata_and_standalone_lock():
     manifest = yaml.safe_load((ROOT / "manifest.yaml").read_text())
     assert manifest["execution"].get("sharedRuntime") == "shared-runtime-v1"
-    assert manifest["metadata"]["version"] == "0.1.11"
+    assert manifest["metadata"]["version"] == "0.2.0"
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert "langbot-plugin>=0.7.4,<0.8" in project["project"]["dependencies"]
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
@@ -25,7 +25,7 @@ def test_shared_release_metadata_and_standalone_lock():
 @pytest.mark.asyncio
 async def test_real_sdk_dependency_admission(tmp_path):
     assert importlib.metadata.version("langbot-plugin") == "0.7.4"
-    artifact = PluginArtifact("1" * 64, ROOT, ROOT, "langbot-team", "LocalAgent", "0.1.11")
+    artifact = PluginArtifact("1" * 64, ROOT, ROOT, "langbot-team", "LocalAgent", "0.2.0")
     store = PluginDependencyEnvironmentStore(tmp_path)
     from langbot_plugin.entities.io.context import PluginWorkerPolicy
     from langbot_plugin.runtime.plugin.worker_launcher import PluginWorkerLauncher

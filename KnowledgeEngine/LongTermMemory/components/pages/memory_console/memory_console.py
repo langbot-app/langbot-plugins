@@ -36,6 +36,8 @@ class MemoryConsolePage(Page):
                 return PageResponse.ok(await self._health(self._body(request)))
             if request.endpoint == "/injection" and request.method == "POST":
                 return PageResponse.ok(await self._injection(self._body(request)))
+            if request.endpoint == "/fences/clear" and request.method == "POST":
+                return PageResponse.ok(await self._clear_fence(self._body(request)))
 
             return PageResponse.fail(f"Unknown endpoint: {request.method} {request.endpoint}")
         except ValueError as exc:
@@ -126,6 +128,7 @@ class MemoryConsolePage(Page):
             "profile_key_count": len(profile_keys),
             "session_profile_count": len([key for key in profile_keys if key.startswith("ps:")]),
             "speaker_profile_count": len([key for key in profile_keys if key.startswith("pp:")]),
+            "fences": await store.list_fences(),
             "scopes": self._profile_scopes(profile_keys, kb_entries[0]["isolation"] if kb_entries else "session"),
         }
 
@@ -475,6 +478,29 @@ class MemoryConsolePage(Page):
         scope_key = self._required_string(body, "scope_key")
         snapshot = await self._store.get_injection_snapshot(scope_key)
         return {"scope_key": scope_key, "snapshot": snapshot}
+
+    async def _clear_fence(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Acknowledge reconciliation for the selected memory scope(s).
+
+        A Host write whose outcome was unknown leaves its memory scope fenced, so
+        every later write to it fails closed. After the operator has inspected the
+        affected records, this is the path back to a writable space / KB. The
+        installation-wide scope is only cleared on an explicit request, because it
+        blocks every memory scope of the installation.
+        """
+        identities: list[str | None] = []
+        for key in ("scope_key", "collection_id"):
+            identity = self._string(body, key)
+            if identity and identity not in identities:
+                identities.append(identity)
+        if bool(body.get("installation")):
+            identities.append(None)
+        if not identities:
+            raise ValueError("scope_key, collection_id, or installation is required")
+
+        for identity in identities:
+            await self._store.clear_fence(identity)
+        return {"cleared": [identity if identity is not None else "installation" for identity in identities]}
 
     @staticmethod
     def _combine_status(statuses: list[str]) -> str:

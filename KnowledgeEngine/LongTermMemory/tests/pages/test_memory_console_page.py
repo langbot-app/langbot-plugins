@@ -25,6 +25,8 @@ class FakeStore:
         self.list_calls: list[dict] = []
         self.probe_calls: list[dict] = []
         self.snapshots: dict[str, dict] = {}
+        self.fences: list[dict] = []
+        self.cleared_fences: list = []
         self.episodes = [
             {
                 "id": "ep-1",
@@ -129,10 +131,26 @@ class FakeStore:
     async def get_injection_snapshot(self, scope_key):
         return self.snapshots.get(scope_key)
 
+    async def list_fences(self):
+        return list(self.fences)
+
+    async def clear_fence(self, identity=None):
+        self.cleared_fences.append(identity)
+        self.fences = [
+            fence for fence in self.fences
+            if fence.get("scope") != (identity if identity is not None else "installation")
+        ]
+
 
 class FakePlugin:
     def __init__(self):
         self.memory_store = FakeStore()
+
+    async def get_plugin_storage_keys(self):
+        return []
+
+    def get_config(self):
+        return {}
 
 
 async def _post(page: MemoryConsolePage, endpoint: str, body: dict):
@@ -290,3 +308,60 @@ async def test_injection_returns_none_when_absent(page):
     data = await _post(page, "/injection", {"scope_key": "bot-1:group_9"})
 
     assert data == {"scope_key": "bot-1:group_9", "snapshot": None}
+
+
+async def _get(page: MemoryConsolePage, endpoint: str):
+    response = await page.handle_api(
+        PageRequest(endpoint=endpoint, method="GET", body=None)
+    )
+    assert response.error is None
+    return response.data
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_fenced_scopes(page):
+    page.plugin.memory_store.fences = [
+        {"scope": "bot-1:group_1", "reason": "Host vector_upsert outcome unknown: timeout"},
+    ]
+
+    data = await _get(page, "/summary")
+
+    assert data["fences"] == [
+        {"scope": "bot-1:group_1", "reason": "Host vector_upsert outcome unknown: timeout"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_fence_acknowledges_selected_space_and_kb(page):
+    page.plugin.memory_store.fences = [
+        {"scope": "bot-1:group_1", "reason": "a"},
+        {"scope": "kb-1", "reason": "b"},
+    ]
+
+    data = await _post(page, "/fences/clear", {
+        "scope_key": "bot-1:group_1",
+        "collection_id": "kb-1",
+    })
+
+    assert data == {"cleared": ["bot-1:group_1", "kb-1"]}
+    assert page.plugin.memory_store.cleared_fences == ["bot-1:group_1", "kb-1"]
+    assert page.plugin.memory_store.fences == []
+
+
+@pytest.mark.asyncio
+async def test_clear_fence_requires_a_selected_scope_or_kb(page):
+    response = await page.handle_api(
+        PageRequest(endpoint="/fences/clear", method="POST", body={})
+    )
+
+    assert response.error is not None
+    assert "required" in response.error
+    assert page.plugin.memory_store.cleared_fences == []
+
+
+@pytest.mark.asyncio
+async def test_clear_fence_clears_installation_only_on_request(page):
+    data = await _post(page, "/fences/clear", {"installation": True})
+
+    assert data == {"cleared": ["installation"]}
+    assert page.plugin.memory_store.cleared_fences == [None]

@@ -505,6 +505,12 @@
             <span id="healthSummary" class="pill">-</span>
           </div>
           <div id="healthOutput" class="list"></div>
+          <div class="actions" style="margin-top: 16px; margin-bottom: 12px;">
+            <button id="clearFenceBtn" data-i18n="clearFence">Clear Fence</button>
+            <span id="fenceSummary" class="pill">-</span>
+            <span class="muted" data-i18n="fenceHint">An ambiguous Host write fences its memory space until it is reconciled.</span>
+          </div>
+          <div id="fenceOutput" class="list"></div>
           <div class="section-head" style="margin-top: 16px;">
             <h3 data-i18n="rawSummary">Raw summary</h3>
           </div>
@@ -544,6 +550,12 @@
       injectionLoading: 'Loading last injection...',
       injectedYes: 'Injected into prompt',
       injectedNo: 'Nothing injected',
+      clearFence: 'Clear Fence',
+      fenceHint: 'An ambiguous Host write fences its memory space until it is reconciled.',
+      fenceCleared: 'Fence cleared for the selected memory space.',
+      fenceRequired: 'Select a memory space or knowledge base first.',
+      noFences: 'No fenced space',
+      fencedSpaces: 'fenced',
       pageInfo: 'Page {page} / {pages}',
     };
 
@@ -662,7 +674,50 @@
       setStatus($('scopeStatus'), scopes.length > 0, scopes.length > 0 ? text.scopeReady : text.scopeMissing);
       renderKb(kbEntries);
       renderScopeOptions(scopes);
+      renderFences(data.fences || []);
       $('diagnosticsOutput').textContent = JSON.stringify(data, null, 2);
+    }
+
+    function renderFences(fences) {
+      const pill = $('fenceSummary');
+      if (!fences.length) {
+        pill.className = 'pill ok';
+        pill.textContent = text.noFences;
+        $('fenceOutput').innerHTML = '';
+        return;
+      }
+      pill.className = 'pill danger';
+      pill.textContent = fences.length + ' ' + text.fencedSpaces;
+      $('fenceOutput').innerHTML = fences.map((fence) => (
+        '<article class="item"><div class="item-head">'
+        + '<div class="item-title">' + escapeHtml(fence.scope || 'installation') + '</div>'
+        + '</div><div class="item-content">' + escapeHtml(fence.reason || '') + '</div></article>'
+      )).join('');
+    }
+
+    async function clearFence() {
+      const target = $('fenceOutput');
+      const scope = selectedScope();
+      const kb = selectedKb();
+      const body = {};
+      if (scope.scopeKey) body.scope_key = scope.scopeKey;
+      if (kb.collectionId) body.collection_id = kb.collectionId;
+      if (!body.scope_key && !body.collection_id) {
+        renderNotice(target, text.fenceRequired, true);
+        return;
+      }
+      $('clearFenceBtn').disabled = true;
+      try {
+        const data = await api('/fences/clear', body);
+        // The refreshed summary re-renders the fence list, so re-state the
+        // acknowledgment after it.
+        await refresh();
+        renderNotice(target, text.fenceCleared + ' ' + (data.cleared || []).join(', '), false);
+      } catch (err) {
+        renderError(target, err);
+      } finally {
+        $('clearFenceBtn').disabled = false;
+      }
     }
 
     function renderKb(entries) {
@@ -1128,6 +1183,7 @@
       $('searchEpisodesBtn').addEventListener('click', searchEpisodes);
       $('loadAuditBtn').addEventListener('click', loadAudit);
       $('runHealthBtn').addEventListener('click', runHealth);
+      $('clearFenceBtn').addEventListener('click', clearFence);
       $('loadInjectionBtn').addEventListener('click', loadInjection);
       $('exportProfilesBtn').addEventListener('click', exportProfiles);
       $('exportEpisodesBtn').addEventListener('click', exportEpisodes);
