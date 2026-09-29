@@ -1,6 +1,6 @@
 # LocalAgent shared-runtime candidate
 
-Version 0.2.0 targets `langbot-plugin>=0.7.4,<0.8` and declares
+Version 0.2.1 targets `langbot-plugin>=0.7.4,<0.8` and declares
 `shared-runtime-v1`. This declaration is **not a certificate**. Publication,
 independent exact-package review, signing and live acceptance remain separate gates.
 
@@ -28,7 +28,7 @@ not introduce unnecessary changes to the existing invocation-local algorithm.
 
 ## Verification
 
-Run from this plugin directory with the actual 0.6.1 interpreter:
+Run from this plugin directory with the actual 0.7.4 interpreter:
 
 ```sh
 python -m pytest tests -q
@@ -49,7 +49,7 @@ It deliberately collides model, conversation, tool and state-key identifiers:
 - Box acquisition/binding/export and both automatic and explicit file reply paths,
   plus unavailable-Box isolation.
 
-`tests/test_shared_release.py` checks metadata/lock consistency and real SDK
+`tests/test_shared_release.py` checks real SDK
 `PluginDependencyEnvironmentStore` preparation/cache readback through the SDK's
 **direct OSS installer** into a disposable directory. It does not mutate the
 Runtime virtualenv or substitute an SDK stub.
@@ -64,7 +64,7 @@ From the repository, verify the frozen package:
 
 ```sh
 python Runner/certification-tests/verify_localagent_candidate.py \
-  --package /absolute/external/candidate-directory/langbot-team-LocalAgent-0.2.0.lbpkg \
+  --package /absolute/external/candidate-directory/langbot-team-LocalAgent-0.2.1.lbpkg \
   --evidence /absolute/external/new-evidence-directory
 ```
 
