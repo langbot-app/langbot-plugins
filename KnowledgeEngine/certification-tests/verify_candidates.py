@@ -22,7 +22,7 @@ from langbot_plugin.runtime.plugin.dependency_environment import PluginDependenc
 from langbot_plugin.runtime.plugin.worker_launcher import PluginWorkerLauncher
 from langbot_plugin.entities.io.context import PluginWorkerPolicy
 
-NAMES = ['DifyDatasetsConnector', 'FastGPTConnector', 'LangRAG', 'RAGFlowConnector']
+NAMES = ['DifyDatasetsConnector', 'FastGPTConnector', 'LangRAG', 'RAGFlowConnector', 'LongTermMemory']
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -88,9 +88,9 @@ async def verify(out):
         (out / (name + '-rpc.log')).write_text(result.stdout + result.stderr)
         assert result.returncode == 0, result.stdout + result.stderr
     saved = json.loads((out / 'candidate-inventory.json').read_text())
-    assert len(saved) == len({r['name'] for r in saved}) == 4
+    assert len(saved) == len({r['name'] for r in saved}) == 5
     assert {r['name'] for r in saved} == set(NAMES)
-    print('VERIFIED 4 exact unsigned candidates, dependencies, discovery and RPC isolation')
+    print('VERIFIED 5 exact unsigned candidates, dependencies, discovery and RPC isolation')
 
 
 if __name__ == '__main__':

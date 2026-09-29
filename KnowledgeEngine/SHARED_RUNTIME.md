@@ -23,3 +23,14 @@ Dify, FastGPT, and RAGFlow now serialize mutations and fence ambiguous errors pe
 The Host may already persist `IngestionResult.document_id` and pass that upstream ID on delete, but this source alone cannot prove which deployed Host revision is used. Provider DELETE acknowledgements here are not yet verified with an authoritative upstream list/readback, and an upload timeout after remote commit leaves a durable pending intent requiring manual reconciliation. Config KB tombstones must not precede cleanup of outstanding mappings; the Host needs to retain the file row until verified upstream absence. For RAGFlow, an acknowledged upload followed by failed parse needs reconciliation rather than blind reupload. Existing connector fixture tests written for deleting arbitrary unrecorded IDs now fail by design; cancellation fixtures with deliberately detached Host commits no longer model the SDK-owned revocable action. Replacement fixture tests cover per-knowledge-base fencing and sibling isolation, fence persistence across a worker restart, fence clearing on knowledge-base deletion, ambiguous provider/transport failures, non-fencing of deterministic validation errors and pre-dispatch cancellation, and the revocation hook. Real upstream A/B ingestion, deletion absence and cancellation/revision proof remain release gates.
 
 The items above are **certification and release gates, not placement blockers**: an ambiguous upstream outcome needs the same manual reconciliation under dedicated placement, so they do not justify staying dedicated. All three connectors declare shared placement. No published certification is claimed for them yet.
+
+The real-child two-binding probe `certification-tests/shared_subprocess_probe.py` now also takes a
+connector directory: one controller/plugin/component graph attaches two `InstallationBinding` Workspaces
+(asserting `SAME_OBJECT_GRAPH=true` inside the child) and runs the same Host ids through
+create/ingest/retrieve/delete per binding against local Host and provider fixtures. Each binding is asserted
+to ingest with its own document id and file bytes, to retrieve only hits carrying its own credentials, to keep
+its own `api_key` under the same Host storage key, and to delete using only its own recorded upstream id, with
+the provider call log partitioned per binding. `certification-tests/verify_candidates.py` now builds and
+exercises all five KnowledgeEngine archives, LongTermMemory included. These remain local fixtures: live
+provider acceptance is still a release gate.
+
