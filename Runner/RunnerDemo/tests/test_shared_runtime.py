@@ -238,8 +238,10 @@ class SharedRuntimeDualBindingTests(unittest.IsolatedAsyncioTestCase):
             ("shared-runtime-v1", "stateless-v1"),
         )
         components = discover_plugin_components(manifest, discovery)
+        # Component discovery order follows the filesystem, so compare the set of
+        # declared components rather than the order they were found in.
         self.assertEqual(
-            [(component.kind, component.metadata.name) for component in components],
+            sorted((component.kind, component.metadata.name) for component in components),
             [("Runner", "community"), ("Runner", "observer")],
         )
 
@@ -327,7 +329,7 @@ class SharedRuntimeDualBindingTests(unittest.IsolatedAsyncioTestCase):
         # One plugin instance and one instance per component, bound to the live worker.
         self.assertEqual(type(container.plugin_instance).__name__, "RunnerDemo")
         self.assertEqual(
-            [component.manifest.metadata.name for component in container.components],
+            sorted(component.manifest.metadata.name for component in container.components),
             ["community", "observer"],
         )
         self.assertEqual(container.status, RuntimeContainerStatus.INITIALIZED)
