@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
 from components.shared_state import SerialState, serialized
 
 from langbot_plugin.api.definition.components.knowledge_engine import (
@@ -173,18 +173,34 @@ class LangRAG(KnowledgeEngine):
             error = e
             raise
         finally:
-            await telemetry.record_embedding_batch(
-                collection_id=collection_id,
-                ids=ids,
-                metas=metas,
-                texts=texts,
-                status=status,
-                duration_ms=telemetry.elapsed_ms(started_at),
-                vectors_stored=vectors_stored,
-                stage_durations_ms=stage_durations,
-                trace_id=trace_id,
-                error=error,
+            await self._record_diagnostic(
+                "record_embedding_batch",
+                telemetry.record_embedding_batch(
+                    collection_id=collection_id,
+                    ids=ids,
+                    metas=metas,
+                    texts=texts,
+                    status=status,
+                    duration_ms=telemetry.elapsed_ms(started_at),
+                    vectors_stored=vectors_stored,
+                    stage_durations_ms=stage_durations,
+                    trace_id=trace_id,
+                    error=error,
+                ),
             )
+
+    @staticmethod
+    async def _record_diagnostic(label: str, awaitable: Awaitable[None]) -> None:
+        """Record one diagnostic best effort.
+
+        Telemetry is observability, never a precondition: a fenced or unreachable
+        telemetry state must not fail the operation it describes, and it must not
+        replace the error the caller is about to see.
+        """
+        try:
+            await awaitable
+        except Exception:
+            logger.warning("LangRAG telemetry %s failed", label, exc_info=True)
 
     @staticmethod
     def _metadata_int(value) -> int | None:
@@ -514,25 +530,28 @@ class LangRAG(KnowledgeEngine):
                 error_message=str(e),
             )
         finally:
-            await telemetry.record_ingest(
-                document_id=doc_id,
-                filename=filename,
-                collection_id=collection_id,
-                status=telemetry_status,
-                duration_ms=telemetry.elapsed_ms(started_at),
-                index_type=index_type,
-                chunks_created=telemetry_chunks_created,
-                file_size=file_size,
-                text_length=telemetry_text_length,
-                content_hash=telemetry_content_hash,
-                sections_count=telemetry_sections_count,
-                settings=context.creation_settings,
-                stage_durations_ms=stage_durations,
-                parser_source=parser_source,
-                knowledge_base_id=context.knowledge_base_id,
-                trace_id=trace_id,
-                correlation=correlation,
-                error=telemetry_error,
+            await self._record_diagnostic(
+                "record_ingest",
+                telemetry.record_ingest(
+                    document_id=doc_id,
+                    filename=filename,
+                    collection_id=collection_id,
+                    status=telemetry_status,
+                    duration_ms=telemetry.elapsed_ms(started_at),
+                    index_type=index_type,
+                    chunks_created=telemetry_chunks_created,
+                    file_size=file_size,
+                    text_length=telemetry_text_length,
+                    content_hash=telemetry_content_hash,
+                    sections_count=telemetry_sections_count,
+                    settings=context.creation_settings,
+                    stage_durations_ms=stage_durations,
+                    parser_source=parser_source,
+                    knowledge_base_id=context.knowledge_base_id,
+                    trace_id=trace_id,
+                    correlation=correlation,
+                    error=telemetry_error,
+                ),
             )
 
     async def retrieve(self, context: RetrievalContext) -> RetrievalResponse:
@@ -858,33 +877,36 @@ class LangRAG(KnowledgeEngine):
             telemetry_status = "failed"
             raise
         finally:
-            await telemetry.record_retrieval(
-                query=query,
-                collection_id=collection_id,
-                status=telemetry_status,
-                duration_ms=telemetry.elapsed_ms(started_at),
-                index_type=context.creation_settings.get("index_type") or "chunk",
-                search_type=search_type,
-                top_k=top_k,
-                fetch_k=fetch_k,
-                raw_count=raw_count,
-                result_count=result_count,
-                reference_count=reference_count,
-                heading_count=heading_count,
-                context_expanded_count=context_expanded_count,
-                distance_min=distance_min,
-                distance_avg=distance_avg,
-                distance_max=distance_max,
-                filters=context.filters,
-                creation_settings=context.creation_settings,
-                retrieval_settings=context.retrieval_settings,
-                stage_durations_ms=stage_durations,
-                trace_spans=_trace_spans(trace_id, stage_durations),
-                reranked=reranked,
-                knowledge_base_id=context.knowledge_base_id,
-                trace_id=trace_id,
-                correlation=correlation,
-                error=telemetry_error,
+            await self._record_diagnostic(
+                "record_retrieval",
+                telemetry.record_retrieval(
+                    query=query,
+                    collection_id=collection_id,
+                    status=telemetry_status,
+                    duration_ms=telemetry.elapsed_ms(started_at),
+                    index_type=context.creation_settings.get("index_type") or "chunk",
+                    search_type=search_type,
+                    top_k=top_k,
+                    fetch_k=fetch_k,
+                    raw_count=raw_count,
+                    result_count=result_count,
+                    reference_count=reference_count,
+                    heading_count=heading_count,
+                    context_expanded_count=context_expanded_count,
+                    distance_min=distance_min,
+                    distance_avg=distance_avg,
+                    distance_max=distance_max,
+                    filters=context.filters,
+                    creation_settings=context.creation_settings,
+                    retrieval_settings=context.retrieval_settings,
+                    stage_durations_ms=stage_durations,
+                    trace_spans=_trace_spans(trace_id, stage_durations),
+                    reranked=reranked,
+                    knowledge_base_id=context.knowledge_base_id,
+                    trace_id=trace_id,
+                    correlation=correlation,
+                    error=telemetry_error,
+                ),
             )
 
     @serialized
@@ -926,14 +948,17 @@ class LangRAG(KnowledgeEngine):
             error = e
             raise
         finally:
-            await telemetry.record_delete(
-                collection_id=kb_id,
-                document_id=document_id,
-                status=status,
-                duration_ms=telemetry.elapsed_ms(started_at),
-                deleted=deleted,
-                vectors_deleted=count,
-                knowledge_base_id=kb_id,
-                trace_id=trace_id,
-                error=error,
+            await self._record_diagnostic(
+                "record_delete",
+                telemetry.record_delete(
+                    collection_id=kb_id,
+                    document_id=document_id,
+                    status=status,
+                    duration_ms=telemetry.elapsed_ms(started_at),
+                    deleted=deleted,
+                    vectors_deleted=count,
+                    knowledge_base_id=kb_id,
+                    trace_id=trace_id,
+                    error=error,
+                ),
             )
