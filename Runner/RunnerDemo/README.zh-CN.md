@@ -23,7 +23,7 @@
 
 1. 使用配套 SDK 在此目录执行 `lbp build`。
 2. 在 LangBot「添加扩展」中选择本地安装，上传
-   `dist/langbot-team-RunnerDemo-0.1.0.lbpkg`。
+   `dist/langbot-team-RunnerDemo-0.2.1.lbpkg`。
 3. 分别创建「社区助手」「事件观察员」两个插件处理器配置。
 4. 在详情页顶部选择对应组件，在右侧「配置」标签中设置参数并保存。
 5. 在左侧事件调试中选择样例的 `event_type`；切换到「完整 JSON」，仅粘贴样例中的 **`data` 对象**。
@@ -63,7 +63,12 @@
 ## 共享运行时认证配置
 
 RunnerDemo 声明了 `execution.sharedRuntime: shared-runtime-v1`，并保持运行时代码
-不使用进程级或可变模块状态；配置和单次运行数据仅通过 `RunnerContext` 传递。本地
+不使用进程级或可变模块状态；配置和单次运行数据仅通过 `RunnerContext` 传递。
+`tests/test_shared_runtime.py` 用已发布 SDK 复现了双绑定证据：同一个真实 Worker
+（`PluginRuntimeController`、一份 `RunnerDemo` 实例、每个组件一份实例）分别以
+workspace-A/installation-A 与 workspace-B/installation-B 挂载两次，两个安装并发驱动同一个
+`community` 组件，各自使用独立配置、事件和结果；同一测试还会摘除其中一个安装，验证
+另一个安装的对象图不受影响。只有 Host/后端 RPC 响应是固定桩。本地
 `lbp build` 生成的归档仍未签名，ZIP 注释中不含认证信息。Space 审批是独立的
 签发和签名关卡；本仓库不声称已经获得审批或证书。
 

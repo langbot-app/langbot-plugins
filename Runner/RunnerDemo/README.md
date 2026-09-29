@@ -25,7 +25,7 @@ from explicitly bound bots. Old Pipeline `EventListener` hooks are unchanged.
 
 1. Use a running LangBot 4.11 Host and matching Plugin Runtime.
 2. In this directory, run `lbp build` with that SDK. The package is written to
-   `dist/langbot-team-RunnerDemo-0.1.0.lbpkg`.
+   `dist/langbot-team-RunnerDemo-0.2.1.lbpkg`.
 3. Upload it with **Add extension → local plugin installation** in LangBot.
 4. Create two **Plugin processor** configurations. On each detail page, select
    **Community concierge** or **Event observer** from the component selector.
@@ -79,10 +79,18 @@ logging includes typed event data but excludes the raw platform object.
 
 RunnerDemo declares `execution.sharedRuntime: shared-runtime-v1` and keeps its
 runtime modules free of process-wide or mutable module state; configuration and
-per-run data stay on `RunnerContext`. A local `lbp build` archive is still
-unsigned and has no certification comment. Space approval is the separate gate
-that may issue and sign a certification envelope; this repository does not claim
-that approval or certificate.
+per-run data stay on `RunnerContext`. `tests/test_shared_runtime.py` reproduces
+the two-binding proof locally with the released SDK: one real worker
+(`PluginRuntimeController` + the `RunnerDemo` instance + one instance per
+component) is attached twice, as workspace-A/installation-A and
+workspace-B/installation-B, and both installations are driven concurrently
+through the `community` component with distinct configuration, events and
+results. The same test detaches one installation and checks that the sibling
+graph survives, so a regression to per-installation object graphs fails it
+instead of passing vacuously. Only Host/backend RPC responses are fixtures. A
+local `lbp build` archive is still unsigned and has no certification comment.
+Space approval is the separate gate that may issue and sign a certification
+envelope; this repository does not claim that approval or certificate.
 
 ## Development and repeatable verification
 
@@ -113,6 +121,7 @@ saved. Re-running adds another set of run records.
 - `components/runner/observer.py`: generic event fallback handler.
 - Matching YAML files: independent component configs, event declarations and permissions.
 - `tests/test_processors.py`: all samples, trace pairing, fault handling, Unicode and config isolation.
+- `tests/test_shared_runtime.py`: real SDK worker with two installation bindings — object-graph identity, per-binding configuration/results, slot detach.
 - `scripts/smoke.py`: actual package installation and Host/runtime integration check.
 
 The component API exposes `ctx.event`, `ctx.config`, `ctx.run_id`, `ctx.log()`,

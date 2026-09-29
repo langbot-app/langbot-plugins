@@ -156,7 +156,7 @@ def main():
     parser.add_argument(
         "--package",
         type=Path,
-        default=ROOT / "dist/langbot-team-RunnerDemo-0.1.0.lbpkg",
+        default=ROOT / "dist/langbot-team-RunnerDemo-0.2.1.lbpkg",
     )
     parser.add_argument("--receipt", type=Path, default=ROOT / "data/smoke-results.json")
     args = parser.parse_args()
