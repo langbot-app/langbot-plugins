@@ -741,4 +741,3 @@ def test_weknora_empty_answer_fails_instead_of_completing() -> None:
 
     assert [_type(item) for item in results] == ["run.failed"]
     assert results[0].data["code"] == "weknora.empty_response"
-

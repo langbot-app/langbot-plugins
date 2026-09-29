@@ -195,4 +195,3 @@ class ParserObservabilityPageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(response.error)
-
