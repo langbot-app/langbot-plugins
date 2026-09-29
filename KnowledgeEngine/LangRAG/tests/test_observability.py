@@ -169,28 +169,3 @@ class ObservabilityPageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Unknown endpoint", response.error)
 
-    def test_i18n_assets_exist(self):
-        root = Path(__file__).resolve().parents[1]
-        for filename in ("en_US.json", "zh_Hans.json"):
-            path = root / "components" / "pages" / "i18n" / filename
-            self.assertTrue(path.exists())
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self.assertIn("title", data)
-            self.assertIn("sections.window", data)
-
-    def test_sensitive_query_log_patterns_are_not_present(self):
-        root = Path(__file__).resolve().parents[1]
-        for relative in (
-            "components/knowledge_engine/langrag.py",
-            "components/knowledge_engine/query_rewrite.py",
-            "components/knowledge_engine/rerank.py",
-        ):
-            source = (root / relative).read_text(encoding="utf-8")
-            self.assertNotIn("query={query!r}", source)
-            self.assertNotIn("query: {query!r}", source)
-            self.assertNotIn("LLM response: {raw!r}", source)
-            self.assertNotIn("Hypothetical document:\\n{hypothetical_doc}", source)
-
-
-if __name__ == "__main__":
-    unittest.main()

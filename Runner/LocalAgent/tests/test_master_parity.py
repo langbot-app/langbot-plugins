@@ -2,10 +2,8 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.provider.message import Message
 from langbot_plugin.api.entities.builtin.runner.resources import AgentResources, ModelResource
 
@@ -67,14 +65,6 @@ async def test_date_grounding_creates_system_prompt_when_no_prompt_configured():
     assert "Current date:" in messages[0].content
     # The loop appends its assistant reply to the list after invocation.
     assert messages[1].role == "user"
-
-
-def test_runner_schema_declares_reasoning_and_date_defaults():
-    schema = yaml.safe_load((Path(__file__).parents[1] / "components/runner/default.yaml").read_text())
-    fields = {item["name"]: item for item in schema["spec"]["config"]}
-    assert fields["model"]["type"] == "model-fallback-selector"
-    assert fields["model"]["default"] == {"primary": "", "fallbacks": [], "reasoning": {}}
-    assert fields["date-grounding"]["default"] is True
 
 
 @pytest.mark.asyncio

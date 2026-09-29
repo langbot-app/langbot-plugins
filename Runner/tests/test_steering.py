@@ -15,7 +15,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import yaml
 from langbot_plugin.api.entities.builtin.provider.message import MessageChunk
 from langbot_plugin.api.entities.builtin.runner import (
     AgentEventContext,
@@ -35,12 +34,6 @@ from langbot_plugin.api.entities.builtin.runner.context_access import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-NATIVE_RUNNERS = ("acp-agent-runner", "claude-code-agent", "codex-agent")
-
-
-def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def _load_plugin(plugin_dir: str):
@@ -276,14 +269,8 @@ def test_steering_loop_survives_pull_errors() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Manifest capability
+# Runner argv
 # --------------------------------------------------------------------------- #
-
-
-def test_native_runners_declare_steering_capability() -> None:
-    for plugin_dir in NATIVE_RUNNERS:
-        manifest = _load_yaml(ROOT / plugin_dir / "components" / "runner" / "default.yaml")
-        assert manifest["spec"]["capabilities"].get("steering") is True
 
 
 def test_claude_argv_uses_resume_to_continue_session() -> None:

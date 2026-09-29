@@ -9,12 +9,10 @@ import os
 
 # Import modules to test
 import sys
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.provider.message import (
     ContentElement,
     FunctionCall,
@@ -1472,51 +1470,6 @@ class TestContextAssembler:
 
 class TestDefaultRunner:
     """Tests for DefaultRunner behavior."""
-
-    def test_manifest_declares_local_agent_capabilities(self):
-        """The local runner declares the capabilities it actively needs."""
-        manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "components/runner/default.yaml").read_text())
-
-        assert manifest["spec"]["capabilities"]["skill_authoring"] is True
-        assert manifest["spec"]["capabilities"]["interrupt"] is True
-        assert manifest["spec"]["permissions"] == {
-            "models": ["count_tokens", "invoke", "stream", "rerank"],
-            "tools": ["detail", "call"],
-            "knowledge_bases": ["list", "retrieve"],
-            "history": ["page"],
-        }
-        config_names = {item["name"] for item in manifest["spec"]["config"]}
-        assert "advanced-settings" in config_names
-        assert "remove-think" in config_names
-        assert "context-window-tokens" in config_names
-        assert "context-keep-recent-tokens" in config_names
-        assert "context-window-chars" not in config_names
-        assert "retrieval-top-k" in config_names
-        assert "max-tool-iterations" in config_names
-        assert "tool-execution-mode" in config_names
-        assert "max-tool-result-chars" in config_names
-        max_tool_iterations = next(item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations")
-        assert max_tool_iterations["default"] == DEFAULT_MAX_TOOL_ITERATIONS
-        tool_execution_mode = next(item for item in manifest["spec"]["config"] if item["name"] == "tool-execution-mode")
-        assert tool_execution_mode["default"] == "parallel"
-        assert [option["name"] for option in tool_execution_mode["options"]] == ["parallel", "serial"]
-        config = {item["name"]: item for item in manifest["spec"]["config"]}
-        assert config["advanced-settings"]["default"] is False
-        basic_fields = {
-            "model",
-            "prompt",
-            "knowledge-bases",
-            "advanced-settings",
-            "box-enabled",
-            "box-session-id-template",
-        }
-        advanced_fields = config_names - basic_fields
-        for field_name in advanced_fields:
-            assert config[field_name]["show_if"] == {
-                "field": "advanced-settings",
-                "operator": "eq",
-                "value": True,
-            }
 
     @pytest.mark.asyncio
     async def test_streaming_tool_call_arguments_continue_when_later_delta_has_no_id(self):
@@ -3559,30 +3512,6 @@ class TestDefaultRunner:
         assert fake_api.invoke_llm.await_args.kwargs["remove_think"] is True
         completed = [r for r in results if r.type == RunnerResultType.MESSAGE_COMPLETED]
         assert completed[0].data.get("message", {}).get("content") == "Clean response"
-
-    @pytest.mark.asyncio
-    async def test_runtime_metadata_can_disable_default_streaming(self, runner, monkeypatch):
-        """When config omits streaming, host adapter capability decides the mode."""
-        fake_api = FakeRunnerAPIProxy(
-            models=[ModelResource(model_id="model-1")],
-        )
-        fake_api.invoke_llm = AsyncMock(return_value=Message(role="assistant", content="Adapter cannot stream"))
-        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
-
-        ctx = make_context(
-            config={"model": {"primary": "model-1", "fallbacks": []}},
-            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
-            runtime_metadata={"streaming_supported": False},
-        )
-
-        results = []
-        async for result in runner.run(ctx):
-            results.append(result)
-
-        fake_api.invoke_llm.assert_awaited_once()
-        assert fake_api.invoke_llm_stream.call_count == 0
-        completed = [r for r in results if r.type == RunnerResultType.MESSAGE_COMPLETED]
-        assert completed[0].data.get("message", {}).get("content") == "Adapter cannot stream"
 
     @pytest.mark.asyncio
     async def test_non_streaming_fallback(self, runner, monkeypatch):

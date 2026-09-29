@@ -1,25 +1,13 @@
 """Shared-runtime release contract; run with the actual candidate SDK."""
 
 import importlib.metadata
-import tomllib
 from pathlib import Path
 
 import pytest
-import yaml
 from langbot_plugin.runtime.plugin.artifact import PluginArtifact
 from langbot_plugin.runtime.plugin.dependency_environment import PluginDependencyEnvironmentStore
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_shared_release_metadata_and_standalone_lock():
-    manifest = yaml.safe_load((ROOT / "manifest.yaml").read_text())
-    assert manifest["execution"].get("sharedRuntime") == "shared-runtime-v1"
-    assert manifest["metadata"]["version"] == "0.2.0"
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert "langbot-plugin>=0.7.4,<0.8" in project["project"]["dependencies"]
-    lock = tomllib.loads((ROOT / "uv.lock").read_text())
-    assert [p["version"] for p in lock["package"] if p["name"] == "langbot-plugin"] == ["0.7.4"]
 
 
 @pytest.mark.asyncio

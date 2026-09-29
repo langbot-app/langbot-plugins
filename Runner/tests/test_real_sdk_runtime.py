@@ -14,9 +14,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from test_sdk_release_pin import CODING_PLUGINS
 
 ROOT = Path(__file__).resolve().parents[1]
+CODING_PLUGINS = {"acp-agent-runner", "claude-code-agent", "codex-agent"}
 PLUGINS = {
     "acp-agent-runner": "ACPAgentRunner",  # Published identity survives the Runner component-kind rename.
     "claude-code-agent": "ClaudeCodeAgent",

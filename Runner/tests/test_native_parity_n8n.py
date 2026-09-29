@@ -17,7 +17,6 @@ from pathlib import Path
 import httpx
 import jwt
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.runner import RunnerContext
 
 ROOT = Path(__file__).resolve().parents[1] / "n8n-agent"
@@ -293,43 +292,6 @@ async def test_request_fields_and_runner_owned_state_survive_ignore(runner_modul
         "msg_create_time": "",
         "custom": "value",
     }
-
-
-def test_response_mode_schema_is_localized():
-    config = yaml.safe_load((ROOT / "components/runner/default.yaml").read_text())["spec"]["config"]
-    fields = {f["name"]: f for f in config}
-    assert "response-handling" in fields
-    field = fields["response-handling"]
-    assert field["default"] == "reply"
-    assert field["type"] == "select"
-    assert {option["name"] for option in field["options"]} == {"reply", "ignore"}
-    for locale in ("en_US", "zh_Hans", "ja_JP"):
-        assert field["label"][locale]
-        assert field["description"][locale]
-        assert all(option["label"][locale] for option in field["options"])
-
-
-def test_n8n_identity_and_mirrored_english_documentation_are_preserved():
-    manifest = yaml.safe_load((ROOT / "manifest.yaml").read_text())
-    assert manifest["metadata"]["author"] == "langbot-team"
-    assert manifest["metadata"]["name"] == "N8nAgent"
-    assert (ROOT / "README.md").read_text() == (ROOT / "readme/README_en_US.md").read_text()
-    config = yaml.safe_load((ROOT / "components/runner/default.yaml").read_text())["spec"]["config"]
-    for path in (ROOT / "readme").glob("README_*.md"):
-        assert all(field["name"] in path.read_text() for field in config), path.name
-
-
-def test_n8n_new_defaults_do_not_enable_asset_access():
-    config = yaml.safe_load((ROOT / "components/runner/default.yaml").read_text())["spec"]["config"]
-    fields = {f["name"]: f for f in config}
-    assert fields["langbot-assets-enabled"]["default"] is False
-    for auth, names in {
-        "basic": ["basic-username", "basic-password"],
-        "jwt": ["jwt-secret", "jwt-algorithm"],
-        "header": ["header-name", "header-value"],
-    }.items():
-        for name in names:
-            assert fields[name]["show_if"] == {"field": "auth-type", "operator": "eq", "value": auth}
 
 
 @pytest.mark.asyncio

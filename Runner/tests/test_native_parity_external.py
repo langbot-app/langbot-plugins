@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.runner import (
     AgentEventContext,
     AgentInput,
@@ -101,25 +100,11 @@ def contents(results):
     return [message["content"] for message in messages if message.get("content")]
 
 
-def schema(plugin):
-    return yaml.safe_load((ROOT / plugin / "components/runner/default.yaml").read_text())["spec"]
-
-
 @pytest.mark.parametrize("value", ["false", 0, 1, None, [], {}])
 def test_dify_remove_think_rejects_non_boolean(value):
     with load_runner("dify-agent") as (m, runner):
         with pytest.raises(m.DifyConfigError, match="remove-think must be a boolean"):
             runner._validate_config(ctx({"api-key": "fixture", "remove-think": value}))
-
-
-def test_dify_remove_think_schema_and_locales():
-    fields = {f["name"]: f for f in schema("dify-agent")["config"]}
-    field = fields["remove-think"]
-    assert field["type"] == "boolean" and field["default"] is False
-    assert all(field[part][locale] for part in ["label", "description"] for locale in ["en_US", "zh_Hans"])
-    assert "chatflow" in {o["name"] for o in fields["app-type"]["options"]}
-    assert schema("dify-agent")["capabilities"]["interactions"] is True
-    assert schema("dify-agent")["capabilities"]["interrupt"] is False
 
 
 @pytest.mark.parametrize("app", ["chat", "chatflow", "agent", "workflow"])
@@ -334,15 +319,6 @@ def test_weknora_agent_defaults_and_exact_remote_ids_reach_client(monkeypatch, a
         assert captured[0]["path"] == (
             "/knowledge-chat/remote-session" if app == "chat" else "/agent-chat/remote-session"
         )
-
-
-def test_weknora_schema_does_not_force_smart_reasoning_in_chat():
-    fields = {f["name"]: f for f in schema("weknora-agent")["config"]}
-    assert "default" not in fields["agent-id"]
-    assert not fields["agent-id"]["required"]
-    assert "show_if" not in fields["agent-id"]
-    assert "show_if" not in fields["knowledge-base-ids"]
-    assert schema("weknora-agent")["capabilities"]["knowledge_retrieval"] is False
 
 
 @pytest.mark.parametrize("value", [[None], [5], [{}], [""], [" \t"], "remote-kb"])

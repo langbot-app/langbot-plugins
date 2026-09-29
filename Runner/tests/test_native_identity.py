@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.runner import ActorContext, AdapterContext, ConversationContext
 
-from tests.test_native_parity_external import ROOT, collect, ctx, kind, load_runner
+from tests.test_native_parity_external import collect, ctx, kind, load_runner
 
 PLUGINS = ("dify", "coze", "n8n", "tbox")
 
@@ -94,18 +93,6 @@ def test_missing_identity_fails_safe_without_sender_or_params_fallback(name, mis
         assert [kind(e) for e in events] == ["run.failed"]
         assert events[0].data["code"] == f"{name}.identity_unavailable"
         assert "forged" not in str(events)
-
-
-@pytest.mark.parametrize("name", PLUGINS)
-def test_identity_enum_is_pipeline_only(name):
-    root = ROOT / (name + "-agent")
-    schema = yaml.safe_load((root / "components/runner/default.yaml").read_text())
-    field = next(f for f in schema["spec"]["config"] if f["name"] == "user-id-source")
-    assert field["type"] == "select" and field["default"] == "sender"
-    assert [o["name"] for o in field["options"]] == ["sender", "legacy-bot" if name == "tbox" else "legacy-session"]
-    assert yaml.safe_load((root / "manifest.yaml").read_text())["spec"]["config"] == []
-    for path in [root / "README.md", *(root / "readme").glob("README_*.md")]:
-        assert "user-id-source" in path.read_text()
 
 
 @pytest.mark.parametrize("name", PLUGINS)

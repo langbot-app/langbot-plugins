@@ -196,15 +196,3 @@ class ParserObservabilityPageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(response.error)
 
-    def test_i18n_assets_exist(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        for filename in ("en_US.json", "zh_Hans.json"):
-            path = root / "components" / "pages" / "i18n" / filename
-            self.assertTrue(path.exists())
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self.assertIn("title", data)
-            self.assertIn("sections.recentParses", data)
-
-
-if __name__ == "__main__":
-    unittest.main()

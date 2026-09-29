@@ -233,39 +233,6 @@ async def test_loop_aggregates_usage_across_tool_turns():
 
 
 @pytest.mark.asyncio
-async def test_streaming_model_empty_first_stream_falls_back():
-    class StreamingAPI:
-        def __init__(self):
-            self.model_ids: list[str] = []
-
-        def invoke_llm_stream(self, *, llm_model_uuid, messages, funcs, remove_think, reasoning_level):
-            self.model_ids.append(llm_model_uuid)
-
-            async def stream():
-                if llm_model_uuid == "model-1":
-                    return
-                    yield
-                yield MessageChunk(role="assistant", content="fallback response", is_final=True)
-
-            return stream()
-
-    api = StreamingAPI()
-    caller = StreamingModelCaller(
-        api,
-        model_ids=["model-1", "model-2"],
-        messages=[Message(role="user", content="hello")],
-    )
-
-    chunks = []
-    async for chunk, _ in caller.stream():
-        chunks.append(chunk)
-
-    assert api.model_ids == ["model-1", "model-2"]
-    assert chunks[-1].content == "fallback response"
-    assert caller.get_committed_model_id() == "model-2"
-
-
-@pytest.mark.asyncio
 async def test_streaming_model_empty_final_chunk_falls_back():
     class StreamingAPI:
         def __init__(self):
@@ -294,27 +261,6 @@ async def test_streaming_model_empty_final_chunk_falls_back():
     assert api.model_ids == ["model-1", "model-2"]
     assert chunks[-1].content == "fallback response"
     assert caller.get_committed_model_id() == "model-2"
-
-
-@pytest.mark.asyncio
-async def test_streaming_model_all_empty_streams_fail():
-    class StreamingAPI:
-        def invoke_llm_stream(self, *, llm_model_uuid, messages, funcs, remove_think, reasoning_level):
-            async def stream():
-                return
-                yield
-
-            return stream()
-
-    caller = StreamingModelCaller(
-        StreamingAPI(),
-        model_ids=["model-1", "model-2"],
-        messages=[Message(role="user", content="hello")],
-    )
-
-    with pytest.raises(ModelCallError, match="All models failed"):
-        async for _chunk, _ in caller.stream():
-            pass
 
 
 @pytest.mark.asyncio

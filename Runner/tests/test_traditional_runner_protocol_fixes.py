@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import yaml
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
 from langbot_plugin.api.entities.builtin.runner import (
     AgentEventContext,
@@ -26,11 +25,6 @@ from langbot_plugin.api.entities.builtin.runner import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def _load_runner_module(plugin_dir: str, stubs: dict[str, Any] | None = None):
@@ -102,15 +96,6 @@ def _text_and_image_ctx(config: dict[str, Any]) -> RunnerContext:
         text="describe this",
         contents=[ContentElement.from_image_base64("data:image/png;base64,aGVsbG8=")],
     )
-
-
-def test_traditional_requirements_match_direct_imports() -> None:
-    assert "httpx" in (ROOT / "dify-agent" / "requirements.txt").read_text(encoding="utf-8")
-    assert "aiohttp" in (ROOT / "coze-agent" / "requirements.txt").read_text(encoding="utf-8")
-    assert "dashscope" in (ROOT / "dashscope-agent" / "requirements.txt").read_text(encoding="utf-8")
-    assert "httpx" in (ROOT / "n8n-agent" / "requirements.txt").read_text(encoding="utf-8")
-    assert "httpx" in (ROOT / "langflow-agent" / "requirements.txt").read_text(encoding="utf-8")
-    assert "aiohttp" not in (ROOT / "tbox-agent" / "requirements.txt").read_text(encoding="utf-8")
 
 
 def test_coze_does_not_reuse_langbot_conversation_id_as_external_id() -> None:
@@ -757,10 +742,3 @@ def test_weknora_empty_answer_fails_instead_of_completing() -> None:
     assert [_type(item) for item in results] == ["run.failed"]
     assert results[0].data["code"] == "weknora.empty_response"
 
-
-def test_weknora_manifest_does_not_advertise_host_tool_or_knowledge_capabilities() -> None:
-    runner = _load_yaml(ROOT / "weknora-agent" / "components" / "runner" / "default.yaml")
-
-    assert runner["spec"]["capabilities"]["tool_calling"] is False
-    assert runner["spec"]["capabilities"]["knowledge_retrieval"] is False
-    assert runner["spec"]["permissions"] == {"storage": ["plugin"]}

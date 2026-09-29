@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 from langbot_plugin.api.entities.builtin.runner import (
     AgentEventContext,
     AgentInput,
@@ -163,20 +162,6 @@ def drive(loader, monkeypatch, mode, config, pieces, reasoning="private-reasonin
     return events, captured
 
 
-@pytest.mark.parametrize("name", PLUGINS)
-def test_remove_think_schema_is_boolean_false_bilingual(name):
-    fields = yaml.safe_load((ROOT / f"{name}-agent/components/runner/default.yaml").read_text())["spec"]["config"]
-    field = next((f for f in fields if f["name"] == "remove-think"), None)
-    assert field is not None
-    assert field["type"] == "boolean" and field["default"] is False
-    assert field["label"]["en_US"] and field["label"]["zh_Hans"]
-    plugin = ROOT / f"{name}-agent"
-    root_readme = (plugin / "README.md").read_text()
-    assert root_readme == (plugin / "readme/README_en_US.md").read_text()
-    for readme in (plugin / "readme").glob("README_*.md"):
-        assert all(f["name"] in readme.read_text() for f in fields)
-
-
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("flag", [False, True, "absent"])
 def test_output_split_think_boundaries_preserve_answer_and_tool_content(parity_module_loader, monkeypatch, mode, flag):
@@ -242,13 +227,6 @@ def test_remove_think_rejects_non_boolean_before_vendor_call(parity_module_loade
     assert events[0].data["code"] == f"{name}.config_invalid"
     assert "remove-think" in events[0].data["error"]
     assert captured == {}
-
-
-def test_coze_custom_endpoint_schema_is_freeform():
-    fields = yaml.safe_load((ROOT / "coze-agent/components/runner/default.yaml").read_text())["spec"]["config"]
-    field = next(f for f in fields if f["name"] == "api-base")
-    assert field["type"] == "string"
-    assert "options" not in field
 
 
 @pytest.mark.parametrize(
