@@ -146,6 +146,10 @@ async def vendor(request):
 async def probe(name, out):
     folder = ROOT / (name + "-agent")
     marker = out / (name + "-identities.jsonl")
+    # The worker appends to this file, so a stale file from an earlier run in the
+    # same outdir would add identity lines and fail the one-process assertions
+    # below with a misleading `AssertionError()`.
+    marker.write_text("", encoding="utf-8")
     site = out / (name + "-site")
     site.mkdir(exist_ok=True)
     if name in ("dashscope", "tbox"):
