@@ -29,7 +29,7 @@ from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction, Runt
 from langbot_plugin.entities.io.context import InstallationBinding
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-NAMES = ["coze", "dify", "n8n", "langflow", "dashscope", "tbox"]
+NAMES = ["coze", "dify", "n8n", "langflow", "dashscope", "tbox", "deerflow", "weknora"]
 
 
 def ctx(name, config):
@@ -96,19 +96,17 @@ async def rpc(proc, seq, action, data, b=None):
 
 async def vendor(request):
     body = await request.json()
-    letter = (
-        "A"
-        if "tenant-A" in json.dumps(body) + request.path + str(request.headers.get("Authorization", ""))
-        else "B"
-        if "tenant-B" in json.dumps(body) + request.path + str(request.headers.get("Authorization", ""))
-        else "?"
-    )
+    authorization = str(request.headers.get("Authorization", ""))
+    api_key_header = str(request.headers.get("X-API-Key", ""))
+    credential_blob = json.dumps(body) + request.path + authorization + api_key_header
+    letter = "A" if "tenant-A" in credential_blob else "B" if "tenant-B" in credential_blob else "?"
     request.app["calls"].append(
         dict(
             path=request.path,
             letter=letter,
             body=body,
-            authorization_marker=letter if "tenant-" + letter in request.headers.get("Authorization", "") else None,
+            authorization_marker=letter if "tenant-" + letter in authorization else None,
+            api_key_marker=letter if "tenant-" + letter in api_key_header else None,
         )
     )
     name = request.app["name"]
@@ -140,6 +138,18 @@ async def vendor(request):
                 (None, {"event": "message_end", "conversation_id": "fixture-conversation-" + letter}),
             ]
         )
+    if name == "weknora":
+        # WeKnora: POST /sessions returns {"data": {"id": ...}}; chats stream
+        # `data:` lines whose payload carries response_type/content/done.
+        if request.path.endswith("/sessions"):
+            return web.json_response({"data": {"id": "fixture-session-" + letter}})
+        return sse([(None, {"response_type": "answer", "content": text, "done": True})])
+    if name == "deerflow":
+        # DeerFlow LangGraph: POST .../threads returns {"thread_id": ...}; the
+        # runs/stream SSE carries a `values` event holding the message list.
+        if request.path.endswith("/threads"):
+            return web.json_response({"thread_id": "fixture-thread-" + letter})
+        return sse([("values", {"messages": [{"type": "ai", "content": text, "id": "fixture-message-" + letter}]})])
     raise AssertionError(name)
 
 
@@ -316,7 +326,15 @@ async def probe(name, out):
             if name in ("coze", "dify", "langflow")
             else True
         )
-        assert len(app["calls"]) == 2 if name not in ("dashscope", "tbox") else True
+        assert len(app["calls"]) == 2 if name not in ("dashscope", "tbox", "deerflow", "weknora") else True
+        if name in ("deerflow", "weknora"):
+            # These vendors touch their API twice per binding: create the
+            # thread/session, then stream the run. Both calls must carry that
+            # binding's own credential (Bearer / X-API-Key).
+            assert len(app["calls"]) == 4, result["upstream_calls"]
+            assert [c["letter"] for c in app["calls"]] == ["A", "A", "B", "B"], result["upstream_calls"]
+            markers = [c["authorization_marker"] or c["api_key_marker"] for c in app["calls"]]
+            assert markers == ["A", "A", "B", "B"], result["upstream_calls"]
         assert len(result["identities"]) == 2 and {x["pid"] for x in result["identities"]} == {proc.pid}
         assert (
             len({x["plugin_id"] for x in result["identities"]})
