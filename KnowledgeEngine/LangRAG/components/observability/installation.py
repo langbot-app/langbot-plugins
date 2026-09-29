@@ -66,10 +66,15 @@ class InstallationTelemetry:
             events.pop(0)
         try:
             await self.plugin.set_plugin_storage(KEY, raw)
-        except Exception:
-            # Diagnostics must never fence business work: drop the write and let
-            # the next record start from the durable history.
-            logger.warning('Could not persist LangRAG telemetry', exc_info=True)
+        except BaseException as exc:
+            # An interrupted (caller cancelled) or failed durable write leaves the
+            # stored history unknown, so this diagnostic state fails closed from
+            # here on. The marker stays in process: persisting it under the
+            # installation-wide identity would fence every knowledge base of the
+            # installation, including the ones this telemetry must never block.
+            self._state.mark_fenced(self.plugin, None)
+            if isinstance(exc, Exception):
+                logger.warning('Could not persist LangRAG telemetry', exc_info=True)
             raise
 
     async def _record(self, method, kwargs):
@@ -122,7 +127,11 @@ class InstallationTelemetry:
         async def clear():
             try:
                 await self.plugin.set_plugin_storage(KEY, b'[]')
-            except Exception:
-                logger.warning('Could not clear LangRAG telemetry', exc_info=True)
+            except BaseException as exc:
+                # A clear that did not land cannot acknowledge deletion, so this
+                # diagnostic state refuses further work from here on.
+                self._state.mark_fenced(self.plugin, None)
+                if isinstance(exc, Exception):
+                    logger.warning('Could not clear LangRAG telemetry', exc_info=True)
                 raise
         await self._transaction(clear)

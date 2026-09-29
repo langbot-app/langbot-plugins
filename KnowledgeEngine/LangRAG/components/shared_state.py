@@ -5,11 +5,15 @@ so an ambiguous failure for one knowledge base never blocks the other knowledge
 bases that share the same installation. The platform storage key spans a whole
 installation, so the knowledge-base id is always folded into our keys.
 
-Only a dispatched mutation whose outcome is unknown fences: a deterministic
-error raised after the Host answered, a validation error raised before any call
-is dispatched, and ordinary cancellation before dispatch do not. Fences are
-persisted (key includes the knowledge-base identity) behind an in-process cache,
-so a restarted worker still recognises them.
+Only a dispatched mutation whose outcome is unknown fences: a validation error
+raised before any call is dispatched, and ordinary cancellation before dispatch,
+do not. A caller that goes away while its mutation is already in flight can
+never observe the outcome, so that fences too, and it fences in the same step as
+the cancellation so sibling operations fail closed instead of queueing behind
+the unsettled mutation. A reply that does not say what happened to the rows is
+an unknown outcome for the same reason. Fences are persisted (key includes the
+knowledge-base identity) behind an in-process cache, so a restarted worker still
+recognises them.
 """
 import asyncio
 import hashlib
@@ -55,19 +59,24 @@ async def settle(task):
     return task.result()
 
 
-async def _settle_commit(task):
+async def _settle_commit(task, on_cancel=None):
     """Wait for a dispatched commit and report its outcome.
 
     Returns ``(caller_cancelled, failure)``; ``failure`` is the commit's
     exception, or ``asyncio.CancelledError`` when the commit itself was
     cancelled. Unlike :func:`settle` this never re-raises, because the caller has
     to fence an unknown outcome before propagating anything.
+
+    ``on_cancel`` runs once, in the same step that observes the caller's first
+    cancellation, so a fence can be raised before the detached commit settles.
     """
     cancelled = False
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
+            if not cancelled and on_cancel is not None:
+                on_cancel()
             cancelled = True
         except Exception:
             # The commit raised; its outcome is read from the state below.
@@ -172,8 +181,20 @@ class SerialState:
             return
         self._fence_loaded.add(binding)
 
+    @staticmethod
+    def _fenced_error(kb_identity):
+        return RuntimeError(
+            f'Knowledge base {kb_identity!r} fenced after an ambiguous mutation; '
+            'reconcile before retrying'
+        )
+
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
         binding = self.binding(plugin)
+        # Refuse before queueing: a fence raised by an ambiguity that is still in
+        # flight (a cancelled caller whose detached mutation may yet land) must
+        # fail closed here instead of waiting behind the unsettled mutation.
+        if not allow_fenced and self.is_fenced(binding, kb_identity):
+            raise self._fenced_error(kb_identity)
         key = self._scope(binding, kb_identity)
         lock = self._locks.get(key)
         if lock is None:
@@ -181,10 +202,7 @@ class SerialState:
         async with lock:
             await self._load_fences(plugin, binding)
             if not allow_fenced and self.is_fenced(binding, kb_identity):
-                raise RuntimeError(
-                    f'Knowledge base {kb_identity!r} fenced after an ambiguous mutation; '
-                    'reconcile before retrying'
-                )
+                raise self._fenced_error(kb_identity)
             try:
                 return await operation()
             except AmbiguousMutationError:
@@ -196,17 +214,39 @@ class SerialState:
 
         A dispatched call whose outcome is unknown fences this knowledge base; a
         caller cancellation cancels the caller only after the dispatched call has
-        settled, so the lock is never released over an unknown outcome.
+        settled, so the lock is never released over an unknown outcome. The
+        caller that goes away can never observe that outcome, so the fence is
+        raised in the same step as the cancellation: sibling operations fail
+        closed instead of queueing behind an unsettled vector mutation.
         """
+        binding = self.binding(plugin)
+        fence_key = _kb_fence_key(kb_identity)
         task = asyncio.create_task(operation())
-        cancelled, failure = await _settle_commit(task)
-        if failure is not None:
-            await self.fence(plugin, kb_identity, f'{reason}: {failure!r}')
+        cancelled, failure = await _settle_commit(
+            task, on_cancel=lambda: self._fenced_keys(binding).add(fence_key)
+        )
+        if cancelled or failure is not None:
+            await self.fence(
+                plugin,
+                kb_identity,
+                reason if failure is None else f'{reason}: {failure!r}',
+            )
         if cancelled:
             raise asyncio.CancelledError
         if failure is not None:
             raise failure
         return task.result()
+
+    def mark_fenced(self, plugin, kb_identity):
+        """Fence one knowledge base in process only, without touching storage.
+
+        Used by diagnostics: a persisted marker written under the fallback
+        identity is installation-wide, so it would fence every knowledge base
+        that shares the installation and turn a telemetry write failure into a
+        business-work outage. The in-process marker still makes the next
+        operation of that component fail closed.
+        """
+        self._fenced_keys(self.binding(plugin)).add(_kb_fence_key(kb_identity))
 
     async def fence(self, plugin, kb_identity, reason):
         """Mark one knowledge base as requiring reconciliation.
@@ -216,7 +256,7 @@ class SerialState:
         """
         binding = self.binding(plugin)
         fence_key = _kb_fence_key(kb_identity)
-        self._fenced_keys(binding).add(fence_key)
+        self.mark_fenced(plugin, kb_identity)
         payload = json.dumps({'kb_id': kb_identity, 'reason': reason}).encode()
         cancelled, failure = await _settle_commit(
             asyncio.create_task(plugin.set_plugin_storage(fence_key, payload))

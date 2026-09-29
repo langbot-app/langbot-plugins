@@ -907,9 +907,15 @@ class LangRAG(KnowledgeEngine):
                 ),
                 'Host vector_delete outcome unknown',
             )
-            # The Host answered, so a malformed count is deterministic rather than
-            # ambiguous and must not fence the knowledge base.
+            # The Host answered, but a malformed count does not say what happened
+            # to the rows: the vector store's state is unknown, so this knowledge
+            # base has to be reconciled before it accepts another mutation.
             if type(result_count) is not int or result_count < 0:
+                await self._state.fence(
+                    self.plugin,
+                    kb_id,
+                    'Host vector_delete returned a malformed count',
+                )
                 raise ValueError("Host vector_delete must return a nonnegative integer count")
             count = result_count
             # An authoritative no-op also confirms absence (empty ingest or retry).
