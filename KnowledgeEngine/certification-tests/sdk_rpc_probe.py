@@ -39,12 +39,11 @@ async def main():
     components = discover_plugin_components(manifest, discovery)
     kinds = sorted(c.kind for c in components)
     assert kinds == (['KnowledgeEngine', 'Page'] if NAME == 'LangRAG' else ['KnowledgeEngine'])
-    shared = NAME == 'LangRAG'
-    if shared:
-        assert manifest.execution.shared_runtime == 'shared-runtime-v1'
-        assert manifest.execution.component_model == 'stateless-v1'
-    else:
-        assert manifest.execution.shared_runtime is None
+    # Every verified candidate is a stateless shared-placement archive, so the
+    # manifest inside the built artifact has to declare exactly that. The
+    # declaration is not a certificate: this only checks it survived packaging.
+    assert manifest.execution.shared_runtime == 'shared-runtime-v1'
+    assert manifest.execution.component_model == 'stateless-v1'
     stores, vectors, calls = {}, {}, []
     http_calls = []
     async def provider(request):
@@ -94,10 +93,11 @@ async def main():
             handler = PluginRuntimeHandler(WebSocketConnection(ws), controller.initialize)
             controller.handler = handler
             handler.plugin_container = controller.plugin_container
-            if shared:
-                handler._slot_initialize_callback = controller.initialize_slot
-                handler._slot_detach_callback = controller.detach_slot
-                handler._slot_cancel_callback = controller.invalidate_slot
+            # Stateless shared placement: the runtime drives the plugin through
+            # per-slot lifecycle callbacks, not one bound plugin instance.
+            handler._slot_initialize_callback = controller.initialize_slot
+            handler._slot_detach_callback = controller.detach_slot
+            handler._slot_cancel_callback = controller.invalidate_slot
             ready.set_result(handler)
             await handler.run()
         async with websockets.serve(connected, '127.0.0.1', 0) as server:
@@ -151,17 +151,10 @@ async def main():
                     return await host.call_action(action, data, action_context=context, timeout=8)
                 try:
                     settings = {'plugin_settings': {'enabled': True, 'priority': 0, 'plugin_config': {'marker': label}}}
-                    if shared:
-                        await call(R.ATTACH_PLUGIN_SLOT, settings)
-                        slot = await call(R.GET_PLUGIN_SLOT_CONTAINER, {})
-                        assert slot['plugin_config'] == {'marker': label}
-                    else:
-                        await call(R.INITIALIZE_PLUGIN, settings)
-                        assert controller.plugin_container.plugin_instance.get_config() == {'marker': label}
-                    if shared:
-                        assert controller.plugin_container_for_slot(scope.installation_uuid).binding == scope
-                    else:
-                        assert handler.require_bound_action_context() == scope
+                    await call(R.ATTACH_PLUGIN_SLOT, settings)
+                    slot = await call(R.GET_PLUGIN_SLOT_CONTAINER, {})
+                    assert slot['plugin_config'] == {'marker': label}
+                    assert controller.plugin_container_for_slot(scope.installation_uuid).binding == scope
                     yield call, controller
                 finally:
                     await host.close()
