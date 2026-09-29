@@ -22,9 +22,12 @@ independent review, signer approval, and two-Workspace acceptance.
 ## Upstream identity migration
 
 With a trusted SDK installation binding (or a Host Workspace conversation context),
-upstream user IDs are deterministic `lb_` SHA-256 names scoped to that authority.
-The same actor/legacy launcher in different installations/Workspaces no longer
-collides. Dedicated OSS without either scope retains the existing legacy IDs.
-Existing vendor conversations associated with the old unscoped user may require
-a new conversation after upgrading; no automatic cross-user memory migration is
-performed. Host-scoped state is not copied between tenants.
+the user name this plugin derives is a deterministic `lb_` SHA-256 name scoped to
+that authority, and it reaches WeKnora as the **session title** (`IM Chat - <name>`).
+The agent and knowledge chat request bodies this client builds carry no user field,
+so the scoped name is not sent as an upstream user id; any vendor-side per-user state
+keyed independently of the session is outside this plugin's control. Dedicated OSS
+without either scope retains the existing legacy IDs. Existing vendor conversations
+associated with the old unscoped user may require a new conversation after upgrading;
+no automatic cross-user memory migration is performed. Host-scoped state is not copied
+between tenants.
