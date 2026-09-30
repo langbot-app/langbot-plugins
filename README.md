@@ -83,7 +83,8 @@ concurrency tests must prove the implementation.
 37 of the 40 plugins here declare shared placement. `Runner/acp-agent-runner`, `Runner/claude-code-agent` and
 `Runner/codex-agent` stay dedicated: each launches a process-global daemon hub, symlinks worker-`HOME` credentials
 into every run home and shares one workspace root, so serving two installations from one process needs the
-Host/SDK broker and duplex-process API first (see `Runner/acp-agent-runner/docs/SHARED_RUNTIME_BLOCKERS.md`).
+Host/SDK broker and duplex-process API first (see `Runner/acp-agent-runner/docs/SHARED_RUNTIME_BLOCKERS.md`); shared
+adaptation is deliberately not planned for them, and their dedicated manifests are the supported configuration.
 
 Every plugin that declares shared placement ships a `SHARED_RUNTIME.md` stating what is per invocation, what is
 binding-keyed and released on revocation, and its known limits, plus a test that drives two installation bindings
