@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from langbot_plugin.api.entities.builtin.runner import (
+    ActorContext,
     AgentEventContext,
     AgentInput,
     AgentResources,
@@ -65,6 +66,7 @@ def context(config, *, streaming=True):
         resources=AgentResources(),
         state=AgentRunState(conversation={"external.conversation_id": "remote"}),
         runtime=AgentRuntimeContext(metadata={"streaming_supported": streaming}),
+        actor=ActorContext(actor_type="user", actor_id="parity-sender"),
         config=config,
     )
 

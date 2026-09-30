@@ -33,4 +33,7 @@ keyed independently of the session is outside this plugin's control. Dedicated O
 without either scope retains the existing legacy IDs. Existing vendor conversations
 associated with the old unscoped user may require a new conversation after upgrading;
 no automatic cross-user memory migration is performed. Host-scoped state is not copied
-between tenants.
+between tenants. A run whose sender is not a trusted Host actor is refused before any
+outbound call instead of minting a per-run vendor user; this plugin exposes no
+conversation-scoped `user-id-source` mode, so no vendor user is derived without a
+trusted Host actor.

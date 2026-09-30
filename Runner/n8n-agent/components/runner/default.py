@@ -182,7 +182,10 @@ class DefaultRunner(Runner):
         actor = ctx.actor
         if actor and actor.actor_id:
             return scoped_identity(self, ctx, f"{actor.actor_type}_{actor.actor_id}")
-        return scoped_identity(self, ctx, f"user_{ctx.run_id}")
+        raise N8nConfigError(
+            "user-id-source=sender requires a trusted Host actor identity",
+            code="n8n.identity_unavailable",
+        )
 
     def _get_or_create_state_id(
         self,

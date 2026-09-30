@@ -18,6 +18,7 @@ import websockets
 from aiohttp import web
 from langbot_plugin.api.definition.components.runner.runner import Runner
 from langbot_plugin.api.entities.builtin.runner import (
+    ActorContext,
     AgentEventContext,
     AgentInput,
     AgentResources,
@@ -63,6 +64,7 @@ def ctx(run_id, config):
         resources=AgentResources(),
         state=AgentRunState(),
         runtime=AgentRuntimeContext(metadata={"component_kind": "Runner", "steering_enabled": False}),
+        actor=ActorContext(actor_type="user", actor_id="fixture-sender"),
         config=config,
     ).model_dump(mode="json")
 

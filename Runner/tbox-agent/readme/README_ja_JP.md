@@ -44,6 +44,7 @@ Ant Tbox アプリを LangBot Runner として実行します。
 ### Provider identity compatibility (`user-id-source`)
 
 Per-pipeline Runner parameter, not plugin-global configuration. `sender` remains the default.
+A `sender` run whose Host actor is missing or empty is refused before any upstream request, instead of minting a per-run provider user; select `legacy-bot` explicitly when a conversation-scoped provider user is intended.
 Explicit `legacy-bot` preserves native provider identity using trusted Host run context only;
 missing identity fails before any upstream request, never falls back to the sender or business params.
 `legacy-bot` uses `conversation.bot_id` (or Host runtime `bot_id` when there is no conversation), exactly, without a prefix.

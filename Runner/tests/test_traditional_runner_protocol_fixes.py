@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
 from langbot_plugin.api.entities.builtin.runner import (
+    ActorContext,
     AgentEventContext,
     AgentInput,
     AgentResources,
@@ -86,6 +87,7 @@ def _ctx(
         resources=AgentResources(),
         state=AgentRunState(conversation=conversation_state or {}),
         runtime=AgentRuntimeContext(),
+        actor=ActorContext(actor_type="user", actor_id="traditional-sender"),
         config=config or {},
     )
 

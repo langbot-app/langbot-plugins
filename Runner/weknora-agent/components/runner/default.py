@@ -80,7 +80,10 @@ class DefaultRunner(Runner):
         actor = ctx.actor
         if actor and actor.actor_id:
             return scoped_identity(self, ctx, f"{actor.actor_type}_{actor.actor_id}")
-        return scoped_identity(self, ctx, f"user_{ctx.run_id}")
+        raise WeKnoraConfigError(
+            "vendor user identity requires a trusted Host actor identity",
+            code="weknora.identity_unavailable",
+        )
 
     def _get_input_text(self, ctx: RunnerContext, base_prompt: str) -> str:
         text = ctx.input.to_text()
@@ -112,6 +115,7 @@ class DefaultRunner(Runner):
     async def run(self, ctx: RunnerContext) -> typing.AsyncGenerator[RunnerResult, None]:
         """Run the WeKnora app."""
         try:
+            user_tag = self._get_user_tag(ctx)  # Validate identity before constructing any upstream client.
             config = self._validate_config(ctx)
         except WeKnoraConfigError as e:
             yield RunnerResult.run_failed(ctx.run_id, error=e.message, code=e.code)
@@ -121,7 +125,6 @@ class DefaultRunner(Runner):
             api_key=config["api_key"],
             base_url=config["base_url"],
         )
-        user_tag = self._get_user_tag(ctx)
 
         try:
             session_id, _created = await self._ensure_session_id(ctx, client, config["timeout"], user_tag)

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from langbot_plugin.api.entities.builtin.runner import (
+    ActorContext,
     AgentEventContext,
     AgentInput,
     AgentResources,
@@ -76,6 +77,7 @@ def ctx(config=None, state=None, text="hello"):
         resources=AgentResources(),
         state=AgentRunState(conversation=state or {}),
         runtime=AgentRuntimeContext(),
+        actor=ActorContext(actor_type="user", actor_id="parity-sender"),
         config=config or {},
     )
 

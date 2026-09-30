@@ -40,7 +40,10 @@ The same actor/legacy launcher in different installations/Workspaces no longer
 collides. Dedicated OSS without either scope retains the existing legacy IDs.
 Existing vendor conversations associated with the old unscoped user may require
 a new conversation after upgrading; no automatic cross-user memory migration is
-performed. Host-scoped state is not copied between tenants.
+performed. Host-scoped state is not copied between tenants. A run whose sender is
+not a trusted Host actor is refused before any outbound call instead of minting a
+per-run vendor user; a conversation-scoped vendor user must be selected explicitly
+through this plugin's `user-id-source` legacy mode.
 
 ## Human-input continuation migration
 

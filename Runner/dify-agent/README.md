@@ -298,6 +298,7 @@ Migrated from `dify-service-api` in LangBot.
 ### Provider identity compatibility (`user-id-source`)
 
 Per-pipeline Runner parameter, not plugin-global configuration. `sender` remains the default.
+A `sender` run whose Host actor is missing or empty is refused before any upstream request, instead of minting a per-run provider user; select `legacy-session` explicitly when a conversation-scoped provider user is intended.
 Explicit `legacy-session` preserves native provider identity using trusted Host run context only;
 missing identity fails before any upstream request, never falls back to the sender or business params.
 `legacy-session` uses `conversation.launcher_type` (`group`/`person`) plus `_` plus the exact `conversation.launcher_id`. Host must project the native Query.session launcher into those fields, including interaction/resume runs. Older Hosts that leave these fields empty must be upgraded.

@@ -26,6 +26,13 @@ from langbot_plugin.api.proxies.invocation import bind_invocation
 ROOT = Path(os.environ.get("HTTP_RUNNER_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
 GATEWAYS = ["coze", "dashscope", "dify", "langflow", "n8n"]
 IDENTITIES = ["coze", "dify", "n8n", "tbox", "weknora"]
+IDENTITY_ERRORS = {
+    "coze": ("CozeConfigError", "AsyncCozeClient"),
+    "dify": ("DifyConfigError", "AsyncDifyClient"),
+    "n8n": ("N8nConfigError", "AsyncN8nClient"),
+    "tbox": ("TboxConfigError", "AsyncTboxClient"),
+    "weknora": ("WeKnoraConfigError", "AsyncWeKnoraClient"),
+}
 
 
 @contextmanager
@@ -51,7 +58,7 @@ def load(name):
         sys.modules.update(saved)
 
 
-def context(workspace="A"):
+def context(workspace="A", *, actor=True):
     return RunnerContext(
         run_id="fixture",
         trigger=AgentTrigger(type="message.received"),
@@ -60,13 +67,17 @@ def context(workspace="A"):
         delivery=DeliveryContext(surface="fixture"),
         resources=AgentResources(),
         runtime=AgentRuntimeContext(),
-        actor=ActorContext(actor_type="user", actor_id="same-actor"),
+        actor=ActorContext(actor_type="user", actor_id="same-actor") if actor else None,
         conversation=ConversationContext(conversation_id="same-conversation", workspace_id=workspace),
     )
 
 
 def identity(runner, ctx):
     return (getattr(runner, "_get_user_tag", None) or runner._get_user_id)(ctx)
+
+
+async def collect(generator):
+    return [result async for result in generator]
 
 
 @contextmanager
@@ -95,6 +106,30 @@ def test_connection_binding_overrides_claimed_workspace(name):
             bound_action_context=SimpleNamespace(instance_uuid="i", workspace_uuid="B", installation_uuid="install-b")
         )
         assert identity(a, context(None)) != identity(b, context(None))
+
+
+@pytest.mark.parametrize("name", IDENTITIES)
+def test_sender_without_host_actor_is_refused_before_any_upstream_call(name, monkeypatch):
+    error_name, client_name = IDENTITY_ERRORS[name]
+    with load(name) as (module, runner):
+        error_cls = getattr(module, error_name)
+
+        with pytest.raises(error_cls) as refused:
+            identity(runner, context(actor=False))
+        assert refused.value.code == f"{name}.identity_unavailable"
+
+        built = []
+
+        class RecordingClient:
+            def __init__(self, *args, **kwargs):
+                built.append((args, kwargs))
+                raise AssertionError("upstream client must not be built without a trusted Host actor")
+
+        monkeypatch.setattr(module, client_name, RecordingClient)
+        results = asyncio.run(collect(runner.run(context(actor=False))))
+        assert [getattr(result.type, "value", str(result.type)) for result in results] == ["run.failed"]
+        assert results[0].data["code"] == f"{name}.identity_unavailable"
+        assert built == []
 
 
 @pytest.mark.parametrize("name", GATEWAYS)

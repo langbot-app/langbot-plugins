@@ -231,7 +231,10 @@ class DefaultRunner(Runner):
         actor = ctx.actor
         if actor and actor.actor_id:
             return scoped_identity(self, ctx, f"{actor.actor_type}_{actor.actor_id}")
-        return scoped_identity(self, ctx, f"user_{ctx.run_id}")
+        raise TboxConfigError(
+            "user-id-source=sender requires a trusted Host actor identity",
+            code="tbox.identity_unavailable",
+        )
 
     def _get_external_conversation_id(self, ctx: RunnerContext) -> str | None:
         """Get external conversation ID from state.
