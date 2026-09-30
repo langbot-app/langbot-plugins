@@ -408,40 +408,51 @@ async def test_differing_collection_and_knowledge_base_ids_share_one_identity(mo
 
 
 @pytest.mark.asyncio
-async def test_legacy_collection_keyed_record_is_migrated(monkeypatch):
+async def test_delete_under_another_knowledge_base_never_adopts_its_mapping(monkeypatch):
     store = StorageFixture()
     engine, calls = engine_with(monkeypatch, store, acknowledge)
 
-    # Records written by the revision that keyed a knowledge base by the
-    # ingestion collection id: neither the configuration nor the mapping is
-    # reachable under the knowledge-base key.
-    await engine._save_config('collection-1', configuration('A'))
-    await engine._save_document('collection-1', 'doc', created_mapping('https://fixture.invalid'))
+    # Knowledge base A's mapping and configuration name the upstream document;
+    # knowledge base B has neither.
+    cfg = configuration('A')
+    await engine._save_config('A', cfg)
+    await engine._save_document('A', 'shared-doc', created_mapping('https://fixture.invalid'))
 
-    assert await engine.delete_document('kb', 'doc') is True
+    # Deleting under B must not resolve, copy or tombstone A's record: the
+    # operation is refused with nothing dispatched and nothing written under B.
+    assert await engine.delete_document('B', 'shared-doc') is False
+    assert calls == []
+    assert engine._document_key('B', 'shared-doc') not in store.data
+    assert engine._key('B') not in store.data
+    assert (await engine._load_document('A', 'shared-doc'))['status'] == 'created'
+
+    # A's own delete still reaches the provider: B never consumed its record.
+    assert await engine.delete_document('A', 'shared-doc') is True
     assert [request.method for request in calls] == ['DELETE']
-
-    # Both records now resolve under the canonical key: the deletion tombstoned
-    # the canonical mapping, and the settings it needed came across with it.
-    assert engine._document_key('kb', 'doc') in store.data
-    assert (await engine._load_document('kb', 'doc'))['status'] == 'deleted'
-    assert (await engine._load_config('kb'))['api_key'] == 'A'
 
 
 @pytest.mark.asyncio
-async def test_legacy_collection_keyed_intent_is_found_by_an_ingest(monkeypatch):
+async def test_pending_record_of_another_knowledge_base_does_not_block_ingest(monkeypatch):
     store = StorageFixture()
     engine, calls = engine_with(monkeypatch, store, acknowledge)
 
-    # A pending record from the revision that keyed by the collection id is the
-    # same upload intent the canonical check has to refuse.
-    await engine._save_document('collection-1', 'local-doc',
+    # A pending record under knowledge base A is A's upload intent, not B's.
+    await engine._save_document('A', 'local-doc',
                                 {'upstream_id': '', 'dataset_id': 'A',
                                  'api_base_url': 'https://fixture.invalid', 'status': 'pending'})
-    with pytest.raises(RuntimeError, match='Existing upload intent'):
-        await engine.ingest(collection_context(configuration('A'), 'collection-1'))
-    assert calls == []
-    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'pending'
+    before = store.data[engine._document_key('A', 'local-doc')]
+
+    context = ingest_context(configuration('B'))
+    context.knowledge_base_id = 'B'
+    result = await engine.ingest(context)
+    assert result.status == DocumentStatus.PROCESSING
+
+    # B recorded only its own mapping, and A's pending record is untouched: B
+    # neither treated A's intent as its own nor wrote under A.
+    assert (await engine._load_document('B', 'local-doc'))['status'] == 'created'
+    assert (await engine._load_document('A', 'local-doc'))['status'] == 'pending'
+    assert store.data[engine._document_key('A', 'local-doc')] == before
+    assert [request.method for request in calls] == ['POST', 'POST']
 
 
 INGESTION_STEPS = [
