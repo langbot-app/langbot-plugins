@@ -442,3 +442,130 @@ async def test_fastgpt_load_discards_a_snapshot_read_before_a_sibling_clear():
     assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
     assert store.keys_reads == 2
     await engine.on_knowledge_base_create('kb', configuration('B'))
+
+
+def collection_context(config, collection_id):
+    """An ingestion context whose collection id is not the knowledge-base id."""
+    context = ingest_context(config)
+    context.collection_id = collection_id
+    return context
+
+
+def accepting_upload():
+    async def service(request):
+        if request.method == 'POST':
+            return httpx.Response(200, json={
+                'code': 200, 'data': {'collectionId': 'upstream-1', 'results': {'insertLen': 3}},
+            })
+        return httpx.Response(200, json={'code': 200, 'data': None})
+    return service
+
+
+@pytest.mark.asyncio
+async def test_fastgpt_collection_and_knowledge_base_ids_share_one_identity(monkeypatch):
+    pc, ec = load_plugin('FastGPTConnector')
+    from components import shared_state
+
+    calls = []
+
+    async def service(request):
+        calls.append(request.method)
+        return await accepting_upload()(request)
+
+    bind_mock_http(monkeypatch, service)
+    store = StorageFixture()
+    engine = upload_engine(pc, ec, store)
+    plugin = engine.plugin
+    binding = engine._state.binding(plugin)
+    cfg = configuration('A')
+
+    # A fence taken for the knowledge base the Host names must refuse an
+    # ingestion whose context carries a different collection id: the two ids are
+    # one knowledge base, not two independently protected scopes.
+    await engine._state.fence(plugin, 'kb', 'earlier upload outcome unknown')
+    context = collection_context(cfg, 'collection-1')
+    with pytest.raises(shared_state.FencedKnowledgeBaseError):
+        await engine.ingest(context)
+    assert calls == []
+
+    await engine._state.clear_fence(plugin, 'kb')
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def read_file(path):
+        entered.set()
+        await release.wait()
+        return b'fixture file'
+
+    engine.plugin.get_knowledge_file_stream = read_file
+    upload = asyncio.create_task(engine.ingest(context))
+    await asyncio.wait_for(entered.wait(), 5)
+    # In flight, the mutation holds the knowledge base's lock, not the
+    # collection's.
+    assert (binding, 'kb') in engine._state._locks
+    assert (binding, 'collection-1') not in engine._state._locks
+    release.set()
+    assert (await upload).status == DocumentStatus.PROCESSING
+
+    # One identity for storage too: the mapping is written under the key the
+    # deletion that names the knowledge base resolves.
+    assert (await engine._load_document('kb', 'local-doc'))['upstream_id'] == 'upstream-1'
+    assert await engine.delete_document('kb', 'local-doc') is True
+    assert calls == ['POST', 'DELETE']
+    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'deleted'
+    assert not engine._state.is_fenced(binding, 'kb')
+
+
+@pytest.mark.asyncio
+async def test_fastgpt_legacy_collection_keyed_record_is_migrated(monkeypatch):
+    pc, ec = load_plugin('FastGPTConnector')
+
+    calls = []
+
+    async def service(request):
+        calls.append(request.method)
+        return httpx.Response(200, json={'code': 200, 'data': None})
+
+    bind_mock_http(monkeypatch, service)
+    store = StorageFixture()
+    engine = ec()
+    engine.plugin = bind(pc, store)
+    # Records written by the revision that keyed a knowledge base by the
+    # ingestion collection id: neither is reachable under the knowledge-base key.
+    await engine._save_config('collection-1', configuration('A'))
+    await engine._save_document('collection-1', 'doc', {
+        'upstream_id': 'upstream-doc', 'dataset_id': 'A', 'status': 'created',
+        'api_base_url': 'https://fixture.invalid'})
+
+    assert await engine.delete_document('kb', 'doc') is True
+    assert calls == ['DELETE']
+
+    # Both records now resolve under the canonical key: the deletion tombstoned
+    # the canonical mapping, and the settings it needed came across with it.
+    assert engine._document_key('kb', 'doc') in store.data
+    assert (await engine._load_document('kb', 'doc'))['status'] == 'deleted'
+    assert (await engine._load_config('kb'))['api_key'] == 'A'
+
+
+@pytest.mark.asyncio
+async def test_fastgpt_legacy_collection_keyed_intent_is_found_by_an_ingest(monkeypatch):
+    pc, ec = load_plugin('FastGPTConnector')
+
+    calls = []
+
+    async def service(request):
+        calls.append(request.method)
+        return await accepting_upload()(request)
+
+    bind_mock_http(monkeypatch, service)
+    store = StorageFixture()
+    engine = upload_engine(pc, ec, store)
+    # A pending record from the revision that keyed by the collection id is the
+    # same upload intent the canonical check has to refuse.
+    await engine._save_document('collection-1', 'local-doc', {
+        'upstream_id': '', 'dataset_id': 'A',
+        'api_base_url': 'https://fixture.invalid', 'status': 'pending'})
+
+    with pytest.raises(RuntimeError, match='Existing upload intent'):
+        await engine.ingest(collection_context(configuration('A'), 'collection-1'))
+    assert calls == []
+    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'pending'

@@ -171,7 +171,7 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 error_message="Missing api_key or dataset_id in configuration.",
             )
 
-        kb_id = context.get_collection_id()
+        kb_id = context.knowledge_base_id
         await self._save_config(kb_id, config)
         if await self._load_document(kb_id, doc_id) is not None:
             raise RuntimeError('Existing upload intent; reconcile before retry')
