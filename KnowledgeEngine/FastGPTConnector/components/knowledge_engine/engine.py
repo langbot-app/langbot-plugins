@@ -6,7 +6,7 @@ import logging
 from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
-    is_ambiguous_http_failure,
+    normalize_api_base_url,
     serialized,
 )
 
@@ -185,8 +185,9 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 error_message=f"Could not read file: {e}",
             )
 
+        upstream_target = normalize_api_base_url(api_base_url)
         await self._save_document(kb_id, doc_id, {'upstream_id': '', 'dataset_id': dataset_id,
-            'status': 'pending'})
+            'status': 'pending', 'api_base_url': upstream_target})
         # 2. Upload file to FastGPT dataset
         url = f"{api_base_url}/api/core/dataset/collection/create/localFile"
         headers = {
@@ -199,7 +200,7 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             "chunkSize": 512,
         })
 
-        try:
+        async def upload():
             async with self.http_client() as client:
                 response = await client.post(
                     url,
@@ -209,7 +210,14 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                     timeout=120.0,
                 )
                 response.raise_for_status()
-                result = response.json()
+                return response.json()
+
+        try:
+            # Pre-persisted intent: a cancellation after dispatch must leave the
+            # ambiguity visible rather than lose the mutation.
+            result = await self._state.dispatched(
+                self.plugin, kb_id, upload, 'FastGPT upload outcome unknown'
+            )
 
             if result.get("code") != 200:
                 error_msg = result.get("message", "Unknown error from FastGPT")
@@ -225,7 +233,8 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             if not isinstance(collection_id, str) or not collection_id:
                 raise AmbiguousMutationError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
             await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
-                'dataset_id': dataset_id, 'status': 'created'})
+                'dataset_id': dataset_id, 'status': 'created',
+                'api_base_url': upstream_target})
             insert_len = resp_data.get("results", {}).get("insertLen", 0)
 
             logger.info(
@@ -243,10 +252,6 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             # Already-dispatched upload with an unknown outcome: fence this KB.
             raise
         except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"FastGPT upload outcome unknown: {e!r}"
-                )
             logger.error(f"[FastGPTKnowledgeEngine] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -278,15 +283,25 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
         url = f"{api_base_url}/api/core/dataset/collection/delete"
         if mapping['dataset_id'] != config.get('dataset_id'):
             raise RuntimeError('Dataset changed; reconcile before deletion')
+        if mapping.get('api_base_url') != normalize_api_base_url(api_base_url):
+            # The mapping names the upstream instance that owns the collection;
+            # replaying the delete against another target would remove an
+            # unrelated collection, so this must fail before any remote request.
+            raise RuntimeError('Upstream target changed; reconcile before deletion')
         headers = {"Authorization": f"Bearer {api_key}"}
 
-        try:
+        async def delete_upstream():
             async with self.http_client() as client:
                 response = await client.delete(
                     url, params={"id": mapping['upstream_id']}, headers=headers, timeout=30.0
                 )
                 response.raise_for_status()
-                result = response.json()
+                return response.json()
+
+        try:
+            result = await self._state.dispatched(
+                self.plugin, kb_id, delete_upstream, 'FastGPT delete outcome unknown'
+            )
 
             if result.get("code") != 200:
                 logger.error(
@@ -307,11 +322,7 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 f"[FastGPTKnowledgeEngine] Delete rejected for collection={document_id}: {e}"
             )
             return False
-        except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"FastGPT delete outcome unknown: {e!r}"
-                )
+        except Exception:
             logger.exception(
                 f"[FastGPTKnowledgeEngine] Error deleting collection={document_id}"
             )

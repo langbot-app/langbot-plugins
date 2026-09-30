@@ -66,7 +66,7 @@ jobs:
         run: uv run --no-sync ruff check LocalAgent
       - name: LocalAgent Ruff format check
         run: uv run --no-sync ruff format --check LocalAgent
-      - name: All Runner tests, including isolated LocalAgent and RunnerDemo suites
+      - name: All Runner tests, including isolated plugin suites (LocalAgent, RunnerDemo, shared agents)
         run: uv run --no-sync python -m pytest --junitxml="${RUNNER_EVIDENCE_DIR}/runner.xml"
       # Generic pkg/test module names require a fresh pytest interpreter.
       - name: HTTP Runner certification regressions

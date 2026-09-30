@@ -158,6 +158,34 @@ class ObservabilityPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.error)
         self.assertEqual(response.data["counters"], {})
 
+    async def test_unreadable_storage_fails_the_snapshot_instead_of_stale_data(self):
+        from benchmarks.state_fixture import attach_installation_state
+        from types import SimpleNamespace
+        plugin = await attach_installation_state(SimpleNamespace())
+        await plugin.telemetry.record_delete(
+            collection_id="kb1",
+            document_id="doc1",
+            status="completed",
+            duration_ms=5.0,
+            deleted=True,
+            vectors_deleted=2,
+        )
+
+        async def offline():
+            raise RuntimeError("fixture fence store offline")
+
+        # An unreadable fence store is not "no fence": the Page answers with an
+        # error the console can display, never with last-known counters.
+        plugin.get_plugin_storage_keys = offline
+        page = LangRAGObservabilityPage()
+        page.plugin = plugin
+        response = await page.handle_api(
+            PageRequest(endpoint="/snapshot", method="GET")
+        )
+
+        self.assertIsNone(response.data)
+        self.assertIn("Telemetry unavailable", response.error)
+
     async def test_unknown_endpoint_fails(self):
         from benchmarks.state_fixture import attach_installation_state
         from types import SimpleNamespace

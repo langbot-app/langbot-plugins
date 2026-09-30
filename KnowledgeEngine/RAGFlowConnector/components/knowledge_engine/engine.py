@@ -5,7 +5,6 @@ import logging
 from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
-    is_ambiguous_http_failure,
     serialized,
 )
 
@@ -23,6 +22,22 @@ from langbot_plugin.api.entities.builtin.rag import (
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_base_url(api_base_url: str) -> str:
+    """Reduce a configured base URL to ``scheme://host[:port]/path``.
+
+    A document mapping must name the upstream it was created on, so the stored
+    form is canonical: scheme and host casing, a default port and a trailing
+    slash never distinguish one deployment from another. An address without a
+    host is stored stripped, so a later comparison still detects a change.
+    """
+    url = httpx.URL(api_base_url)
+    if not url.host:
+        return api_base_url.rstrip("/")
+    default_port = {'http': 80, 'https': 443}.get(url.scheme)
+    port = f":{url.port}" if url.port is not None and url.port != default_port else ""
+    return f"{url.scheme}://{url.host}{port}{url.path.rstrip('/')}"
 
 
 class RAGFlowConnector(ConfigStore, KnowledgeEngine):
@@ -225,6 +240,9 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
 
         # Use the first dataset as the ingestion target
         target_dataset_id = dataset_ids[0]
+        # The mapping names the canonical upstream it was created on, so a later
+        # configuration change cannot be mistaken for the same deployment.
+        upstream_target = _normalize_base_url(api_base_url)
 
         kb_id = context.get_collection_id()
         await self._save_config(kb_id, config)
@@ -243,7 +261,8 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
             )
 
         await self._save_document(kb_id, doc_id, {'upstream_id': '',
-            'dataset_id': target_dataset_id, 'status': 'pending'})
+            'dataset_id': target_dataset_id, 'api_base_url': upstream_target,
+            'status': 'pending'})
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
@@ -251,8 +270,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # 2. Upload file to RAGFlow dataset
                 upload_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
                 files = {"file": (filename, file_bytes)}
-                upload_resp = await client.post(
-                    upload_url, headers=headers, files=files, timeout=60.0
+                # The intent is persisted before the upload leaves, so a
+                # cancellation after dispatch still leaves a fence behind.
+                upload_resp = await self._state.dispatched(
+                    self.plugin, kb_id,
+                    lambda: client.post(
+                        upload_url, headers=headers, files=files, timeout=60.0
+                    ),
+                    'RAGFlow upload outcome unknown',
                 )
                 upload_resp.raise_for_status()
                 upload_data = upload_resp.json()
@@ -275,15 +300,20 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
                     raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
                 await self._save_document(kb_id, doc_id, {'upstream_id': ragflow_doc_id,
-                    'dataset_id': target_dataset_id, 'status': 'created'})
+                    'dataset_id': target_dataset_id, 'api_base_url': upstream_target,
+                    'status': 'created'})
 
                 # 3. Trigger parsing
                 chunks_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/chunks"
-                parse_resp = await client.post(
-                    chunks_url,
-                    headers={**headers, "Content-Type": "application/json"},
-                    json={"document_ids": [ragflow_doc_id]},
-                    timeout=30.0,
+                parse_resp = await self._state.dispatched(
+                    self.plugin, kb_id,
+                    lambda: client.post(
+                        chunks_url,
+                        headers={**headers, "Content-Type": "application/json"},
+                        json={"document_ids": [ragflow_doc_id]},
+                        timeout=30.0,
+                    ),
+                    'RAGFlow parsing trigger outcome unknown',
                 )
                 parse_resp.raise_for_status()
                 parse_data = parse_resp.json()
@@ -310,10 +340,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 if auto_graphrag:
                     try:
                         graphrag_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_graphrag"
-                        gr_resp = await client.post(
-                            graphrag_url,
-                            headers={**headers, "Content-Type": "application/json"},
-                            timeout=30.0,
+                        gr_resp = await self._state.dispatched(
+                            self.plugin, kb_id,
+                            lambda: client.post(
+                                graphrag_url,
+                                headers={**headers, "Content-Type": "application/json"},
+                                timeout=30.0,
+                            ),
+                            'RAGFlow GraphRAG trigger outcome unknown',
                         )
                         gr_resp.raise_for_status()
                         gr_data = gr_resp.json()
@@ -338,10 +372,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 if auto_raptor:
                     try:
                         raptor_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_raptor"
-                        rp_resp = await client.post(
-                            raptor_url,
-                            headers={**headers, "Content-Type": "application/json"},
-                            timeout=30.0,
+                        rp_resp = await self._state.dispatched(
+                            self.plugin, kb_id,
+                            lambda: client.post(
+                                raptor_url,
+                                headers={**headers, "Content-Type": "application/json"},
+                                timeout=30.0,
+                            ),
+                            'RAGFlow RAPTOR trigger outcome unknown',
                         )
                         rp_resp.raise_for_status()
                         rp_data = rp_resp.json()
@@ -370,10 +408,7 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
             # Already-dispatched upload with an unknown outcome: fence this KB.
             raise
         except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"RAGFlow upload outcome unknown: {e!r}"
-                )
+            # An ambiguous failure already left its pre-dispatch fence in place.
             logger.error(f"[RAGFlowKnowledgeEngine] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -417,6 +452,11 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
         if mapping['dataset_id'] != target_dataset_id:
             # Local validation before any remote call: deterministic, no fence.
             raise RuntimeError('Dataset changed; reconcile before deletion')
+        if mapping.get('api_base_url') != _normalize_base_url(api_base_url):
+            # The recorded upstream is not the configured one, so the document id
+            # does not necessarily exist here; mappings written before the target
+            # was recorded are equally unresolvable.
+            raise RuntimeError('Upstream target changed; reconcile before deletion')
         try:
             async with self.http_client() as client:
                 url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
@@ -424,10 +464,14 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 }
-                resp = await client.request(
-                    "DELETE", url, headers=headers,
-                    json={"ids": [mapping['upstream_id']]},
-                    timeout=30.0,
+                resp = await self._state.dispatched(
+                    self.plugin, kb_id,
+                    lambda: client.request(
+                        "DELETE", url, headers=headers,
+                        json={"ids": [mapping['upstream_id']]},
+                        timeout=30.0,
+                    ),
+                    'RAGFlow delete outcome unknown',
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -452,11 +496,8 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 f"[RAGFlowKnowledgeEngine] Delete rejected for doc={document_id}: {e}"
             )
             return False
-        except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"RAGFlow delete outcome unknown: {e!r}"
-                )
+        except Exception:
+            # An ambiguous failure already left its pre-dispatch fence in place.
             logger.exception(
                 f"[RAGFlowKnowledgeEngine] Error deleting document {document_id}"
             )

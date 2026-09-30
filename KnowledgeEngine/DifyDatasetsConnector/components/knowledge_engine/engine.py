@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+from urllib.parse import urlsplit, urlunsplit
 
 from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
-    is_ambiguous_http_failure,
     serialized,
 )
 
@@ -24,6 +24,16 @@ from langbot_plugin.api.entities.builtin.rag import (
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_api_base_url(url: str) -> str:
+    """Canonical provider target: ``scheme://host[:port]/path``, no trailing slash.
+
+    Used to bind a stored document mapping to the upstream instance that created
+    it, so a later configuration change is detected before any remote call.
+    """
+    parts = urlsplit(url or '')
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip('/'), '', ''))
 
 
 class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
@@ -191,6 +201,7 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
         config = context.creation_settings
 
         api_base_url = config.get("api_base_url", "https://api.dify.ai/v1").rstrip("/")
+        upstream_target = _normalize_api_base_url(api_base_url)
         api_key = config.get("dify_apikey")
         dataset_id = config.get("dataset_id")
 
@@ -238,23 +249,28 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
                 "process_rule": {"mode": "automatic"},
             })
 
-            async with self.http_client() as client:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    files={"file": (filename, file_bytes)},
-                    data={"data": data_payload},
-                    timeout=120.0,
-                )
-                response.raise_for_status()
-                resp_data = response.json()
+            async def upload():
+                async with self.http_client() as client:
+                    response = await client.post(
+                        url,
+                        headers=headers,
+                        files={"file": (filename, file_bytes)},
+                        data={"data": data_payload},
+                        timeout=120.0,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+            resp_data = await self._state.dispatched(
+                self.plugin, kb_id, upload, 'Dify upload outcome unknown')
 
             dify_document = resp_data.get("document", {})
             dify_doc_id = dify_document.get("id")
             if not isinstance(dify_doc_id, str) or not dify_doc_id:
                 raise AmbiguousMutationError("Dify upload omitted upstream document ID; outcome requires reconciliation")
             await self._save_document(kb_id, doc_id, {'upstream_id': dify_doc_id,
-                'dataset_id': dataset_id, 'status': 'created'})
+                'dataset_id': dataset_id, 'status': 'created',
+                'api_base_url': upstream_target})
 
             logger.info(
                 f"[DifyDatasetsConnector] File uploaded: {filename} -> "
@@ -282,10 +298,6 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             # Already-dispatched upload with an unknown outcome: fence this KB.
             raise
         except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"Dify upload outcome unknown: {e!r}"
-                )
             logger.error(f"[DifyDatasetsConnector] Ingestion failed for {filename}: {e}")
             return IngestionResult(
                 document_id=doc_id,
@@ -320,29 +332,33 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
 
         if mapping['dataset_id'] != dataset_id:
             raise RuntimeError('Dataset changed; reconcile before deletion')
+        # The mapping is bound to the upstream instance that created it: a changed
+        # base URL (or a legacy mapping without one) must not be sent to a
+        # different provider. Reject before dispatching any remote request.
+        if mapping.get('api_base_url') != _normalize_api_base_url(api_base_url):
+            raise RuntimeError('Upstream target changed; reconcile before deletion')
         url = f"{api_base_url}/datasets/{dataset_id}/documents/{mapping['upstream_id']}"
         headers = {
             "Authorization": f"Bearer {api_key}",
         }
 
-        try:
+        async def remove():
             async with self.http_client() as client:
                 response = await client.delete(url, headers=headers, timeout=30.0)
-                if response.status_code == 204:
-                    await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
-                    logger.info(
-                        f"[DifyDatasetsConnector] Document deleted: {document_id} "
-                        f"from dataset {dataset_id}"
-                    )
-                    return True
-                response.raise_for_status()
-                # Some Dify versions may return 200 instead of 204
-                await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
-                logger.info(
-                    f"[DifyDatasetsConnector] Document deleted: {document_id} "
-                    f"from dataset {dataset_id} (status={response.status_code})"
-                )
-                return True
+                if response.status_code != 204:
+                    # Some Dify versions may return 200 instead of 204.
+                    response.raise_for_status()
+                return response.status_code
+
+        try:
+            status_code = await self._state.dispatched(
+                self.plugin, kb_id, remove, 'Dify delete outcome unknown')
+            await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
+            logger.info(
+                f"[DifyDatasetsConnector] Document deleted: {document_id} "
+                f"from dataset {dataset_id} (status={status_code})"
+            )
+            return True
         except httpx.HTTPStatusError as e:
             # The provider answered, so the delete was rejected deterministically.
             logger.error(
@@ -350,10 +366,6 @@ class DifyDatasetsConnector(ConfigStore, KnowledgeEngine):
             )
             return False
         except Exception as e:
-            if is_ambiguous_http_failure(e):
-                await self._state.fence(
-                    self.plugin, kb_id, f"Dify delete outcome unknown: {e!r}"
-                )
             logger.error(
                 f"[DifyDatasetsConnector] Failed to delete document {document_id}: {e}"
             )

@@ -38,7 +38,7 @@ async def test_fastgpt_delete_uses_delete_query_id_and_saved_credentials():
         await first.on_knowledge_base_create('kb',cfg)
         restarted=ec();restarted.plugin=bind(pc,store)
         assert await restarted.delete_document('kb','upstream-doc') is False
-        await restarted._save_document('kb','host-doc', {'upstream_id':'upstream-doc', 'dataset_id':'A', 'status':'created'})
+        await restarted._save_document('kb','host-doc', {'upstream_id':'upstream-doc', 'dataset_id':'A', 'status':'created', 'api_base_url':cfg['api_base_url']})
         assert await restarted.delete_document('kb','host-doc')
         assert seen==[('DELETE',{'id':'upstream-doc'},'Bearer A')]
     finally:await runner.cleanup()

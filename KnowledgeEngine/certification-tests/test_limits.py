@@ -1,11 +1,10 @@
 """Regression fixtures are local; no external model/parser/provider requests."""
 import asyncio
 import threading
-import time
 
 import pytest
 
-from test_shared_state import load_plugin, bind, StorageFixture, CONNECTORS, configuration
+from test_shared_state import load_plugin, bind, StorageFixture, CONNECTORS
 
 
 @pytest.mark.asyncio
@@ -56,20 +55,24 @@ async def test_parser_rejects_oversized_input_before_decode():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('name', CONNECTORS)
-async def test_connector_storage_failure_is_not_missing_and_fences_mutations(name):
+async def test_connector_storage_failure_is_not_missing_and_refuses_mutations(name):
     pc, ec = load_plugin(name)
     store = StorageFixture()
     engine = ec()
     engine.plugin = bind(pc, store)
     store.fail = True
+    # Unreadable fence state is "unknown", never "unfenced": the mutation is
+    # refused with the Host failure instead of being dispatched.
     with pytest.raises(RuntimeError, match='offline'):
         await engine.delete_document('kb', 'doc')
-    with pytest.raises(RuntimeError, match='ambiguous'):
-        await engine.on_knowledge_base_create('kb', {})
-    store.fail = False
-    with pytest.raises(RuntimeError, match='fenced'):
+    with pytest.raises(RuntimeError, match='offline'):
         await engine.on_knowledge_base_create('kb', {})
     assert not store.data
+    # The unreadable state is not cached either: once Host storage answers, the
+    # same mutation is retried and proceeds rather than staying refused.
+    store.fail = False
+    await engine.on_knowledge_base_create('kb', {})
+    assert store.data
 
 
 @pytest.mark.asyncio

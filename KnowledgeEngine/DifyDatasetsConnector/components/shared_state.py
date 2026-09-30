@@ -41,6 +41,15 @@ class AmbiguousMutationError(RuntimeError):
     """
 
 
+class FenceStateUnavailableError(RuntimeError):
+    """Persisted fence state could not be read, so the fence cannot be confirmed.
+
+    A failed read is not evidence that no fence exists, so the operation fails
+    closed rather than proceeding as if the knowledge base were clear. The read
+    is retried on the next call instead of being cached as loaded.
+    """
+
+
 def is_ambiguous_http_failure(exc):
     """Whether a failed provider call had an unknown outcome.
 
@@ -147,11 +156,11 @@ class SerialState:
         )
 
     async def _load_fences(self, plugin, binding):
-        """Read persisted fences once per binding, best effort.
+        """Read persisted fences once per binding.
 
-        A failed fence read must not introduce a new failure mode: any Host
-        mutation that follows fails closed on its own, and the read is retried
-        rather than cached.
+        A failed read cannot be treated as "no fence": it means the fence state
+        is unknown, so the caller fails closed and retries on the next call
+        rather than caching the failure as loaded.
         """
         if binding in self._fence_loaded:
             return
@@ -170,9 +179,11 @@ class SerialState:
                     fenced.add(key)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning("Could not read persisted fences for %r", binding, exc_info=True)
-            return
+            raise FenceStateUnavailableError(
+                f"Could not confirm persisted fence state for {binding!r}: {exc!r}"
+            ) from exc
         self._fence_loaded.add(binding)
 
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
@@ -193,6 +204,26 @@ class SerialState:
             except AmbiguousMutationError:
                 await self.fence(plugin, kb_identity, 'ambiguous remote mutation')
                 raise
+
+    async def dispatched(self, plugin, kb_identity, operation, reason):
+        """Dispatch a remote mutation under a pre-persisted intent.
+
+        The fence is written before the request goes out, so a cancellation after
+        dispatch (or an ambiguous failure) cannot leave a mutation with no marker
+        for reconciliation; a deterministic answer clears it again.
+        """
+        await self.fence(plugin, kb_identity, reason)
+        try:
+            result = await operation()
+        except asyncio.CancelledError:
+            # Dispatched, outcome unknown: keep the fence and let the caller see it.
+            raise
+        except Exception as exc:
+            if not is_ambiguous_http_failure(exc):
+                await self.clear_fence(plugin, kb_identity)
+            raise
+        await self.clear_fence(plugin, kb_identity)
+        return result
 
     async def fence(self, plugin, kb_identity, reason):
         """Mark one knowledge base as requiring reconciliation.

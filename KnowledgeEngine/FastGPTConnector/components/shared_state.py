@@ -19,6 +19,7 @@ import json
 import logging
 from functools import wraps
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 import httpx
 from weakref import WeakValueDictionary
 
@@ -39,6 +40,28 @@ class AmbiguousMutationError(RuntimeError):
     knowledge base; deterministic errors raised before any remote call, and
     ordinary cancellation before a call is dispatched, do not fence.
     """
+
+
+class FenceStateUnavailableError(RuntimeError):
+    """Persisted fence state could not be read, so no mutation is attempted.
+
+    A failed read means "unknown", never "unfenced": the knowledge base is
+    refused (and the read retried on the next call) instead of dispatching a
+    mutation that a persisted fence should have blocked.
+    """
+
+
+def normalize_api_base_url(api_base_url):
+    """Canonical upstream target: ``scheme://host[:port]/path``, no trailing slash.
+
+    Used to bind a document mapping to the instance that owns it, so a later
+    delete is not replayed against a different deployment. Credentials in the
+    URL are dropped rather than recorded.
+    """
+    parsed = urlsplit(str(api_base_url).strip())
+    host = parsed.hostname or ''
+    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    return f"{(parsed.scheme or 'http').lower()}://{netloc}{parsed.path.rstrip('/')}"
 
 
 def is_ambiguous_http_failure(exc):
@@ -147,11 +170,11 @@ class SerialState:
         )
 
     async def _load_fences(self, plugin, binding):
-        """Read persisted fences once per binding, best effort.
+        """Read persisted fences for one binding, succeeded reads only.
 
-        A failed fence read must not introduce a new failure mode: any Host
-        mutation that follows fails closed on its own, and the read is retried
-        rather than cached.
+        A failed read is not "no fences": it raises so the caller refuses this
+        operation, and it is not cached, so the next call retries the read
+        instead of treating the failure as permanent.
         """
         if binding in self._fence_loaded:
             return
@@ -170,9 +193,10 @@ class SerialState:
                     fenced.add(key)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.warning("Could not read persisted fences for %r", binding, exc_info=True)
-            return
+        except Exception as exc:
+            raise FenceStateUnavailableError(
+                f"Fence state for {binding!r} is unavailable: {exc!r}"
+            ) from exc
         self._fence_loaded.add(binding)
 
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
@@ -193,6 +217,26 @@ class SerialState:
             except AmbiguousMutationError:
                 await self.fence(plugin, kb_identity, 'ambiguous remote mutation')
                 raise
+
+    async def dispatched(self, plugin, kb_identity, operation, reason):
+        """Dispatch a remote mutation under a pre-persisted intent.
+
+        The fence is written before the request goes out, so a cancellation after
+        dispatch (or an ambiguous failure) cannot leave a mutation with no marker
+        for reconciliation; a deterministic answer clears it again.
+        """
+        await self.fence(plugin, kb_identity, reason)
+        try:
+            result = await operation()
+        except asyncio.CancelledError:
+            # Dispatched, outcome unknown: keep the fence and let the caller see it.
+            raise
+        except Exception as exc:
+            if not is_ambiguous_http_failure(exc):
+                await self.clear_fence(plugin, kb_identity)
+            raise
+        await self.clear_fence(plugin, kb_identity)
+        return result
 
     async def fence(self, plugin, kb_identity, reason):
         """Mark one knowledge base as requiring reconciliation.

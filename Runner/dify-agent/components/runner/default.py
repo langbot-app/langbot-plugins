@@ -6,6 +6,7 @@ Real Dify Service API integration supporting chat, agent, and workflow app types
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -577,26 +578,51 @@ class DefaultRunner(Runner):
             )
         if continuation.get("consumed") or continuation.get("expires_at", 0) < time.time():
             raise DifyAPIError("Dify continuation expired or already consumed", code="dify.interaction_not_found")
-        if continuation.get("owner") != self._continuation_owner(ctx):
-            raise DifyAPIError("Dify continuation belongs to another context", code="dify.interaction_invalid")
+        owner = self._continuation_owner(ctx)
+        stored_owner = continuation.get("owner")
+        if stored_owner != owner:
+            if stored_owner != self._legacy_continuation_owner(ctx):
+                raise DifyAPIError("Dify continuation belongs to another context", code="dify.interaction_invalid")
+            # One-time migration: a continuation stored before identity resolution moved
+            # to task-local bindings is accepted and re-written with the current owner.
+            # No long-term dual-rule compatibility branch beyond this upgrade path.
+            continuation = dict(continuation, owner=owner)
         return continuation
 
-    def _continuation_owner(self, ctx):
+    def _continuation_subject(self, ctx):
         conversation = ctx.conversation
-        return scoped_identity(
-            self,
-            ctx,
-            json.dumps(
-                [
-                    getattr(conversation, "conversation_id", None),
-                    getattr(conversation, "launcher_type", None),
-                    getattr(conversation, "launcher_id", None),
-                    getattr(ctx.actor, "actor_id", None),
-                    (ctx.config or {}).get("base-url"),
-                ],
-                separators=(",", ":"),
-            ),
+        return json.dumps(
+            [
+                getattr(conversation, "conversation_id", None),
+                getattr(conversation, "launcher_type", None),
+                getattr(conversation, "launcher_id", None),
+                getattr(ctx.actor, "actor_id", None),
+                (ctx.config or {}).get("base-url"),
+            ],
+            separators=(",", ":"),
         )
+
+    def _continuation_owner(self, ctx):
+        return scoped_identity(self, ctx, self._continuation_subject(ctx))
+
+    def _legacy_continuation_owner(self, ctx):
+        """Owner computed before identity resolution moved to task-local bindings.
+
+        Used only to accept continuations persisted by the previous release so an
+        in-flight human-input request survives the upgrade; the record is re-written
+        with the current owner on the next store.
+        """
+        binding = getattr(getattr(self, "_plugin_runtime_handler", None), "bound_action_context", None)
+        subject = self._continuation_subject(ctx)
+        if binding is not None:
+            scope = [binding.instance_uuid, binding.workspace_uuid, binding.installation_uuid]
+        else:
+            workspace = getattr(ctx.conversation, "workspace_id", None)
+            if not workspace:
+                return subject
+            scope = [workspace]
+        encoded = json.dumps([scope, subject], ensure_ascii=False, separators=(",", ":")).encode()
+        return "lb_" + hashlib.sha256(encoded).hexdigest()
 
     async def _delete_interaction_continuation(self, ctx: RunnerContext, interaction_id: str) -> None:
         await self.get_run_api(ctx).delete_plugin_storage(_interaction_storage_key(interaction_id))
@@ -1310,7 +1336,12 @@ class DefaultRunner(Runner):
             active = self._active_resumes = set()
         from langbot_plugin.api.proxies.invocation import current_binding
 
-        binding = current_binding(getattr(self, "_plugin_runtime_handler", None))
+        handler = getattr(self, "_plugin_runtime_handler", None)
+        # Same binding chain as scoped_identity, so the owner and the concurrency
+        # key can never disagree within one invocation.
+        binding = current_binding(handler) if handler is not None else None
+        if binding is None:
+            binding = getattr(handler, "bound_action_context", None)
         key = (binding, self._continuation_owner(ctx), str(submission.interaction_id))
         if key in active:
             raise DifyAPIError("Dify continuation is already being resumed", code="dify.interaction_invalid")

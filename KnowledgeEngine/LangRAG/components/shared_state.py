@@ -13,7 +13,8 @@ the cancellation so sibling operations fail closed instead of queueing behind
 the unsettled mutation. A reply that does not say what happened to the rows is
 an unknown outcome for the same reason. Fences are persisted (key includes the
 knowledge-base identity) behind an in-process cache, so a restarted worker still
-recognises them.
+recognises them. A fence store that cannot be read refuses the operation rather
+than assuming no fence.
 """
 import asyncio
 import hashlib
@@ -36,6 +37,15 @@ class AmbiguousMutationError(RuntimeError):
 
     Raise this from a call site when a mutation may have taken effect but its
     result is unknown. Only these failures fence a knowledge base.
+    """
+
+
+class FenceStateUnavailableError(RuntimeError):
+    """Persisted fence records could not be read, so the fence state is unknown.
+
+    An unreadable fence store must never be mistaken for "no fence": without
+    this the plugin would mutate a knowledge base that may still be fenced. The
+    read is not cached, so the operation is refused and retried later.
     """
 
 
@@ -153,11 +163,13 @@ class SerialState:
         return _kb_fence_key(kb_identity) in fenced or _INSTALLATION_FENCE_KEY in fenced
 
     async def _load_fences(self, plugin, binding):
-        """Read persisted fences once per binding, best effort.
+        """Read persisted fences once per binding, failing closed on error.
 
-        A failed fence read must not introduce a new failure mode: a Host
-        mutation that follows fails closed on its own, and the read is retried
-        rather than cached.
+        A failed read must never be mistaken for "no fence": the knowledge base
+        stays unfenced in the cache, but this operation is refused so the caller
+        retries instead of mutating a knowledge base whose fence state is
+        unknown. ``CancelledError`` propagates unchanged, and the read is only
+        marked done after it actually succeeded.
         """
         if binding in self._fence_loaded:
             return
@@ -176,9 +188,10 @@ class SerialState:
                     fenced.add(key)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.warning('Could not read persisted fences for %r', binding, exc_info=True)
-            return
+        except Exception as exc:
+            raise FenceStateUnavailableError(
+                f'Could not read persisted fences for {binding!r}: {exc!r}'
+            ) from exc
         self._fence_loaded.add(binding)
 
     @staticmethod
@@ -254,7 +267,6 @@ class SerialState:
         The in-process marker is set synchronously; persisting it is best effort
         so a caller cancellation cannot lose the fence.
         """
-        binding = self.binding(plugin)
         fence_key = _kb_fence_key(kb_identity)
         self.mark_fenced(plugin, kb_identity)
         payload = json.dumps({'kb_id': kb_identity, 'reason': reason}).encode()

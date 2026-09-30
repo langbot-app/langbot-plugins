@@ -21,7 +21,10 @@ independent review, signer approval, and two-Workspace acceptance.
 
 ## Upstream identity migration
 
-With a trusted SDK installation binding (or a Host Workspace conversation context),
+The identity is derived from the current invocation's trusted SDK installation
+binding; the connection binding is only the dedicated-worker fallback, and a
+shared worker whose invocation carries no binding refuses the call instead of
+falling back to a weaker scope. With that authority,
 the user name this plugin derives is a deterministic `lb_` SHA-256 name scoped to
 that authority, and it reaches WeKnora as the **session title** (`IM Chat - <name>`).
 The agent and knowledge chat request bodies this client builds carry no user field,

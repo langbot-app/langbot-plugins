@@ -1,4 +1,9 @@
-"""Keep migrated plugins' suites isolated, as in their production processes."""
+"""Keep plugin suites isolated, as in their production processes.
+
+Every plugin here owns a `pkg`/`components` tree with generic module names, so a
+suite that imports them must run in its own interpreter; the Runner process
+collects only `tests/` (see `[tool.pytest.ini_options]`).
+"""
 
 from __future__ import annotations
 
@@ -12,8 +17,20 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Migrated runners plus the shared agents that carry installation-scoped identity
+# tests; all of them import `pkg.*` and must not share this interpreter.
+PLUGINS = [
+    "LocalAgent",
+    "RunnerDemo",
+    "coze-agent",
+    "dify-agent",
+    "n8n-agent",
+    "tbox-agent",
+    "weknora-agent",
+]
 
-@pytest.mark.parametrize("plugin", ["LocalAgent", "RunnerDemo"])
+
+@pytest.mark.parametrize("plugin", PLUGINS)
 def test_migrated_runner_suite(plugin, tmp_path):
     plugin_root = ROOT / plugin
     manifest = yaml.safe_load((plugin_root / "manifest.yaml").read_text(encoding="utf-8"))

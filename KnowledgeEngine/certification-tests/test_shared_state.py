@@ -3,7 +3,6 @@ import asyncio
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -103,8 +102,10 @@ async def test_connector_restart_isolation_and_delete(name, monkeypatch):
     assert await restarted.delete_document('same-kb', 'doc') is False
     assert await eb.delete_document('same-kb', 'doc') is False
     assert not any(request.method == 'DELETE' for request in calls)
-    await restarted._save_document('same-kb', 'doc', {'upstream_id': 'upstream-A', 'dataset_id': 'A', 'status': 'created'})
-    await eb._save_document('same-kb', 'doc', {'upstream_id': 'upstream-B', 'dataset_id': 'B', 'status': 'created'})
+    # Mappings record the upstream target they were created on; a delete only
+    # replays against that same target.
+    await restarted._save_document('same-kb', 'doc', {'upstream_id': 'upstream-A', 'dataset_id': 'A', 'status': 'created', 'api_base_url': 'https://fixture.invalid'})
+    await eb._save_document('same-kb', 'doc', {'upstream_id': 'upstream-B', 'dataset_id': 'B', 'status': 'created', 'api_base_url': 'https://fixture.invalid'})
     assert await restarted.delete_document('same-kb', 'doc') is True
     assert calls[-1].headers['authorization'] == 'Bearer A'
     assert await eb.delete_document('same-kb', 'doc') is True

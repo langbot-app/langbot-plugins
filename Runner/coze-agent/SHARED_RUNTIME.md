@@ -31,7 +31,10 @@ does not promise rollback of an already-dispatched Host operation.
 
 ## Upstream identity migration
 
-With a trusted SDK installation binding (or a Host Workspace conversation context),
+The identity is derived from the current invocation's trusted SDK installation
+binding; the connection binding is only the dedicated-worker fallback, and a
+shared worker whose invocation carries no binding refuses the call instead of
+falling back to a weaker scope. With that authority,
 upstream user IDs are deterministic `lb_` SHA-256 names scoped to that authority.
 The same actor/legacy launcher in different installations/Workspaces no longer
 collides. Dedicated OSS without either scope retains the existing legacy IDs.

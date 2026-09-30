@@ -8,9 +8,11 @@ bases that share the same installation; the platform storage key is the same for
 a whole installation, hence the knowledge-base id is always folded into our keys.
 Fences are persisted in installation-bound Host storage (key includes the
 knowledge-base id) with an in-process cache in front, so a restarted worker still
-recognises them. Only dispatched mutations whose outcome is unknown fence; a
-deterministic validation error raised before any remote call and ordinary
-cancellation before a call is dispatched do not.
+recognises them. An unreadable fence record refuses the operation instead of
+being read as "no fence", and such a read is retried rather than cached. Only
+dispatched mutations whose outcome is unknown fence; a deterministic validation
+error raised before any remote call and ordinary cancellation before a call is
+dispatched do not.
 """
 import asyncio
 import hashlib
@@ -38,6 +40,16 @@ class AmbiguousMutationError(RuntimeError):
     its result (or its durable record) is unknown. Only these failures fence a
     knowledge base; deterministic errors raised before any remote call, and
     ordinary cancellation before a call is dispatched, do not fence.
+    """
+
+
+class FenceStateUnavailableError(RuntimeError):
+    """Persisted fence state could not be read, so the operation is refused.
+
+    An unreadable fence record cannot be told apart from a knowledge base that
+    is fenced after an ambiguous mutation, so an unknown fence state fails
+    closed. The read is not cached: the next attempt re-reads the durable state,
+    and nothing has been dispatched while the state stays unknown.
     """
 
 
@@ -147,11 +159,13 @@ class SerialState:
         )
 
     async def _load_fences(self, plugin, binding):
-        """Read persisted fences once per binding, best effort.
+        """Read persisted fences once per binding, or refuse the operation.
 
-        A failed fence read must not introduce a new failure mode: any Host
-        mutation that follows fails closed on its own, and the read is retried
-        rather than cached.
+        A failed read means the pending ambiguity of the installation is
+        unknown, so it must not be mistaken for "no fences": the operation is
+        refused with ``FenceStateUnavailableError`` and nothing is dispatched.
+        The binding is not marked as loaded, so the next attempt re-reads and
+        the knowledge base becomes usable again once storage answers.
         """
         if binding in self._fence_loaded:
             return
@@ -170,9 +184,12 @@ class SerialState:
                     fenced.add(key)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.warning("Could not read persisted fences for %r", binding, exc_info=True)
-            return
+            raise FenceStateUnavailableError(
+                f"Could not read persisted fences for {binding!r}; pending ambiguous "
+                f"mutations are unknown: {exc!r}"
+            ) from exc
         self._fence_loaded.add(binding)
 
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
@@ -193,6 +210,26 @@ class SerialState:
             except AmbiguousMutationError:
                 await self.fence(plugin, kb_identity, 'ambiguous remote mutation')
                 raise
+
+    async def dispatched(self, plugin, kb_identity, operation, reason):
+        """Dispatch a remote mutation under a pre-persisted intent.
+
+        The fence is written before the request goes out, so a cancellation after
+        dispatch (or an ambiguous failure) cannot leave a mutation with no marker
+        for reconciliation; a deterministic answer clears it again.
+        """
+        await self.fence(plugin, kb_identity, reason)
+        try:
+            result = await operation()
+        except asyncio.CancelledError:
+            # Dispatched, outcome unknown: keep the fence and let the caller see it.
+            raise
+        except Exception as exc:
+            if not is_ambiguous_http_failure(exc):
+                await self.clear_fence(plugin, kb_identity)
+            raise
+        await self.clear_fence(plugin, kb_identity)
+        return result
 
     async def fence(self, plugin, kb_identity, reason):
         """Mark one knowledge base as requiring reconciliation.
