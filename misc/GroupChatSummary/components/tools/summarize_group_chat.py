@@ -55,6 +55,7 @@ class SummarizeGroupChat(Tool):
             except (ValueError, TypeError):
                 return "Invalid hours parameter."
 
+        await self.plugin.ensure_loaded()
         msg_count = self.plugin.get_message_count(
             session.launcher_type.value, session.launcher_id
         )

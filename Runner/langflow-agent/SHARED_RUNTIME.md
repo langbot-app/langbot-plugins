@@ -28,3 +28,22 @@ instead of silently reusing or mutating an active listener. Separate installatio
 Limits: 16 accepted connections, 16 KiB headers, 1 MiB request/response, 32-message
 MCP batches, finite request timeout <=120s and token TTL <=3600s. Tool RPC cancellation
 does not promise rollback of an already-dispatched Host operation.
+
+## Identity and per-invocation scope
+
+This plugin derives no upstream user identity. Unlike `coze`/`dify`/`n8n`/`tbox`/
+`weknora` there is no `pkg/scoped_identity.py` here and no user id is sent upstream.
+The dead, uncalled `_get_user_tag` helper was removed: it returned an unscoped
+`{actor_type}_{actor_id}` and fell back to a per-run `user_{run_id}`, and that
+per-run fallback is exactly what the shared-runtime identity rule forbids.
+
+Read per invocation from `ctx.config` (never cached on the shared component):
+`base-url`, `api-key`, `flow-id`, `input-type`/`output-type`, `tweaks`, `timeout`
+and the asset-gateway settings. Each run builds its own `AsyncLangflowClient`
+with its own `x-api-key` header; `external.session_id` comes from Host-managed
+run state.
+
+Nothing is binding-keyed: the runner keeps no process cache, no detached
+tenant-bearing tasks and no module-level mutable tenant state, so
+`on_installation_revoked` has nothing to release. The asset-gateway listener is
+owned by the SDK-created component and not by any installation.

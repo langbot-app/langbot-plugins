@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: PowerContext
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/PowerContext
-  version: 0.1.0
+  version: 0.1.1
   label:
     en_US: PowerContext
     zh_Hans: PowerContext
@@ -163,3 +163,5 @@ execution:
   python:
     path: main.py
     attr: PowerContextPlugin
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

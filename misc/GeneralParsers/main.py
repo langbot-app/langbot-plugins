@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from langbot_plugin.api.definition.plugin import BasePlugin
 
+from components.observability import release_telemetry
+
 
 class GeneralParsersPlugin(BasePlugin):
 
     async def initialize(self) -> None:
         pass
+
+    async def on_installation_revoked(self, binding) -> None:
+        release_telemetry(binding)
 
     def __del__(self) -> None:
         pass

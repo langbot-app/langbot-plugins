@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: AutoTranslate
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/AutoTranslate
-  version: 0.1.4
+  version: 0.1.5
   description:
     en_US: Automatically detect foreign language messages and translate them using
       LLM. Supports configurable target language and translation style.
@@ -100,3 +100,5 @@ execution:
   python:
     path: main.py
     attr: AutoTranslate
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

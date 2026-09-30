@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: EssentialCommands
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/EssentialCommands
-  version: 0.1.9
+  version: 0.1.10
   description:
     en_US: Essential commands, previously included in LangBot
     zh_Hans: 实用命令, 以前包含在 LangBot 中
@@ -49,3 +49,5 @@ execution:
   python:
     path: main.py
     attr: EssentialCommands
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

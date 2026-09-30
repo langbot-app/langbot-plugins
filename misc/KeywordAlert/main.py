@@ -8,17 +8,42 @@ from langbot_plugin.api.definition.plugin import BasePlugin
 
 logger = logging.getLogger("KeywordAlert")
 
+# Scope used when the active invocation carries no installation binding.
+LEGACY_SCOPE = ""
+
 
 class KeywordAlert(BasePlugin):
     """Monitor group messages for keywords and alert admins via private message."""
 
     def __init__(self):
         super().__init__()
-        # Cooldown tracking: {(group_id, keyword): last_alert_timestamp}
-        self._cooldowns: dict[tuple[str, str], float] = {}
+        # Cooldown tracking, keyed by installation scope then
+        # (group_id, keyword): one object graph serves every installation of
+        # this artifact digest, so a cooldown must never suppress a sibling
+        # installation's alert. Entries are released in
+        # on_installation_revoked().
+        self._cooldowns: dict[str, dict[tuple[str, str], float]] = {}
 
     async def initialize(self):
+        # Process-scoped only: no tenant config or state is read here.
         logger.info("KeywordAlert plugin initialized")
+
+    async def on_installation_revoked(self, binding) -> None:
+        """Release one installation's cooldown table (no Host call is made here)."""
+        self._cooldowns.pop(self._scope(binding), None)
+
+    def _scope(self, binding=None) -> str:
+        """Return the full installation scope of this invocation.
+
+        The whole binding is used so two Workspaces that reuse an installation
+        UUID never share a cooldown. Dedicated placement has no binding and keeps
+        its process-local scope.
+        """
+        if binding is None:
+            binding = self.get_installation_binding()
+        if binding is None:
+            return LEGACY_SCOPE
+        return f"{binding.instance_uuid}:{binding.workspace_uuid}:{binding.installation_uuid}"
 
     def parse_keywords(self) -> list[str]:
         raw = self.get_config().get("keywords", "")
@@ -36,10 +61,11 @@ class KeywordAlert(BasePlugin):
         cooldown = int(config.get("cooldown_seconds", 60))
         key = (group_id, keyword)
         now = time.time()
-        last = self._cooldowns.get(key, 0)
+        table = self._cooldowns.setdefault(self._scope(), {})
+        last = table.get(key, 0)
         if now - last < cooldown:
             return False
-        self._cooldowns[key] = now
+        table[key] = now
         return True
 
     async def send_alert(self, group_id: str, sender_id: str, keyword: str, text: str):

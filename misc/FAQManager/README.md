@@ -24,3 +24,6 @@ Manage FAQ entries through a visual page in the LangBot WebUI, and let the LLM s
 2. Open the **Plugin Pages** section in the sidebar and select **FAQ Manager**.
 3. Add question-answer pairs through the page.
 4. When users ask questions in a conversation, the LLM can use the `search_faq` tool to look up matching FAQ entries and respond accordingly.
+
+Entries are kept per installation, so the plugin can be placed on a shared worker: see
+[SHARED_RUNTIME.md](SHARED_RUNTIME.md).

@@ -2065,9 +2065,7 @@ def test_runners_use_protocol_v1_actor_fields_for_user_identity() -> None:
 
     for plugin_dir, method_name in {
         "coze-agent": "_get_user_id",
-        "deerflow-agent": "_get_user_tag",
         "dify-agent": "_get_user_tag",
-        "langflow-agent": "_get_user_tag",
         "n8n-agent": "_get_user_tag",
         "tbox-agent": "_get_user_id",
         "weknora-agent": "_get_user_tag",
@@ -2075,6 +2073,17 @@ def test_runners_use_protocol_v1_actor_fields_for_user_identity() -> None:
         module = _load_runner_module(plugin_dir)
         runner = object.__new__(module.DefaultRunner)
         assert getattr(runner, method_name)(ctx) == "user_user_1"
+
+
+def test_deerflow_and_langflow_runners_derive_no_upstream_identity() -> None:
+    # These runners send no upstream user identity (unlike coze/dify/n8n/tbox/
+    # weknora), so they must not carry an identity helper. The removed
+    # `_get_user_tag` returned an unscoped tag with a per-run `user_{run_id}`
+    # fallback, which is exactly what shared placement forbids; nothing called it.
+    for plugin_dir in ("deerflow-agent", "langflow-agent"):
+        module = _load_runner_module(plugin_dir)
+        assert not hasattr(module.DefaultRunner, "_get_user_tag")
+        assert not hasattr(module.DefaultRunner, "_get_user_id")
 
 
 def test_non_streaming_capability_metadata_is_honored_when_supported() -> None:

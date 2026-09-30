@@ -36,7 +36,7 @@ Only posts when that repo has new commits, PR changes, or a new release.
 
 ## How it works
 
-- On `initialize()` the plugin starts a background `asyncio` poller that fetches `GET /repos/{owner}/{repo}/events` for every subscribed repo at the configured interval.
+- On the first invocation of an installation the plugin starts a background `asyncio` poller for that installation's subscriptions, fetching `GET /repos/{owner}/{repo}/events` at the configured interval. Pollers are keyed by installation binding and stopped by `on_installation_revoked`.
 - Deduplicates with `last_event_id`, pushing only events newer than the last seen; on first subscription it records the current cursor and never backfills history.
 - Subscriptions (including `bot_uuid` + chat target) are persisted in the plugin KV store, so push continues after a restart.
 
@@ -50,3 +50,13 @@ Only posts when that repo has new commits, PR changes, or a new release.
 ## Rate limit note
 
 Without a token the anonymous quota is only 60 requests/hour, which a few subscribed repos will exhaust quickly. Always configure a token for production use.
+
+## Shared runtime
+
+`manifest.yaml` declares `sharedRuntime: shared-runtime-v1` +
+`componentModel: stateless-v1`, so this plugin can be placed on a multi-tenant
+shared worker: config is read per invocation, subscriptions are namespaced per
+installation, and each installation's poller is stopped in
+`on_installation_revoked`. See [SHARED_RUNTIME.md](SHARED_RUNTIME.md) for what is
+per-invocation, what is binding-keyed, and the known limits. This source is not
+certified.

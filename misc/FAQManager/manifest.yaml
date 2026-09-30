@@ -4,7 +4,7 @@ metadata:
   author: RockChinQ
   name: FAQManager
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/FAQManager
-  version: 0.1.1
+  version: 0.1.2
   description:
     en_US: Manage FAQ entries via a visual page and let the LLM search them during conversations.
     zh_Hans: 通过可视化页面管理常见问答条目，并让 LLM 在对话中检索它们。
@@ -29,3 +29,5 @@ execution:
   python:
     path: main.py
     attr: FAQManagerPlugin
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

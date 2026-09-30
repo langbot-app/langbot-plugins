@@ -116,6 +116,7 @@ class GeneralParsers(Parser):
             ParseResult with extracted text and optional structured sections.
         """
         started_at = time.perf_counter()
+        binding = self.get_installation_binding()
         filename = context.filename
         raw_mime_type = context.mime_type
         mime_type = (raw_mime_type or '').split(';', 1)[0].strip().lower()
@@ -227,7 +228,7 @@ class GeneralParsers(Parser):
             raise
         finally:
             try:
-                get_telemetry().record_parse(
+                get_telemetry(binding).record_parse(
                     filename=filename,
                     mime_type=raw_mime_type,
                     extension=extension,

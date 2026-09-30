@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: SysStatPlugin
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/SysStatPlugin
-  version: 0.2.4
+  version: 0.2.5
   description:
     en_US: View system status including CPU, memory, and disk usage
     zh_Hans: 查看系统状态，包括 CPU、内存和磁盘使用情况
@@ -34,3 +34,5 @@ execution:
   python:
     path: main.py
     attr: SysStatPlugin
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

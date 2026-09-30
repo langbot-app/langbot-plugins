@@ -45,4 +45,15 @@ Grades also accept English / Chinese aliases: `again/hard/good/easy`, `忘了/�
 
 ## Data storage
 
-Review progress is stored as JSON in the plugin KV store under `deck:{session_id}`. Each card keeps the full FSRS state (`Card.to_dict()`), so upgrading algorithm parameters reads back losslessly.
+Review progress is stored as JSON in the plugin KV store under
+`deck:{instance_uuid}:{workspace_uuid}:{installation_uuid}:{session_id}` (binding-less
+dedicated workers keep the historical `deck:{session_id}` row; existing rows are not
+migrated). Each card keeps the full FSRS state (`Card.to_dict()`), so upgrading algorithm
+parameters reads back losslessly.
+
+## Shared runtime
+
+This release declares `shared-runtime-v1` / `stateless-v1`: settings are read per
+invocation and the deck read-modify-write is guarded per installation binding.
+See [SHARED_RUNTIME.md](SHARED_RUNTIME.md) for the per-invocation and
+revocation-scoped state and the known limits. It is not a certification claim.

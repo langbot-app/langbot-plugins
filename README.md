@@ -59,6 +59,40 @@ Each plugin is an independent package with its own `manifest.yaml`, dependencies
 - [WebSearch](misc/WebSearch/README.md)
 - [WordFSRS](misc/WordFSRS/README.md)
 
+## Deployment: dedicated and shared placement
+
+A plugin runs either **dedicated** (its own worker per installation) or **shared** (one `BasePlugin` and one object
+per declared component serve every installation of an artifact digest in a single worker). Shared placement is
+opted into per plugin with both manifest fields:
+
+```yaml
+execution:
+  python: {path: main.py, attr: Plugin}
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1
+```
+
+`sharedRuntime` without `componentModel: stateless-v1` is not eligible. The normative contract is
+[`langbot-plugin-sdk/docs/stateless-components.md`](https://github.com/langbot-app/langbot-plugin-sdk/blob/main/docs/stateless-components.md):
+component objects are process-wide singletons, `initialize()` runs once per worker and sees no tenant config,
+configuration and credentials are resolved per invocation, tenant state in a process cache is keyed by the full
+installation binding and released in `on_installation_revoked()`, components must be re-entrant, and blocking work
+must stay off the shared event loop. Adding the manifest fields alone is not sufficient — source review and
+concurrency tests must prove the implementation.
+
+37 of the 40 plugins here declare shared placement. `Runner/acp-agent-runner`, `Runner/claude-code-agent` and
+`Runner/codex-agent` stay dedicated: each launches a process-global daemon hub, symlinks worker-`HOME` credentials
+into every run home and shares one workspace root, so serving two installations from one process needs the
+Host/SDK broker and duplex-process API first (see `Runner/acp-agent-runner/docs/SHARED_RUNTIME_BLOCKERS.md`).
+
+Every plugin that declares shared placement ships a `SHARED_RUNTIME.md` stating what is per invocation, what is
+binding-keyed and released on revocation, and its known limits, plus a test that drives two installation bindings
+through one object graph. `misc/*` suites run in CI through `.github/workflows/misc-tests.yml` (one venv and one
+interpreter per plugin, dependencies from that plugin's `requirements.txt`); Runner plugin suites run through the
+isolated-interpreter harness in `Runner/tests/test_migrated_runners.py`. Declaration is not certification:
+[`SHARED_SOURCE_LEDGER.md`](SHARED_SOURCE_LEDGER.md) records the committed source tree of each candidate and no
+plugin is claimed certified or live-accepted there.
+
 ## Development
 
 Use a plugin directory as the working directory when building or running it; the repository root is not a plugin. Runner development and tests are documented in [Runner/README.md](Runner/README.md).

@@ -110,7 +110,7 @@ class SiteAdapterBase:
         status_code: int=200,
         message: str='ok',
         title: str='',
-        briefs: list[str]=[]
+        briefs: list[str] | None = None
     ):
         """生成返回的字典"""
         return {
@@ -118,7 +118,7 @@ class SiteAdapterBase:
             "message": message,
             "content": {
                 "title": title,
-                "briefs": briefs
+                "briefs": [] if briefs is None else briefs
             }
         }
 

@@ -19,7 +19,7 @@ class Recall(Tool):
         query = params.get("query", "")
         if not isinstance(query, str) or not query.strip():
             return "Error: query is required."
-        limit = params.get("limit", self.plugin.search_limit)
+        limit = params.get("limit", self.plugin.settings().search_limit)
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
@@ -31,10 +31,11 @@ class Recall(Tool):
             return "Error: mode must be auto, fts, vector, or hybrid."
 
         try:
+            settings = self.plugin.settings()
             resolved = await self.plugin.resolve_query(
                 session=session, query_id=query_id
             )
-            response = await self.plugin.client.search_memory(
+            response = await settings.new_client().search_memory(
                 scope_id=resolved.scope_id,
                 query=query.strip()[:8192],
                 limit=limit,

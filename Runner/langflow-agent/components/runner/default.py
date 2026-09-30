@@ -163,13 +163,6 @@ class DefaultRunner(Runner):
         # Generate new session ID
         return str(uuid.uuid4())
 
-    def _get_user_tag(self, ctx: RunnerContext) -> str:
-        """Get user identifier for logging."""
-        actor = ctx.actor
-        if actor and actor.actor_id:
-            return f"{actor.actor_type}_{actor.actor_id}"
-        return f"user_{ctx.run_id}"
-
     def _should_stream(self, ctx: RunnerContext) -> bool:
         """Decide whether to request streaming from Langflow."""
         configured = ctx.config.get("streaming")

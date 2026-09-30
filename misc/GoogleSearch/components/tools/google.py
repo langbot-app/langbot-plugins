@@ -8,6 +8,7 @@ import httpx
 from langbot_plugin.api.definition.components.tool.tool import Tool
 
 SERP_API_URL = "https://serpapi.com/search"
+REQUEST_TIMEOUT = 5.0
 
 
 class Google(Tool):
@@ -29,8 +30,10 @@ class Google(Tool):
         return result
 
     async def call(self, params: dict[str, Any]) -> dict[str, Any]:
-        params = {
-            "api_key": self.plugin.get_config()["api_key"],
+        # Read the installation config for THIS invocation; never cache it on self.
+        config = self.get_plugin_config()
+        request_params = {
+            "api_key": config["api_key"],
             "q": params["query"],
             "engine": "google",
             "google_domain": "google.com",
@@ -38,7 +41,9 @@ class Google(Tool):
             "hl": "en",
         }
 
-        response = httpx.get(url=SERP_API_URL, params=params, timeout=5)
+        # One async client per invocation: never block the shared event loop.
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(url=SERP_API_URL, params=request_params)
         response.raise_for_status()
         valuable_res = self._parse_response(response.json())
 

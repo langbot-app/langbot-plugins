@@ -45,5 +45,7 @@ When the limit is reached it either replies with the limit message or silently d
 (silent mode), and blocks the default LLM pipeline.
 
 Counters roll over at the configured hour in the configured timezone. The management Page reads and
-mutates the same in-memory + persisted state via the plugin's `handle_api`, so changes take effect
-immediately.
+mutates the same state via the plugin's `handle_api`, so changes take effect immediately.
+
+State is kept per installation, so the plugin can be placed on a shared worker: see
+[SHARED_RUNTIME.md](SHARED_RUNTIME.md).

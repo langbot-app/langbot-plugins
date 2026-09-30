@@ -26,21 +26,29 @@ class Draw(Command):
             text=f"🎨 正在生成图片...\n描述: {description}"
         )
         
-        # 检查 OpenAI 客户端
-        if not self.plugin.openai_client:
+        # 读取本次调用自己的配置（共享运行时下一个进程服务多个安装）
+        config = self.get_plugin_config()
+        size = config.get('image_size', '1024x1024')
+        model = config.get('model_name', 'qh-draw-x1-pro')
+        
+        # 每次调用按当前配置创建客户端，用完即关，避免一个租户的凭据被其他租户复用
+        try:
+            client = self.plugin.create_client()
+        except Exception as e:
             yield CommandReturn(
-                text="❌ OpenAI 客户端未初始化，请先在插件设置中配置 API Key"
+                text=f"❌ 初始化 OpenAI 客户端失败: {str(e)}"
+            )
+            return
+        
+        if client is None:
+            yield CommandReturn(
+                text="❌ 未配置 API Key，请先在插件设置中配置"
             )
             return
         
         try:
-            # 获取配置
-            config = self.plugin.get_config()
-            size = config.get('image_size', '1024x1024')
-            model = config.get('model_name', 'qh-draw-x1-pro')
-            
             # 调用图片生成 API
-            response = await self.plugin.openai_client.images.generate(
+            response = await client.images.generate(
                 model=model,
                 prompt=description,
                 size=size,
@@ -59,3 +67,8 @@ class Draw(Command):
             yield CommandReturn(
                 text=f"❌ 生成图片失败: {str(e)}"
             )
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass

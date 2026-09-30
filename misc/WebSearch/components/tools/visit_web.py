@@ -2,6 +2,7 @@
 # Please refer to https://langbot.app/docs/en/plugin/dev/tutor.html for more details.
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from langbot_plugin.api.definition.components.tool.tool import Tool
@@ -20,7 +21,10 @@ class VisitWeb(Tool):
                 params['brief_len'] = 4096
 
             print(f'start visit web: {params["url"]}')
-            return process(params['url'], params['brief_len'])
+            # The site adapters fetch with the blocking `requests` library. Run the
+            # whole call in a worker thread so the shared event loop keeps serving
+            # other tenants while this page is fetched/parsed.
+            return await asyncio.to_thread(process, params['url'], params['brief_len'])
         except Exception as e:
             logging.error("[Webwlkr] error visit web: {}".format(e))
             return "error visit web:{}".format(e)

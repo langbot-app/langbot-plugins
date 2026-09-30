@@ -28,11 +28,12 @@ class Remember(Tool):
             return "Error: reason must be a string of at most 512 characters."
 
         try:
+            settings = self.plugin.settings()
             resolved = await self.plugin.resolve_query(
                 session=session,
                 query_id=query_id,
             )
-            response = await self.plugin.client.remember(
+            response = await settings.new_client().remember(
                 scope_id=resolved.scope_id,
                 kind=kind.strip(),
                 text=text.strip(),

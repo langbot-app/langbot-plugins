@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -30,50 +31,182 @@ STORAGE_SESSION_PREFIX = "ht_session_v2_"
 # Leave ample room for SDK base64 encoding and the 16 MiB transport envelope.
 MAX_SESSION_STORAGE_BYTES = 8 * 1024 * 1024
 
+# Process-cache slot used when no installation binding is available (dedicated
+# placement). It maps to the legacy storage keys so existing dedicated installs
+# keep reading their own rows.
+DEDICATED_SCOPE = "dedicated"
+
+# Written by the SDK worker launcher. A shared worker must always carry a trusted
+# invocation binding; without one it must refuse to touch tenant state instead of
+# falling back to a binding-less scope shared by every installation.
+RUNTIME_PROFILE_ENV = "LANGBOT_PLUGIN_RUNTIME_PROFILE"
+
+
+def installation_scope(binding) -> str:
+    """Return the stable scope token for one installation binding.
+
+    ``runtime_revision`` changes on every worker upgrade, so only the stable
+    installation identity triple is used; including it would orphan persisted
+    rows and make the revoked binding impossible to release.
+    """
+
+    return f"{binding.instance_uuid}:{binding.workspace_uuid}:{binding.installation_uuid}"
+
+
+def scoped_storage_key(scope: str, key: str) -> str:
+    """Return the plugin-storage key for one installation scope.
+
+    Host rows are keyed by ``[instance, workspace, owner_type, owner, key]`` with
+    no installation dimension, so the installation scope has to live in the
+    plugin's own key. The binding-less dedicated scope keeps the legacy key.
+    """
+
+    if scope == DEDICATED_SCOPE:
+        return key
+    return f"{scope}:{key}"
+
+
+class _InstallationState:
+    """Process-local sessions/messages belonging to exactly one installation.
+
+    The same object graph serves every installation of the artifact, so this is
+    cached per binding and dropped in ``on_installation_revoked``.
+    """
+
+    __slots__ = (
+        "scope",
+        "sessions",
+        "messages",
+        "lock",
+        "loaded",
+        "storage_uncertain",
+        "load_failed",
+    )
+
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.messages: dict[str, list[dict[str, Any]]] = {}
+        self.lock = asyncio.Lock()
+        self.loaded = False
+        self.storage_uncertain = False
+        self.load_failed = False
+
 
 class HumanTakeover(BasePlugin):
     """人工接管插件主类。
 
     维护所有会话(私聊/群聊)、消息记录与接管状态,并通过 LangBot 的
     plugin_storage(数据库支撑)持久化,保证重启不丢失数据。
+
+    会话与消息缓存按 installation binding 隔离,并在每次调用时按需加载,因此
+    共享对象图上的多个安装不会看到彼此的会话。
     """
 
-    # 内存缓存
-    sessions: dict[str, dict[str, Any]]
-    """会话元数据:{session_key: {...}}"""
-    messages: dict[str, list[dict[str, Any]]]
-    """消息记录:{session_key: [ {role, sender_id, sender_name, content_type, content, ts}, ... ]}"""
+    def __init__(self) -> None:
+        super().__init__()
+        self._states: dict[str, _InstallationState] = {}
 
-    _lock: asyncio.Lock
-    _loaded: bool
+    # ==================== 生命周期 ====================
 
-    async def initialize(self, *, storage_reconciled: bool = False) -> None:
-        """Reload only after any uncertain remote mutations have been reconciled."""
-        if not hasattr(self, "_lock"):
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            if getattr(self, "_storage_uncertain", False) and not storage_reconciled:
-                raise RuntimeError(
-                    "HumanTakeover storage requires remote reconciliation"
-                )
-            self._storage_uncertain = False
-            await self._finish_operation(self._initialize())
+    async def initialize(self) -> None:
+        """Process-wide initialization only.
 
-    async def _initialize(self) -> None:
-        self.sessions = {}
-        self.messages = {}
-        self._loaded = False
-        try:
-            await self._load_all()
-            self._loaded = True
-            logger.info(
-                "HumanTakeover initialized: %d sessions, %d message buckets loaded",
-                len(self.sessions),
-                len(self.messages),
+        Under shared placement this runs once per worker with an empty config and
+        no installation context, so tenant state is loaded lazily per invocation
+        (and per binding) instead.
+        """
+        return None
+
+    async def on_installation_revoked(self, binding) -> None:
+        """Drop the revoked installation's cache; no Host API is available here."""
+        self._states.pop(installation_scope(binding), None)
+
+    async def destroy(self) -> None:
+        self._states.clear()
+
+    # ==================== 状态作用域 ====================
+
+    def _current_scope(self) -> str:
+        binding = self.get_installation_binding()
+        if binding is not None:
+            return installation_scope(binding)
+        if os.environ.get(RUNTIME_PROFILE_ENV) == "shared":
+            raise RuntimeError(
+                "shared invocation has no trusted installation binding; "
+                "refusing to read or write tenant state"
             )
-        except Exception as e:
-            logger.error("HumanTakeover failed to load persisted data: %s", e)
-            raise
+        return DEDICATED_SCOPE
+
+    def _current_state(self) -> _InstallationState:
+        scope = self._current_scope()
+        st = self._states.get(scope)
+        if st is None:
+            st = _InstallationState(scope)
+            self._states[scope] = st
+        return st
+
+    async def _ensure_loaded(
+        self, st: _InstallationState, *, storage_reconciled: bool = False
+    ) -> None:
+        """Load one installation's rows exactly once, honoring failure fences."""
+        if st.storage_uncertain and not storage_reconciled:
+            raise RuntimeError("HumanTakeover storage requires remote reconciliation")
+        if st.load_failed and not storage_reconciled:
+            raise RuntimeError("HumanTakeover storage is not initialized")
+        if st.loaded and not storage_reconciled:
+            return
+        async with st.lock:
+            if st.loaded and not storage_reconciled:
+                return
+            st.storage_uncertain = False
+            st.load_failed = False
+            # A (re)load replaces the cache with what storage holds.
+            st.sessions = {}
+            st.messages = {}
+            try:
+                await self._finish_operation(self._load_all(st))
+            except asyncio.CancelledError:
+                # A cancelled load settles remotely but stays retryable.
+                raise
+            except BaseException:
+                st.loaded = False
+                st.load_failed = True
+                raise
+            st.loaded = True
+            logger.info(
+                "HumanTakeover initialized scope=%s: %d sessions, %d message buckets",
+                st.scope,
+                len(st.sessions),
+                len(st.messages),
+            )
+
+    async def load_state(self) -> None:
+        """Load the invoking installation's state on demand (per invocation)."""
+        await self._ensure_loaded(self._current_state())
+
+    async def reconcile(self) -> None:
+        """Re-read this installation's rows after an explicitly reconciled failure."""
+        await self._ensure_loaded(self._current_state(), storage_reconciled=True)
+
+    async def _state_for_update(self) -> _InstallationState:
+        st = self._current_state()
+        await self._ensure_loaded(st)
+        return st
+
+    @property
+    def sessions(self) -> dict[str, dict[str, Any]]:
+        """会话元数据 of the invoking installation (empty until loaded)."""
+        return self._current_state().sessions
+
+    @property
+    def messages(self) -> dict[str, list[dict[str, Any]]]:
+        """消息记录 of the invoking installation."""
+        return self._current_state().messages
+
+    @property
+    def _loaded(self) -> bool:
+        return self._current_state().loaded
 
     def __del__(self) -> None:
         # Will be called when plugin is terminating
@@ -98,88 +231,94 @@ class HumanTakeover(BasePlugin):
             raise asyncio.CancelledError
         return result
 
-    async def _storage_mutation(self, operation):
+    async def _storage_mutation(self, st: _InstallationState, operation):
         try:
             return await operation
         except BaseException:
             # The SDK cannot prove whether a dispatched mutation committed.
-            self._loaded = False
-            self._storage_uncertain = True
+            st.loaded = False
+            st.storage_uncertain = True
             logger.error(
-                "HumanTakeover remote storage outcome unknown; writes and clear "
-                "are blocked until remote reconciliation and reinitialization"
+                "HumanTakeover remote storage outcome unknown for scope %s; writes "
+                "and clear are blocked until remote reconciliation",
+                st.scope,
             )
             raise
 
     @staticmethod
-    def _session_storage_key(session_key: str) -> str:
+    def _session_storage_base(session_key: str) -> str:
         # Fixed-length keys also accommodate long/non-ASCII platform identifiers.
         return (
             STORAGE_SESSION_PREFIX
             + hashlib.sha256(session_key.encode("utf-8")).hexdigest()
         )
 
-    async def _load_all(self) -> None:
+    def _session_storage_key(self, st: _InstallationState, session_key: str) -> str:
+        return scoped_storage_key(st.scope, self._session_storage_base(session_key))
+
+    async def _load_all(self, st: _InstallationState) -> None:
         """Migrate legacy snapshots once, retaining them as an untouched backup."""
         keys = await self.get_plugin_storage_keys()
-        if STORAGE_KEY_SCHEMA not in keys:
-            if STORAGE_KEY_SESSIONS in keys:
-                self.sessions = json.loads(
-                    await self.get_plugin_storage(STORAGE_KEY_SESSIONS)
-                )
-            if STORAGE_KEY_MESSAGES in keys:
-                self.messages = json.loads(
-                    await self.get_plugin_storage(STORAGE_KEY_MESSAGES)
-                )
+        schema_key = scoped_storage_key(st.scope, STORAGE_KEY_SCHEMA)
+        if schema_key not in keys:
+            sessions_key = scoped_storage_key(st.scope, STORAGE_KEY_SESSIONS)
+            messages_key = scoped_storage_key(st.scope, STORAGE_KEY_MESSAGES)
+            if sessions_key in keys:
+                st.sessions = json.loads(await self.get_plugin_storage(sessions_key))
+            if messages_key in keys:
+                st.messages = json.loads(await self.get_plugin_storage(messages_key))
             # Older versions also treated a null top-level snapshot as empty.
-            if self.sessions is None:
-                self.sessions = {}
-            if self.messages is None:
-                self.messages = {}
-            self._validate_storage()
+            if st.sessions is None:
+                st.sessions = {}
+            if st.messages is None:
+                st.messages = {}
+            self._validate_storage(st)
             # Nothing may be written until both legacy snapshots have been read.
-            for session_key in self.sessions.keys() | self.messages.keys():
-                await self._persist_session(session_key)
+            for session_key in st.sessions.keys() | st.messages.keys():
+                await self._persist_session(st, session_key)
             # Commit migration last. A failed migration simply retries the legacy data.
             await self._storage_mutation(
-                self.set_plugin_storage(STORAGE_KEY_SCHEMA, b"2")
+                st, self.set_plugin_storage(schema_key, b"2")
             )
             return
 
-        if await self.get_plugin_storage(STORAGE_KEY_SCHEMA) != b"2":
+        if await self.get_plugin_storage(schema_key) != b"2":
             raise ValueError("Unsupported HumanTakeover storage schema")
+        prefix = scoped_storage_key(st.scope, STORAGE_SESSION_PREFIX)
         for key in keys:
-            if not key.startswith(STORAGE_SESSION_PREFIX):
+            if not key.startswith(prefix):
                 continue
             record = json.loads(await self.get_plugin_storage(key))
             session_key = record["session_key"]
-            if self._session_storage_key(session_key) != key:
+            if self._session_storage_key(st, session_key) != key:
                 raise ValueError("HumanTakeover session storage key mismatch")
             if record["session"] is not None:
-                self.sessions[session_key] = record["session"]
+                st.sessions[session_key] = record["session"]
             if record["messages"] is not None:
-                self.messages[session_key] = record["messages"]
-        self._validate_storage()
+                st.messages[session_key] = record["messages"]
+        self._validate_storage(st)
 
-    def _validate_storage(self) -> None:
-        if not isinstance(self.sessions, dict) or not isinstance(self.messages, dict):
+    def _validate_storage(self, st: _InstallationState) -> None:
+        if not isinstance(st.sessions, dict) or not isinstance(st.messages, dict):
             raise ValueError("Invalid HumanTakeover storage: expected dictionaries")  # noqa: TRY004
-        if any(not isinstance(session, dict) for session in self.sessions.values()):
+        if any(not isinstance(session, dict) for session in st.sessions.values()):
             raise ValueError("Invalid HumanTakeover session storage")
         if any(
             not isinstance(bucket, list)
             or any(not isinstance(entry, dict) for entry in bucket)
-            for bucket in self.messages.values()
+            for bucket in st.messages.values()
         ):
             raise ValueError("Invalid HumanTakeover message storage")
 
-    async def _persist_session(self, session_key: str) -> None:
+    async def _persist_session(
+        self, st: _InstallationState, session_key: str
+    ) -> None:
         """Metadata + history commit together in one bounded KV value."""
         raw = json.dumps(
             {
                 "session_key": session_key,
-                "session": self.sessions.get(session_key),
-                "messages": self.messages.get(session_key),
+                "session": st.sessions.get(session_key),
+                "messages": st.messages.get(session_key),
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -189,27 +328,28 @@ class HumanTakeover(BasePlugin):
                 f"of {MAX_SESSION_STORAGE_BYTES} bytes; history has not been truncated"
             )
         await self._storage_mutation(
-            self.set_plugin_storage(self._session_storage_key(session_key), raw)
+            st,
+            self.set_plugin_storage(self._session_storage_key(st, session_key), raw),
         )
 
     @asynccontextmanager
     async def _session_update(self, session_key: str):
-        # Hold the existing lock through I/O so an older snapshot cannot win a race.
-        async with self._lock:
-            if not self._loaded:
-                raise RuntimeError("HumanTakeover storage is not initialized")
-            old_session = deepcopy(self.sessions.get(session_key))
-            old_messages = deepcopy(self.messages.get(session_key))
+        # Load before taking the lock (the loader takes it too), then hold this
+        # installation's lock through I/O so an older snapshot cannot win a race.
+        st = await self._state_for_update()
+        async with st.lock:
+            old_session = deepcopy(st.sessions.get(session_key))
+            old_messages = deepcopy(st.messages.get(session_key))
             committed = False
 
             async def commit():
                 nonlocal committed
-                await self._persist_session(session_key)
+                await self._persist_session(st, session_key)
                 committed = True
 
             try:
                 yield
-                if (self.sessions.get(session_key), self.messages.get(session_key)) != (
+                if (st.sessions.get(session_key), st.messages.get(session_key)) != (
                     old_session,
                     old_messages,
                 ):
@@ -221,34 +361,35 @@ class HumanTakeover(BasePlugin):
                 # Restore the last acknowledged cache, NOT proof of remote rejection.
                 # Ambiguous remote failures have already fenced further mutations.
                 if old_session is None:
-                    self.sessions.pop(session_key, None)
+                    st.sessions.pop(session_key, None)
                 else:
-                    self.sessions[session_key] = old_session
+                    st.sessions[session_key] = old_session
                 if old_messages is None:
-                    self.messages.pop(session_key, None)
+                    st.messages.pop(session_key, None)
                 else:
-                    self.messages[session_key] = old_messages
+                    st.messages[session_key] = old_messages
                 raise
 
     async def clear_all(self) -> None:
         """Delete only our data, serialized with updates; failures reach the caller."""
-        async with self._lock:
-            if not self._loaded:
-                raise RuntimeError("HumanTakeover storage is not initialized")
-            await self._finish_operation(self._clear_all())
+        st = await self._state_for_update()
+        async with st.lock:
+            await self._finish_operation(self._clear_all(st))
 
-    async def _clear_all(self) -> None:
+    async def _clear_all(self, st: _InstallationState) -> None:
         keys = await self.get_plugin_storage_keys()
         # Keep the schema marker: a restart must never resurrect the legacy backup.
+        legacy = {
+            scoped_storage_key(st.scope, STORAGE_KEY_SESSIONS),
+            scoped_storage_key(st.scope, STORAGE_KEY_MESSAGES),
+        }
+        prefix = scoped_storage_key(st.scope, STORAGE_SESSION_PREFIX)
         for key in keys:
-            if key in (
-                STORAGE_KEY_SESSIONS,
-                STORAGE_KEY_MESSAGES,
-            ) or key.startswith(STORAGE_SESSION_PREFIX):
-                await self._storage_mutation(self.delete_plugin_storage(key))
-        self.sessions = {}
-        self.messages = {}
-        logger.info("HumanTakeover storage cleared by user")
+            if key in legacy or key.startswith(prefix):
+                await self._storage_mutation(st, self.delete_plugin_storage(key))
+        st.sessions = {}
+        st.messages = {}
+        logger.info("HumanTakeover storage cleared for scope %s by user", st.scope)
 
     # ==================== 会话与消息 ====================
 
@@ -305,7 +446,8 @@ class HumanTakeover(BasePlugin):
         name: str,
         adapter: str = "",
     ) -> dict[str, Any]:
-        sess = self.sessions.get(session_key)
+        sessions = self.sessions
+        sess = sessions.get(session_key)
         if sess is None:
             sess = {
                 "session_key": session_key,
@@ -325,7 +467,7 @@ class HumanTakeover(BasePlugin):
                     "last_human_at": 0,
                 },
             }
-            self.sessions[session_key] = sess
+            sessions[session_key] = sess
         else:
             # 更新可能变化的元数据
             if bot_uuid:
@@ -462,8 +604,9 @@ class HumanTakeover(BasePlugin):
 
     async def expire_timeouts(self) -> None:
         """批量处理所有会话的接管超时(供 Page 轮询时调用)。"""
+        st = await self._state_for_update()
         now = time.time()
-        for session_key in list(self.sessions):
+        for session_key in list(st.sessions):
             async with self._session_update(session_key):
                 sess = self.sessions.get(session_key)
                 if not sess:
@@ -494,6 +637,7 @@ class HumanTakeover(BasePlugin):
 
         返回 (是否成功, 错误信息)。
         """
+        await self._state_for_update()
         sess = self.sessions.get(session_key)
         if not sess:
             return False, "session not found"

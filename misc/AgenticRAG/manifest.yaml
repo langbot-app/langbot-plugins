@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: AgenticRAG
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/AgenticRAG
-  version: 0.1.5
+  version: 0.1.6
   description:
     en_US: Agentic RAG plugin that exposes knowledge base retrieval as a Tool, allowing
       the Agent to autonomously decide when and what to search.
@@ -39,3 +39,5 @@ execution:
   python:
     path: main.py
     attr: AgenticRAG
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

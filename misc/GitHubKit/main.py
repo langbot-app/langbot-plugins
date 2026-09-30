@@ -13,6 +13,11 @@ from typing import Any, Optional
 import httpx
 
 from langbot_plugin.api.definition.plugin import BasePlugin
+from langbot_plugin.api.proxies.invocation import (
+    bind_invocation,
+    current_binding,
+    current_config,
+)
 
 # Allow importing the plugin-level i18n module.
 sys.path.insert(0, os.path.dirname(__file__))
@@ -20,6 +25,61 @@ from i18n import get_text  # noqa: E402
 
 API_BASE = "https://api.github.com"
 SUBS_KEY = "subscriptions"  # storage key for repo -> [subscribers] map
+
+# Give the runtime a moment to settle before the first poll (seconds).
+POLL_START_DELAY = 10
+
+# Process-cache slot used when no installation binding is available (dedicated
+# placement). It maps to the legacy storage key so existing dedicated installs
+# keep reading their own subscriptions.
+DEDICATED_SCOPE = "dedicated"
+
+# Written by the SDK worker launcher. A shared worker must always carry a trusted
+# invocation binding; without one it must refuse to touch tenant state instead of
+# falling back to a binding-less scope shared by every installation.
+RUNTIME_PROFILE_ENV = "LANGBOT_PLUGIN_RUNTIME_PROFILE"
+
+
+def installation_scope(binding) -> str:
+    """Return the stable scope token for one installation binding.
+
+    ``runtime_revision`` changes on every worker upgrade, so only the stable
+    installation identity triple is used; the revoked binding and the resumed
+    poller must resolve to the same scope.
+    """
+
+    return f"{binding.instance_uuid}:{binding.workspace_uuid}:{binding.installation_uuid}"
+
+
+def storage_key(scope: str) -> str:
+    """Return the plugin-storage key for one scope.
+
+    Host rows are keyed by ``[instance, workspace, owner_type, owner, key]`` with
+    no installation dimension, so the installation scope has to live in the
+    plugin's own key. The binding-less dedicated scope keeps the legacy key.
+    """
+
+    if scope == DEDICATED_SCOPE:
+        return SUBS_KEY
+    return f"{SUBS_KEY}:{scope}"
+
+
+class _Poller:
+    """背景轮询 belongs to exactly one installation binding.
+
+    The registry entry carries the poller's subscription lock, its captured
+    invocation config (token/interval/cap/language), and the task handle so
+    ``on_installation_revoked`` can stop it.
+    """
+
+    __slots__ = ("scope", "binding", "lock", "config", "task")
+
+    def __init__(self, scope: str, binding, config: dict[str, Any]) -> None:
+        self.scope = scope
+        self.binding = binding
+        self.lock = asyncio.Lock()
+        self.config = config
+        self.task: Optional[asyncio.Task] = None
 
 
 def _now_iso() -> str:
@@ -50,49 +110,139 @@ class GitHubKitPlugin(BasePlugin):
 
     # ------------------------------------------------------------- lifecycle
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._pollers: dict[str, _Poller] = {}
+
     async def initialize(self) -> None:
+        """Process-wide initialization only.
+
+        Under shared placement this runs once per worker with an empty config and
+        no installation context, so configuration is read per invocation and the
+        event poller is started lazily per installation binding instead.
+        """
+        return None
+
+    async def on_installation_revoked(self, binding) -> None:
+        """Stop the revoked installation's poller; only process-local state is available."""
+        poller = self._pollers.pop(installation_scope(binding), None)
+        if poller is None:
+            return
+        task = poller.task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def destroy(self) -> None:
+        """Stop every installation's poller (process end)."""
+        pending = [
+            poller.task
+            for poller in self._pollers.values()
+            if poller.task is not None and not poller.task.done()
+        ]
+        self._pollers.clear()
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    # --------------------------------------------------------- scope & config
+
+    def _current_scope(self) -> str:
+        binding = self.get_installation_binding()
+        if binding is not None:
+            return installation_scope(binding)
+        if os.environ.get(RUNTIME_PROFILE_ENV) == "shared":
+            raise RuntimeError(
+                "shared invocation has no trusted installation binding; "
+                "refusing to read or write tenant state"
+            )
+        return DEDICATED_SCOPE
+
+    def _poller_config(self) -> dict[str, Any]:
+        """Read the invoking installation's poll settings (never cached on the object)."""
         cfg = self.get_config() or {}
-        self.language: str = cfg.get("language", "en_US") or "en_US"
-        self.token: str = (cfg.get("github_token") or "").strip()
-        self.poll_interval: int = max(60, int(cfg.get("poll_interval", 120) or 120))
-        self.max_events: int = max(1, int(cfg.get("max_events_per_push", 5) or 5))
-        self._subs_lock = asyncio.Lock()
-        self._poll_task: Optional[asyncio.Task] = None
         try:
-            self._poll_task = asyncio.create_task(self._poll_loop())
-        except RuntimeError:
-            self._poll_task = None
+            interval = max(60, int(cfg.get("poll_interval", 120) or 120))
+        except (TypeError, ValueError):
+            interval = 120
+        try:
+            max_events = max(1, int(cfg.get("max_events_per_push", 5) or 5))
+        except (TypeError, ValueError):
+            max_events = 5
+        return {
+            "token": (cfg.get("github_token") or "").strip(),
+            "poll_interval": interval,
+            "max_events": max_events,
+            "language": cfg.get("language", "en_US") or "en_US",
+        }
 
     def get_language(self) -> str:
-        return getattr(self, "language", "en_US")
+        return self._poller_config()["language"]
 
     def t(self, key: str, **kwargs) -> str:
         return get_text(self.get_language(), key, **kwargs)
 
+    def _ensure_poller(self) -> _Poller:
+        """Start (or refresh) the poller belonging to the invoking installation.
+
+        One installation's subscriptions are polled by exactly one task, keyed by
+        the full binding; a worker upgrade (same installation, new revision)
+        restarts it with the new binding so Host calls stay authorized.
+        """
+        scope = self._current_scope()
+        binding = self.get_installation_binding()
+        handler = getattr(self, "plugin_runtime_handler", None)
+        inv_config = current_config(handler)
+        config = self._poller_config()
+        poller = self._pollers.get(scope)
+        if poller is not None and poller.binding == binding:
+            poller.config = config
+            return poller
+        if poller is not None and poller.task is not None and not poller.task.done():
+            poller.task.cancel()
+        poller = _Poller(scope, binding, config)
+        try:
+            poller.task = asyncio.create_task(
+                self._poll_loop(poller, handler, inv_config, binding)
+            )
+        except RuntimeError:
+            poller.task = None
+        self._pollers[scope] = poller
+        return poller
+
     def __del__(self) -> None:
-        task = getattr(self, "_poll_task", None)
-        if task and not task.done():
-            task.cancel()
+        for poller in getattr(self, "_pollers", {}).values():
+            if poller.task is not None and not poller.task.done():
+                poller.task.cancel()
 
     # --------------------------------------------------------------- http
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, token: str) -> dict[str, str]:
         h = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "LangBot-GitHubKit",
         }
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
+        if token:
+            h["Authorization"] = f"Bearer {token}"
         return h
 
     async def _get(
-        self, path: str, params: dict | None = None
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        token: Optional[str] = None,
     ) -> tuple[int, Any, dict]:
         """GET against the GitHub API. Returns (status, json_or_text, headers)."""
+        if token is None:
+            # Any invocation of this installation resumes its event poller.
+            self._ensure_poller()
+            token = self._poller_config()["token"]
         url = path if path.startswith("http") else f"{API_BASE}{path}"
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(url, headers=self._headers(), params=params or {})
+            r = await client.get(url, headers=self._headers(token), params=params or {})
             try:
                 body = r.json()
             except Exception:
@@ -282,9 +432,9 @@ class GitHubKitPlugin(BasePlugin):
 
     # ------------------------------------------------------- subscriptions
 
-    async def _load_subs(self) -> dict[str, Any]:
+    async def _load_subs(self, scope: str) -> dict[str, Any]:
         try:
-            raw = await self.get_plugin_storage(SUBS_KEY)
+            raw = await self.get_plugin_storage(storage_key(scope))
         except Exception:
             raw = None
         if not raw:
@@ -294,9 +444,9 @@ class GitHubKitPlugin(BasePlugin):
         except Exception:
             return {}
 
-    async def _save_subs(self, subs: dict[str, Any]) -> None:
+    async def _save_subs(self, scope: str, subs: dict[str, Any]) -> None:
         await self.set_plugin_storage(
-            SUBS_KEY, json.dumps(subs, ensure_ascii=False).encode("utf-8")
+            storage_key(scope), json.dumps(subs, ensure_ascii=False).encode("utf-8")
         )
 
     async def subscribe(
@@ -311,15 +461,17 @@ class GitHubKitPlugin(BasePlugin):
         repo = _norm_repo(repo)
         if not repo:
             return self.t("sub.usage")
-        status, body, _ = await self._get(f"/repos/{repo}")
+        poller = self._ensure_poller()
+        token = poller.config["token"]
+        status, body, _ = await self._get(f"/repos/{repo}", token=token)
         if status != 200:
             return self._err_msg(status, body)
-        async with self._subs_lock:
-            subs = await self._load_subs()
+        async with poller.lock:
+            subs = await self._load_subs(poller.scope)
             entry = subs.setdefault(repo, {"subscribers": {}, "last_event_id": None})
             if entry.get("last_event_id") is None:
                 st, ev, _ = await self._get(
-                    f"/repos/{repo}/events", {"per_page": 1}
+                    f"/repos/{repo}/events", {"per_page": 1}, token=token
                 )
                 if st == 200 and isinstance(ev, list) and ev:
                     entry["last_event_id"] = ev[0]["id"]
@@ -331,27 +483,34 @@ class GitHubKitPlugin(BasePlugin):
                 "lang": self.get_language(),
                 "added_at": _now_iso(),
             }
-            await self._save_subs(subs)
+            await self._save_subs(poller.scope, subs)
         evtxt = self.t("sub.all_events") if not events else self.t("misc.sep").join(events)
-        return self.t("sub.ok", repo=repo, events=evtxt, interval=self.poll_interval)
+        return self.t(
+            "sub.ok",
+            repo=repo,
+            events=evtxt,
+            interval=poller.config["poll_interval"],
+        )
 
     async def unsubscribe(self, repo: str, session_id: str) -> str:
         repo = _norm_repo(repo)
         if not repo:
             return self.t("unsub.usage")
-        async with self._subs_lock:
-            subs = await self._load_subs()
+        poller = self._ensure_poller()
+        async with poller.lock:
+            subs = await self._load_subs(poller.scope)
             entry = subs.get(repo)
             if not entry or session_id not in entry.get("subscribers", {}):
                 return self.t("unsub.not_subbed", repo=repo)
             del entry["subscribers"][session_id]
             if not entry["subscribers"]:
                 del subs[repo]
-            await self._save_subs(subs)
+            await self._save_subs(poller.scope, subs)
         return self.t("unsub.ok", repo=repo)
 
     async def list_subscriptions(self, session_id: str) -> str:
-        subs = await self._load_subs()
+        poller = self._ensure_poller()
+        subs = await self._load_subs(poller.scope)
         mine = []
         for repo, entry in subs.items():
             sub = entry.get("subscribers", {}).get(session_id)
@@ -365,39 +524,46 @@ class GitHubKitPlugin(BasePlugin):
 
     # --------------------------------------------------------- poller
 
-    async def _poll_loop(self) -> None:
-        await asyncio.sleep(10)
-        while True:
-            try:
-                await self._poll_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            await asyncio.sleep(self.poll_interval)
+    async def _poll_loop(self, poller: _Poller, handler, inv_config, binding) -> None:
+        """Poll one installation's subscriptions inside its captured invocation.
 
-    async def _poll_once(self) -> None:
-        async with self._subs_lock:
-            subs = await self._load_subs()
+        A detached task does not inherit a live invocation, so the config and
+        binding captured when the poller started are re-entered explicitly; this
+        keeps every storage/send call inside the originating installation.
+        """
+        with bind_invocation(handler, config=inv_config, binding=binding):
+            await asyncio.sleep(POLL_START_DELAY)
+            while True:
+                try:
+                    await self._poll_once(poller)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await asyncio.sleep(poller.config["poll_interval"])
+
+    async def _poll_once(self, poller: _Poller) -> None:
+        async with poller.lock:
+            subs = await self._load_subs(poller.scope)
             repos = list(subs.keys())
         if not repos:
             return
         for repo in repos:
             try:
-                await self._poll_repo(repo)
+                await self._poll_repo(poller, repo)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 continue
 
-    async def _poll_repo(self, repo: str) -> None:
+    async def _poll_repo(self, poller: _Poller, repo: str) -> None:
         status, events, _ = await self._get(
-            f"/repos/{repo}/events", {"per_page": 30}
+            f"/repos/{repo}/events", {"per_page": 30}, token=poller.config["token"]
         )
         if status != 200 or not isinstance(events, list):
             return
-        async with self._subs_lock:
-            subs = await self._load_subs()
+        async with poller.lock:
+            subs = await self._load_subs(poller.scope)
             entry = subs.get(repo)
             if not entry or not entry.get("subscribers"):
                 return
@@ -410,17 +576,17 @@ class GitHubKitPlugin(BasePlugin):
             if events:
                 entry["last_event_id"] = events[0]["id"]
             subscribers = dict(entry["subscribers"])
-            await self._save_subs(subs)
+            await self._save_subs(poller.scope, subs)
 
         if not new_events or last_id is None:
             return
 
         new_events.reverse()  # chronological order
-        new_events = new_events[-self.max_events :]
+        new_events = new_events[-poller.config["max_events"] :]
 
         for session_id, sub in subscribers.items():
             wanted = sub.get("events")  # None = all
-            lang = sub.get("lang", self.get_language())
+            lang = sub.get("lang", poller.config["language"])
             msgs = []
             for ev in new_events:
                 etype = _event_kind(ev)

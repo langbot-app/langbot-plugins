@@ -28,14 +28,25 @@ class FakeClient:
         return SimpleNamespace(data={"status": "accepted"}, request_id="req-capture")
 
 
-class FakePlugin:
+class FakeSettings:
+    scope_mode = "session"
     auto_recall = True
     capture_user_messages = True
     max_context_bytes = 4000
-    scope_mode = "session"
 
+    def __init__(self, client: "FakeClient") -> None:
+        self._client = client
+
+    def new_client(self) -> "FakeClient":
+        return self._client
+
+
+class FakePlugin:
     def __init__(self) -> None:
         self.client = FakeClient()
+
+    def settings(self) -> FakeSettings:
+        return FakeSettings(self.client)
 
     async def resolve_identity(self, **_kwargs):
         return SimpleNamespace(scope_id="scope-1", request_id="req-scope")

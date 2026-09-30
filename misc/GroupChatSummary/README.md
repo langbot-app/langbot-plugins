@@ -51,3 +51,13 @@ Bot: 📋 Group Chat Summary
 - @Alice: Prepare design mockups by Wednesday
 - @Bob: Set up CI/CD pipeline
 ```
+
+## Shared runtime
+
+`manifest.yaml` declares `sharedRuntime: shared-runtime-v1` +
+`componentModel: stateless-v1`, so this plugin can be placed on a multi-tenant
+shared worker: config is read per invocation, message buffers are keyed by
+installation binding and loaded on demand, and the detached auto-summary task is
+stopped in `on_installation_revoked`. See
+[SHARED_RUNTIME.md](SHARED_RUNTIME.md) for the details and known limits. This
+source is not certified.

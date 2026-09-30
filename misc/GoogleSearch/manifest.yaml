@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: GoogleSearch
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/GoogleSearch
-  version: 0.1.6
+  version: 0.1.7
   description:
     en_US: Search A tool for performing a Google SERP search and extracting snippets
       and webpages.Input should be a search query.
@@ -45,3 +45,5 @@ execution:
   python:
     path: main.py
     attr: GoogleSearch
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

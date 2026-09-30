@@ -93,3 +93,13 @@ deployment or a live database test.
 
 - **EventListener**: records messages, caches the adapter, matches trigger words, and blocks the AI while taken over.
 - **Page (`console`)**: the Web management console (`index.html` + `console.py`).
+
+## Shared runtime
+
+`manifest.yaml` declares `sharedRuntime: shared-runtime-v1` +
+`componentModel: stateless-v1`, so this plugin can be placed on a multi-tenant
+shared worker: config is read per invocation, sessions/history/storage keys are
+scoped to the installation binding and loaded on demand, and
+`on_installation_revoked` drops a revoked installation's cache. See
+[SHARED_RUNTIME.md](SHARED_RUNTIME.md) for the details and known limits. This
+source is not certified.

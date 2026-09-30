@@ -22,30 +22,30 @@ class ManagePage(Page):
         ep, method = request.endpoint, request.method
 
         if ep == "/state" and method == "GET":
-            return PageResponse.ok(plugin.snapshot())
+            return PageResponse.ok(await plugin.snapshot())
 
         if ep == "/settings" and method == "PUT":
             await plugin.update_settings(body)
-            return PageResponse.ok(plugin.snapshot())
+            return PageResponse.ok(await plugin.snapshot())
 
         if ep == "/session" and method == "PUT":
             session_id = body.get("id", "")
             if not await plugin.set_session_limit(session_id, body.get("limit")):
                 return PageResponse.fail("session not found")
-            return PageResponse.ok(plugin.snapshot())
+            return PageResponse.ok(await plugin.snapshot())
 
         if ep == "/session" and method == "DELETE":
             if not await plugin.delete_session(body.get("id", "")):
                 return PageResponse.fail("session not found")
-            return PageResponse.ok(plugin.snapshot())
+            return PageResponse.ok(await plugin.snapshot())
 
         if ep == "/reset" and method == "POST":
             if not await plugin.reset_session(body.get("id", "")):
                 return PageResponse.fail("session not found")
-            return PageResponse.ok(plugin.snapshot())
+            return PageResponse.ok(await plugin.snapshot())
 
         if ep == "/reset-all" and method == "POST":
             n = await plugin.reset_all()
-            return PageResponse.ok({**plugin.snapshot(), "reset_count": n})
+            return PageResponse.ok({**(await plugin.snapshot()), "reset_count": n})
 
         return PageResponse.fail(f"Unknown endpoint: {method} {ep}")

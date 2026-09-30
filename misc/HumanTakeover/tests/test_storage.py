@@ -83,6 +83,8 @@ async def open_plugin(host):
     plugin.config = {}
     plugin.plugin_runtime_handler = host
     await plugin.initialize()
+    # Shared placement loads tenant state on demand, per invocation.
+    await plugin.load_state()
     return plugin
 
 
@@ -208,7 +210,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.plugin.sessions, self.plugin.messages), before)
         self.host.failure = None
         # This fixture proves no request remains in flight; production must reconcile.
-        await self.plugin.initialize(storage_reconciled=True)
+        await self.plugin.reconcile()
         await record(self.plugin, content="retry")
         restarted = await open_plugin(self.host)
         self.assertEqual(restarted.messages, self.plugin.messages)
@@ -308,7 +310,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OSError):
             await self.plugin.clear_all()
         self.host.failure = None
-        await self.plugin.initialize(storage_reconciled=True)
+        await self.plugin.reconcile()
         await self.plugin.clear_all()
         self.assertEqual((await open_plugin(self.host)).messages, {})
 
@@ -456,12 +458,12 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         plugin = HumanTakeover()
         plugin.config = {}
         plugin.plugin_runtime_handler = host
-        loading = asyncio.create_task(plugin.initialize())
+        loading = asyncio.create_task(plugin.load_state())
         await host.started.wait()
         loading.cancel()
         await asyncio.sleep(0.01)
         loading.cancel()
-        following = asyncio.create_task(plugin.initialize())
+        following = asyncio.create_task(plugin.load_state())
         try:
             await asyncio.sleep(0.01)
             self.assertFalse(following.done())
@@ -494,7 +496,8 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                             if operation == "clear":
                                 await plugin.clear_all()
                             elif operation == "migration":
-                                await plugin.initialize()
+                                # Force a reload so the migration write is attempted.
+                                await plugin.reconcile()
                             else:
                                 await record(plugin, content="uncertain")
                         self.assertFalse(plugin._loaded)
@@ -503,12 +506,12 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(RuntimeError):
                             await plugin.clear_all()
                         with self.assertRaisesRegex(RuntimeError, "reconcil"):
-                            await plugin.initialize()
+                            await plugin.load_state()
                     finally:
                         host.release.set()
                         await host.remote
                     # The host is now known quiescent; an ordinary read was not proof.
-                    await plugin.initialize(storage_reconciled=True)
+                    await plugin.reconcile()
                     await record(plugin, content="after reconciliation")
                     self.assertEqual(
                         (await open_plugin(host)).messages, plugin.messages
@@ -521,7 +524,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         plugin.config = {}
         plugin.plugin_runtime_handler = self.host
         with self.assertRaises(OSError):
-            await plugin.initialize()
+            await plugin.load_state()
         self.host.failure = None
         with self.assertRaisesRegex(RuntimeError, "not initialized"):
             await record(plugin)

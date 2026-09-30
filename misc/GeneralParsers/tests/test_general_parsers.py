@@ -4,59 +4,12 @@ import sys
 import types
 import unittest
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 logging.disable(logging.CRITICAL)
-
-
-def _ensure_module(name: str) -> types.ModuleType:
-    module = sys.modules.get(name)
-    if module is None:
-        module = types.ModuleType(name)
-        module.__path__ = []
-        sys.modules[name] = module
-    if '.' in name:
-        parent_name, child_name = name.rsplit('.', 1)
-        parent = _ensure_module(parent_name)
-        setattr(parent, child_name, module)
-    return module
-
-
-def _install_langbot_stubs() -> None:
-    parser_module = _ensure_module('langbot_plugin.api.definition.components.parser.parser')
-    models_module = _ensure_module('langbot_plugin.api.entities.builtin.rag.models')
-
-    class Parser:
-        pass
-
-    @dataclass
-    class ParseContext:
-        file_content: bytes
-        filename: str
-        mime_type: str | None = None
-        metadata: dict | None = None
-
-    @dataclass
-    class ParseResult:
-        text: str
-        sections: list
-        metadata: dict
-
-    @dataclass
-    class TextSection:
-        content: str
-        heading: str
-        level: int
-        page: int | None = None
-
-    parser_module.Parser = Parser
-    models_module.ParseContext = ParseContext
-    models_module.ParseResult = ParseResult
-    models_module.TextSection = TextSection
 
 
 def _install_optional_dependency_stubs() -> None:
@@ -73,7 +26,6 @@ def _install_optional_dependency_stubs() -> None:
         sys.modules['fitz'] = types.ModuleType('fitz')
 
 
-_install_langbot_stubs()
 _install_optional_dependency_stubs()
 
 

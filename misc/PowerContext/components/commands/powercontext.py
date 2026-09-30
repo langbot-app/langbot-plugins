@@ -32,13 +32,14 @@ class PowerContext(Command):
             self: PowerContext,
             context: ExecuteContext,
         ) -> AsyncGenerator[CommandReturn, None]:
+            settings = self.plugin.settings()
             lines = ["[PowerContext]"]
-            lines.append(f"Server: {self.plugin.client.server_url}")
-            lines.append(f"Scope mode: {self.plugin.scope_mode}")
-            lines.append(f"Explicit Scope: {self.plugin.explicit_scope_id or '(none)'}")
-            lines.append(f"Default Scope fallback: {self.plugin.allow_default_scope}")
-            lines.append(f"Automatic recall: {self.plugin.auto_recall}")
-            lines.append(f"Source capture: {self.plugin.capture_user_messages}")
+            lines.append(f"Server: {settings.server_url}")
+            lines.append(f"Scope mode: {settings.scope_mode}")
+            lines.append(f"Explicit Scope: {settings.explicit_scope_id or '(none)'}")
+            lines.append(f"Default Scope fallback: {settings.allow_default_scope}")
+            lines.append(f"Automatic recall: {settings.auto_recall}")
+            lines.append(f"Source capture: {settings.capture_user_messages}")
             try:
                 resolved = await self.plugin.resolve_query(
                     session=context.session,
@@ -63,7 +64,7 @@ class PowerContext(Command):
         ) -> AsyncGenerator[CommandReturn, None]:
             lines = ["[PowerContext Health]"]
             try:
-                response = await self.plugin.client.liveness()
+                response = await self.plugin.settings().new_client().liveness()
                 lines.append(f"- OK: Server {response.data.get('status', 'live')}")
             except Exception as exc:
                 lines.append(f"- ERROR: Server unavailable ({_error_text(exc)})")
@@ -97,14 +98,15 @@ class PowerContext(Command):
                 yield CommandReturn(text="Usage: !powercontext bind <scope_id>")
                 return
             scope_id = context.crt_params[0].strip()
+            settings = self.plugin.settings()
             try:
                 identity = await self.plugin.query_identity(
                     session=context.session,
                     query_id=context.query_id,
                     query_uuid=context.query_uuid,
                 )
-                key = binding_key(identity, self.plugin.scope_mode)
-                response = await self.plugin.client.set_scope_binding(
+                key = binding_key(identity, settings.scope_mode)
+                response = await settings.new_client().set_scope_binding(
                     key=key, scope_id=scope_id
                 )
                 bound_scope = response.data.get("scope_id")
@@ -114,7 +116,7 @@ class PowerContext(Command):
                 yield CommandReturn(text=f"Error: {_error_text(exc)}")
                 return
             yield CommandReturn(
-                text=f"Bound current {self.plugin.scope_mode} identity to Scope {scope_id}."
+                text=f"Bound current {settings.scope_mode} identity to Scope {scope_id}."
             )
 
         @self.subcommand(
@@ -132,18 +134,19 @@ class PowerContext(Command):
                     text="Error: administrator privilege is required to change Scope bindings."
                 )
                 return
+            settings = self.plugin.settings()
             try:
                 identity = await self.plugin.query_identity(
                     session=context.session,
                     query_id=context.query_id,
                     query_uuid=context.query_uuid,
                 )
-                key = binding_key(identity, self.plugin.scope_mode)
-                response = await self.plugin.client.clear_scope_binding(key=key)
+                key = binding_key(identity, settings.scope_mode)
+                response = await settings.new_client().clear_scope_binding(key=key)
             except Exception as exc:
                 yield CommandReturn(text=f"Error: {_error_text(exc)}")
                 return
             status = "cleared" if response.data.get("cleared") else "not present"
             yield CommandReturn(
-                text=f"Current {self.plugin.scope_mode} binding: {status}."
+                text=f"Current {settings.scope_mode} binding: {status}."
             )

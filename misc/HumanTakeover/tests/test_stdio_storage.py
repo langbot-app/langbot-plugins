@@ -41,7 +41,8 @@ async def child():
             plugin = HumanTakeover()
             plugin.config = {}
             plugin.plugin_runtime_handler = handler
-            await plugin.initialize()
+            # Shared placement loads state on demand; load before seeding caches.
+            await plugin.load_state()
             for i in range(1200):
                 key = f"group_fixture-{i}"
                 plugin._ensure_session(key, "group", key, "fixture-bot", "fixture")
@@ -71,7 +72,8 @@ async def child():
             except ValueError as exc:
                 rejected = "storage limit" in str(exc)
             memory_preserved = plugin.messages["group_fixture-0"] == expected_large
-            await plugin.initialize()
+            # Force a real read-back from storage to prove the write landed.
+            await plugin.reconcile()
             return ActionResponse.success(
                 {
                     "aggregate_json_bytes": raw_total,

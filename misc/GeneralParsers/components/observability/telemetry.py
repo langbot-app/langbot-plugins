@@ -252,8 +252,73 @@ class ParserTelemetry:
             }
 
 
-_TELEMETRY = ParserTelemetry()
+def binding_scope(binding: Any) -> tuple[str, str, str] | None:
+    """Return the full installation scope for ``binding``, or ``None``.
+
+    The scope is the triple ``(instance_uuid, workspace_uuid,
+    installation_uuid)``. ``runtime_revision`` is deliberately excluded so a
+    worker upgrade keeps the same telemetry bucket. The binding object itself is
+    never stored; only this derived key is.
+    """
+
+    if binding is None:
+        return None
+    instance = _safe_text(getattr(binding, "instance_uuid", None), default="", limit=200)
+    workspace = _safe_text(getattr(binding, "workspace_uuid", None), default="", limit=200)
+    installation = _safe_text(getattr(binding, "installation_uuid", None), default="", limit=200)
+    if not (instance and workspace and installation):
+        return None
+    return (instance, workspace, installation)
 
 
-def get_telemetry() -> ParserTelemetry:
-    return _TELEMETRY
+class TelemetryRegistry:
+    """Binding-keyed telemetry stores for one artifact-digest worker.
+
+    One object graph serves every installation, so the process-wide registry
+    keeps one ``ParserTelemetry`` per full installation binding and a separate
+    "unscoped" store for direct (non-invocation) use. Binding state is released
+    by :meth:`release` from ``BasePlugin.on_installation_revoked``.
+    """
+
+    def __init__(self, recent_limit: int = 80) -> None:
+        self.recent_limit = max(1, int(recent_limit))
+        self._lock = RLock()
+        self._stores: dict[tuple[str, str, str], ParserTelemetry] = {}
+        self._unscoped = ParserTelemetry(recent_limit=self.recent_limit)
+
+    def for_binding(self, binding: Any) -> ParserTelemetry:
+        key = binding_scope(binding)
+        if key is None:
+            return self._unscoped
+        with self._lock:
+            store = self._stores.get(key)
+            if store is None:
+                store = ParserTelemetry(recent_limit=self.recent_limit)
+                self._stores[key] = store
+            return store
+
+    def release(self, binding: Any) -> None:
+        key = binding_scope(binding)
+        if key is None:
+            return
+        with self._lock:
+            self._stores.pop(key, None)
+
+    def scopes(self) -> list[tuple[str, str, str]]:
+        with self._lock:
+            return list(self._stores)
+
+
+_REGISTRY = TelemetryRegistry()
+
+
+def get_telemetry(binding: Any = None) -> ParserTelemetry:
+    """Return the telemetry store for the current installation binding."""
+
+    return _REGISTRY.for_binding(binding)
+
+
+def release_telemetry(binding: Any) -> None:
+    """Drop process-local telemetry held for one revoked installation."""
+
+    _REGISTRY.release(binding)

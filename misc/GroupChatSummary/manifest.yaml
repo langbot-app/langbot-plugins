@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: GroupChatSummary
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/GroupChatSummary
-  version: 0.1.3
+  version: 0.1.4
   description:
     en_US: Summarize group chat messages using LLM. Supports manual commands, LLM
       tool calls, and scheduled auto-summaries.
@@ -114,3 +114,5 @@ execution:
   python:
     path: main.py
     attr: GroupChatSummary
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

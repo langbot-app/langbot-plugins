@@ -40,3 +40,20 @@ returning. Host run concurrency/cgroup limits remain necessary. No daemon thread
 or executor uploads survive cancellation. Parent-owned private temporary directories
 are removed after reaping, including killed Tbox uploads. This is not proof of the
 production nsjail subprocess/rlimit policy; exercise that policy before signing.
+
+## Identity and per-invocation scope
+
+This plugin derives no upstream user identity. Unlike `coze`/`dify`/`n8n`/`tbox`/
+`weknora` there is no `pkg/scoped_identity.py` here and no user id is sent upstream.
+(It never had a `_get_user_tag` helper.)
+
+Read per invocation from `ctx.config` (never cached on the shared component):
+`app-type`, `api-key`, `app-id`, `remove-think`, `timeout` and the asset-gateway
+settings. Each run builds its own `DashScopeClient`, and every synchronous
+DashScope SDK call is executed in a fresh, killable subprocess with a private
+temporary cwd and a minimal environment (never the parent's cwd, secrets or
+import paths). `external.conversation_id` comes from Host-managed run state.
+
+Nothing is binding-keyed: the runner keeps no process cache, no detached
+tenant-bearing tasks and no module-level mutable tenant state, so
+`on_installation_revoked` has nothing to release.

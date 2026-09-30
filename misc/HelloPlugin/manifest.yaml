@@ -4,7 +4,7 @@ metadata:
   author: RockChinQ
   name: HelloPlugin
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/HelloPlugin
-  version: 0.1.3
+  version: 0.1.4
   description:
     en_US: This plugin is an experimental plugin that provides demos on `EventListener`,
       `Tool` and `Command` components.
@@ -41,3 +41,5 @@ execution:
   python:
     path: main.py
     attr: HelloPlugin
+  sharedRuntime: shared-runtime-v1
+  componentModel: stateless-v1

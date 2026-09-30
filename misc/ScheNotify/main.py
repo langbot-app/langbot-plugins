@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime
 import logging
 from typing import Any
@@ -10,53 +11,151 @@ from typing import Any
 from langbot_plugin.api.definition.plugin import BasePlugin
 from langbot_plugin.api.entities.builtin.platform import message as platform_message
 
+logger = logging.getLogger(__name__)
+
+# Prefix used for every notification. Language does not change it: the previous
+# per-config lookup returned this same literal for both supported languages.
+NOTIFY_PREFIX = "[Notify] "
+
+# How often each installation's scheduler wakes up to fire due events.
+CHECK_INTERVAL_SECONDS = 60
+
+# Scope used when the active invocation carries no installation binding.
+LEGACY_SCOPE = ""
+
+# Bounded wait for a revoked installation's loop to observe cancellation.
+LOOP_STOP_TIMEOUT = 5.0
+
+
+def _start_detached(coro: Any) -> asyncio.Task:
+    """Start one installation's scheduler with a context of its own.
+
+    A task created inside an invocation inherits that invocation's authority,
+    which is revoked when the invocation returns — every Host call it makes
+    afterwards then fails with "Plugin invocation has ended". The scheduler
+    therefore runs in a fresh context: it keeps its installation scope as an
+    explicit argument instead of reading it from an invocation.
+    """
+    return contextvars.Context().run(asyncio.create_task, coro)
+
 
 class ScheNotify(BasePlugin):
     """
     Schedule notification plugin.
     Allows users to schedule notifications using natural language through LLM.
+
+    One object graph serves every installation of this artifact digest, so the
+    schedule and its background checker belong to the installation that created
+    them and are released in ``on_installation_revoked``.
     """
 
     def __init__(self):
         super().__init__()
-        self.scheduled_events: list[dict[str, Any]] = []
-        self.logger = logging.getLogger(__name__)
+        # Installation-keyed process state, released on revocation.
+        self._events: dict[str, list[dict[str, Any]]] = {}
+        self._loops: dict[str, asyncio.Task] = {}
 
     async def initialize(self) -> None:
-        """Initialize the plugin and start the check loop"""
-        # Start the background task to check scheduled events
-        asyncio.create_task(self._check_loop_wrapper())
-        self.logger.info("ScheNotify plugin initialized")
+        """Process-scoped initialization only.
 
-    async def _check_loop_wrapper(self):
-        """Wrapper for the check loop to handle continuous execution"""
+        The scheduler loop is bound to an installation, so it is started lazily
+        by the first scheduling invocation of that installation, never here.
+        """
+        logger.info("ScheNotify plugin initialized")
+
+    async def on_installation_revoked(self, binding) -> None:
+        """Stop one installation's scheduler and drop its pending schedule."""
+        scope = self._scope(binding)
+        await self._stop_loop(scope)
+        self._events.pop(scope, None)
+
+    def __del__(self):
+        logger.info("ScheNotify plugin unloaded")
+        for task in list(getattr(self, "_loops", {}).values()):
+            if not task.done():
+                task.cancel()
+
+    # ------------------------------------------------------------------ #
+    # Installation scoping
+    # ------------------------------------------------------------------ #
+    def _scope(self, binding: Any | None = None) -> str:
+        """Return the full installation scope of this invocation.
+
+        The whole binding is used so two Workspaces that reuse an installation
+        UUID never share a schedule. Only the installation identity matters: a
+        worker upgrade revokes the superseded binding.
+        """
+        if binding is None:
+            binding = self.get_installation_binding()
+        if binding is None:
+            return LEGACY_SCOPE
+        return f"{binding.instance_uuid}:{binding.workspace_uuid}:{binding.installation_uuid}"
+
+    def _events_for_scope(self, scope: str) -> list[dict[str, Any]]:
+        return self._events.get(scope, [])
+
+    def _ensure_loop(self, scope: str) -> None:
+        """Start the scheduler of one installation from inside its invocation."""
+        task = self._loops.get(scope)
+        if task is not None and not task.done():
+            return
+        self._loops[scope] = _start_detached(self._check_loop_wrapper(scope))
+
+    async def _stop_loop(self, scope: str) -> None:
+        task = self._loops.pop(scope, None)
+        if task is None:
+            return
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=LOOP_STOP_TIMEOUT)
+        if not done:
+            logger.warning(
+                "ScheNotify scheduler for installation scope %s did not stop in %ss",
+                scope,
+                LOOP_STOP_TIMEOUT,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Scheduler
+    # ------------------------------------------------------------------ #
+    async def _check_loop_wrapper(self, scope: str):
+        """Check one installation's due events until that binding is revoked.
+
+        The loop carries its installation scope explicitly instead of reading it
+        from an invocation: detached work has no invocation context, so it never
+        reads config or any other invocation-scoped API.
+        """
         while True:
             try:
-                await self._check_scheduled_events()
+                await self._check_scheduled_events(scope)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self.logger.error(f"Error in check loop: {e}", exc_info=True)
-            await asyncio.sleep(60)  # Check every minute
+                logger.error(f"Error in check loop: {e}", exc_info=True)
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)  # Check every minute
 
-    async def _check_scheduled_events(self):
-        """Check scheduled events and send notifications for due events"""
+    async def _check_scheduled_events(self, scope: str):
+        """Send notifications for this installation's due events."""
         now = datetime.datetime.now()
-        self.logger.info(f"Checking scheduled events at {now}")
-        self.logger.debug(f"Scheduled events: {self.scheduled_events}")
+        logger.info(f"Checking scheduled events at {now}")
+        events = self._events.get(scope)
+        if not events:
+            return
+        logger.debug(f"Scheduled events: {events}")
 
         events_to_remove = []
 
-        for event in self.scheduled_events:
+        for event in events:
             if now >= event["time"]:
                 # Send notification
                 try:
                     await self._send_notification(event)
                     events_to_remove.append(event)
                 except Exception as e:
-                    self.logger.error(f"Failed to send notification: {e}", exc_info=True)
+                    logger.error(f"Failed to send notification: {e}", exc_info=True)
 
         # Remove sent events
         for event in events_to_remove:
-            self.scheduled_events.remove(event)
+            events.remove(event)
 
     async def _send_notification(self, event: dict[str, Any]):
         """
@@ -65,13 +164,8 @@ class ScheNotify(BasePlugin):
         Args:
             event: Event dict containing session info and message
         """
-        # Get language setting
-        config = self.get_config()
-        language = config.get("language", "zh_Hans")
-        prefix = "[Notify] " if language == "en_US" else "[Notify] "
-
         message_chain = platform_message.MessageChain([
-            platform_message.Plain(text=f"{prefix}{event['message']}")
+            platform_message.Plain(text=f"{NOTIFY_PREFIX}{event['message']}")
         ])
 
         # Send message using saved session info
@@ -83,7 +177,7 @@ class ScheNotify(BasePlugin):
                 message_chain=message_chain
             )
         except Exception as e:
-            self.logger.error(f"Failed to send message: {e}", exc_info=True)
+            logger.error(f"Failed to send message: {e}", exc_info=True)
 
     async def add_scheduled_event(
         self,
@@ -103,43 +197,46 @@ class ScheNotify(BasePlugin):
             target_type: "person" or "group"
             target_id: Target ID
         """
-        self.scheduled_events.append({
+        scope = self._scope()
+        self._events.setdefault(scope, []).append({
             "time": time,
             "message": message,
             "bot_uuid": bot_uuid,
             "target_type": target_type,
             "target_id": target_id,
         })
+        self._ensure_loop(scope)
 
     async def get_scheduled_events(self, target_id: str | None = None) -> list[dict[str, Any]]:
         """
-        Get scheduled events, optionally filtered by target_id.
+        Get this installation's scheduled events, optionally filtered by target_id.
 
         Args:
             target_id: Optional target ID for filtering
 
         Returns:
-            List of scheduled events
+            List of scheduled events (a copy; mutating it does not change the schedule)
         """
+        scope = self._scope()
+        events = self._events_for_scope(scope)
+
         if target_id is None:
-            return self.scheduled_events
+            return list(events)
 
         # Filter by target_id
         return [
-            event for event in self.scheduled_events
+            event for event in events
             if event.get("target_id") == target_id
         ]
 
     async def delete_scheduled_event(self, event: dict[str, Any]):
         """
-        Delete a scheduled event.
+        Delete a scheduled event of this installation.
 
         Args:
             event: Event to delete
         """
-        if event in self.scheduled_events:
-            self.scheduled_events.remove(event)
-
-    def __del__(self):
-        """Cleanup when plugin is unloaded"""
-        self.logger.info("ScheNotify plugin unloaded")
+        scope = self._scope()
+        events = self._events_for_scope(scope)
+        if event in events:
+            events.remove(event)

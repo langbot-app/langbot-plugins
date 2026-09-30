@@ -1,12 +1,15 @@
 from datetime import datetime
 from typing import Union, Optional
 
+import asyncio
 import logging as logger
 
-import requests
-from httpx import Response
+import httpx
 
 from pkg.model import AirApi, NowApi, DailyApi, HourlyApi, WarningApi, WeatherInfo, SunApi
+
+
+_REQUEST_TIMEOUT = 10.0
 
 
 class APIError(Exception):
@@ -21,13 +24,12 @@ class CityNotFoundError(Exception):
     ...
 
 
-def _get_data(url: str, params: dict) -> Response:
-    with requests.Session() as client:
-        res = client.get(url, params=params)
-    return res
+async def _get_data(url: str, params: dict) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+        return await client.get(url, params=params)
 
 
-def _check_response(response: Response) -> bool:
+def _check_response(response: httpx.Response) -> bool:
     if response.status_code == 200:
         logger.debug(f"{response.json()}")
         return True
@@ -70,8 +72,8 @@ class Weather:
         self.__url__()
         self.__reference = "\n请参考: https://dev.qweather.com/docs/start/status-code/"
 
-    def load_data(self):
-        self.city_id = self._get_city_id()
+    async def load_data(self):
+        self.city_id = await self._get_city_id()
         (
             self.now,
             self.daily,
@@ -80,13 +82,13 @@ class Weather:
             self.hourly,
             self.info,
             self.sun
-        ) = (
-            self._now, self._daily, self._air, self._warning, self._hourly, self._info, self._sun
+        ) = await asyncio.gather(
+            self._now(), self._daily(), self._air(), self._warning(), self._hourly(), self._info(), self._sun()
         )
         self._data_validate()
 
-    def _get_city_id(self, api_type: str = "lookup"):
-        res = _get_data(
+    async def _get_city_id(self, api_type: str = "lookup"):
+        res = await _get_data(
             url=self.url_geoapi + api_type,
             params={"location": self.city_name, "key": self.apikey, "number": 1},
         )
@@ -114,65 +116,58 @@ class Weather:
                 + self.__reference
             )
 
-    @property
-    def _now(self) -> NowApi:
-        res = _get_data(
+    async def _now(self) -> NowApi:
+        res = await _get_data(
             url=self.url_weather_api + "now",
             params={"location": self.city_id, "key": self.apikey},
         )
         _check_response(res)
         return NowApi(**res.json())
 
-    @property
-    def _daily(self) -> DailyApi:
-        res = _get_data(
+    async def _daily(self) -> DailyApi:
+        res = await _get_data(
             url=self.url_weather_api + str(self.forecast_days) + "d",
             params={"location": self.city_id, "key": self.apikey},
         )
         _check_response(res)
         return DailyApi(**res.json())
 
-    @property
-    def _air(self) -> AirApi:
-        res = _get_data(
+    async def _air(self) -> AirApi:
+        res = await _get_data(
             url=self.url_air,
             params={"location": self.city_id, "key": self.apikey},
         )
         _check_response(res)
         return AirApi(**res.json())
 
-    @property
-    def _warning(self) -> Optional[WarningApi]:
-        res = _get_data(
+    async def _warning(self) -> Optional[WarningApi]:
+        res = await _get_data(
             url=self.url_weather_warning,
             params={"location": self.city_id, "key": self.apikey},
         )
         _check_response(res)
         return None if res.json().get("code") == "204" else WarningApi(**res.json())
 
-    @property
-    def _hourly(self) -> HourlyApi:
-        res = _get_data(
+    async def _hourly(self) -> HourlyApi:
+        res = await _get_data(
             url=self.url_hourly,
             params={"location": self.city_id, "key": self.apikey},
         )
         _check_response(res)
         return HourlyApi(**res.json())
 
-    @property
-    def _info(self) -> WeatherInfo:
-        res = _get_data(
+    async def _info(self) -> WeatherInfo:
+        res = await _get_data(
             url=self.url_info,
             params={"location": self.city_id, "key": self.apikey, "type": self.qweather_info, 'lang': 'zh'}
         )
         _check_response(res)
         return WeatherInfo(**res.json())
 
-    @property
-    def _sun(self) -> SunApi:
+    async def _sun(self) -> SunApi:
         now = datetime.now()
         formatted_time = now.strftime('%Y%m%d')
-        res = _get_data(
+        res = await _get_data(
             url=self.url_sun,
             params={"location": self.city_id, "key": self.apikey, "date": formatted_time, 'lang': 'zh'}
         )

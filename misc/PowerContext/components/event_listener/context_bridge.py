@@ -52,13 +52,15 @@ class ContextBridge(EventListener):
     async def _process_turn(self, event_ctx: context.EventContext) -> None:
         plugin = self.plugin
         event = event_ctx.event
+        settings = plugin.settings()
+        client = settings.new_client()
         state: dict[str, Any] = {
             "status": "starting",
             "scope_id": None,
             "injected": False,
             "content_bytes": 0,
             "source_capture": "disabled"
-            if not plugin.capture_user_messages
+            if not settings.capture_user_messages
             else "pending",
         }
 
@@ -81,7 +83,7 @@ class ContextBridge(EventListener):
                 {
                     "status": "resolved",
                     "scope_id": resolved.scope_id,
-                    "scope_mode": plugin.scope_mode,
+                    "scope_mode": settings.scope_mode,
                     "request_id": resolved.request_id,
                 }
             )
@@ -101,12 +103,12 @@ class ContextBridge(EventListener):
             await self._publish_state(event_ctx, state)
             return
 
-        if plugin.auto_recall:
+        if settings.auto_recall:
             try:
-                prepared = await plugin.client.prepare_context(
+                prepared = await client.prepare_context(
                     scope_id=resolved.scope_id,
                     query=query[:8192],
-                    max_bytes=plugin.max_context_bytes,
+                    max_bytes=settings.max_context_bytes,
                 )
                 prepared_status = str(prepared.data.get("status", "empty"))
                 prepared_content = prepared.data.get("content")
@@ -141,7 +143,7 @@ class ContextBridge(EventListener):
         else:
             state["status"] = "recall_disabled"
 
-        if plugin.capture_user_messages:
+        if settings.capture_user_messages:
             try:
                 source_id = plugin.source_id(
                     query_uuid=event_ctx.query_uuid,
@@ -152,7 +154,7 @@ class ContextBridge(EventListener):
                 speaker = sender_name or (
                     f"speaker:{sender_id}" if sender_id else "unknown speaker"
                 )
-                capture = await plugin.client.capture_content(
+                capture = await client.capture_content(
                     scope_id=resolved.scope_id,
                     source_id=source_id,
                     content=f"LangBot user message from {speaker}:\n{query}",
@@ -160,7 +162,7 @@ class ContextBridge(EventListener):
                         "integration": "langbot",
                         "event": "PromptPreProcessing",
                         "query_uuid": event_ctx.query_uuid,
-                        "scope_mode": plugin.scope_mode,
+                        "scope_mode": settings.scope_mode,
                     },
                 )
                 state["source_capture"] = str(capture.data.get("status", "accepted"))

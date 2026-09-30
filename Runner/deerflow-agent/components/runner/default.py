@@ -115,12 +115,6 @@ class DefaultRunner(Runner):
         except (TypeError, ValueError):
             raise DeerFlowConfigError(f"{name} must be an integer") from None
 
-    def _get_user_tag(self, ctx: RunnerContext) -> str:
-        actor = ctx.actor
-        if actor and actor.actor_id:
-            return f"{actor.actor_type}_{actor.actor_id}"
-        return f"user_{ctx.run_id}"
-
     def _should_stream(self, ctx: RunnerContext) -> bool:
         configured = (ctx.config or {}).get("streaming")
         if configured is not None:

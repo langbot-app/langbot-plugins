@@ -40,10 +40,11 @@ class Forget(Tool):
             "entry_version_id": entry_version_id.strip(),
         }
         try:
+            settings = self.plugin.settings()
             resolved = await self.plugin.resolve_query(
                 session=session, query_id=query_id
             )
-            await self.plugin.client.retire_memory(
+            await settings.new_client().retire_memory(
                 scope_id=resolved.scope_id,
                 citation=citation,
                 reason=reason.strip()

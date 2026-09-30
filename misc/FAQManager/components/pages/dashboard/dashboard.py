@@ -10,7 +10,7 @@ class DashboardPage(Page):
         plugin = self.plugin
 
         if request.endpoint == '/stats':
-            entries = plugin.entries
+            entries = await plugin.get_entries()
             total = len(entries)
             avg_len = 0
             if total > 0:

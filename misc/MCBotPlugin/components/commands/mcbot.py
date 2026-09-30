@@ -90,7 +90,7 @@ class MCBot(Command):
             group_key = self.plugin.group_key(
                 ctx.session.launcher_type.value, ctx.session.launcher_id
             )
-            server_addr = self.plugin.get_bound_server(group_key)
+            server_addr = await self.plugin.get_bound_server(group_key)
             if not server_addr:
                 yield CommandReturn(text="[MCBot] 当前未绑定服务器。")
                 return
@@ -130,7 +130,7 @@ class MCBot(Command):
             group_key = self.plugin.group_key(
                 ctx.session.launcher_type.value, ctx.session.launcher_id
             )
-            server_addr = self.plugin.get_bound_server(group_key)
+            server_addr = await self.plugin.get_bound_server(group_key)
             if not server_addr:
                 yield CommandReturn(text="[MCBot] 当前未绑定服务器。")
                 return
@@ -148,7 +148,7 @@ class MCBot(Command):
                     )
                     return
 
-            stats = self.plugin.count_playtime(server_addr, period)
+            stats = await self.plugin.count_playtime(server_addr, period)
             if not stats:
                 yield CommandReturn(
                     text=f"[MCBot] 最近 {period} 分钟内暂无在线记录。"

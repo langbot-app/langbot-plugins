@@ -7,16 +7,55 @@ import os
 import sys
 import json
 import time
+import asyncio
 import datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from langbot_plugin.api.definition.plugin import BasePlugin
 
 from fsrs import Scheduler, Card, Rating
 
+if TYPE_CHECKING:
+    from langbot_plugin.entities.io.context import InstallationBinding
+
 # Allow importing the plugin-level i18n module.
 sys.path.insert(0, os.path.dirname(__file__))
 from i18n import get_text  # noqa: E402
+
+# Manifest defaults, used when an invocation carries no explicit value.
+DEFAULT_LANGUAGE = "en_US"
+DEFAULT_DAILY_NEW_LIMIT = 20
+DEFAULT_DESIRED_RETENTION = 0.9
+RETENTION_MIN = 0.7
+RETENTION_MAX = 0.97
+
+# Scope token used when no installation binding is available (dedicated or
+# binding-less placement). It maps to the legacy deck key so those workers keep
+# reading their own historical rows.
+DEDICATED_SCOPE = "dedicated"
+
+
+def installation_scope(binding: "InstallationBinding") -> str:
+    """Return the stable scope token for one installation binding.
+
+    Host storage rows are keyed by ``[instance, workspace, owner_type, owner,
+    key]`` with no installation dimension, so the installation scope has to live
+    in the plugin's own key. ``runtime_revision`` is deliberately excluded: it
+    changes on every worker upgrade and would orphan the tenant's decks.
+    """
+
+    return (
+        f"{binding.instance_uuid}:{binding.workspace_uuid}:"
+        f"{binding.installation_uuid}"
+    )
+
+
+def deck_storage_key(scope: str, session_id: str) -> str:
+    """Return the plugin-storage key for one installation scope and session."""
+
+    if scope == DEDICATED_SCOPE:
+        return f"deck:{session_id}"
+    return f"deck:{scope}:{session_id}"
 
 
 # Rating aliases users can type after `!word grade <word>`.
@@ -50,35 +89,88 @@ def _now() -> datetime.datetime:
 class WordFSRSPlugin(BasePlugin):
     """Entry point and shared state for the WordFSRS plugin.
 
+    One object graph serves every installation of this artifact, so tenant
+    settings (language / daily new-card limit / desired retention) are read
+    from the *current invocation* config on every use; ``initialize()`` never
+    captures them (shared placement initializes it with an empty config).
+
     All persistent vocabulary data is scoped per *session*
     (``{launcher_type}:{launcher_id}``) so private chats and groups each keep
-    their own deck. State is stored as JSON via the plugin KV storage.
+    their own deck. State is stored as JSON via the plugin KV storage under
+    ``deck:{instance}:{workspace}:{installation}:{session}`` because Host rows
+    carry no installation dimension; only binding-less (dedicated) workers use
+    the legacy ``deck:{session}`` row.
     """
 
-    async def initialize(self) -> None:
-        cfg = self.get_config() or {}
-        self.language: str = cfg.get("language", "en_US") or "en_US"
-        self.daily_new_limit: int = int(cfg.get("daily_new_limit", 20) or 0)
-        retention = float(cfg.get("desired_retention", 0.9) or 0.9)
-        retention = min(0.97, max(0.7, retention))
-        self.scheduler = Scheduler(desired_retention=retention)
+    def __init__(self) -> None:
+        super().__init__()
+        # Read-modify-write guards, one per installation binding, so a deck
+        # load/modify/save sequence cannot interleave with another command of
+        # the same installation and lose cards. Released in
+        # on_installation_revoked().
+        self._deck_locks: dict[str, asyncio.Lock] = {}
+
+    # ---------------------------------------------------------- tenant config
+
+    def _invocation_config(self) -> dict[str, Any]:
+        """Settings of the active invocation (or the dedicated worker config)."""
+        return self.get_config() or {}
 
     def get_language(self) -> str:
-        return getattr(self, "language", "en_US")
+        return self._invocation_config().get("language") or DEFAULT_LANGUAGE
 
     def t(self, key: str, **kwargs) -> str:
         return get_text(self.get_language(), key, **kwargs)
 
+    def _daily_new_limit(self) -> int:
+        raw = self._invocation_config().get("daily_new_limit")
+        if raw is None or raw == "":
+            return DEFAULT_DAILY_NEW_LIMIT
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_DAILY_NEW_LIMIT
+
+    def _desired_retention(self) -> float:
+        raw = self._invocation_config().get("desired_retention")
+        if raw is None or raw == "":
+            return DEFAULT_DESIRED_RETENTION
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_DESIRED_RETENTION
+        return min(RETENTION_MAX, max(RETENTION_MIN, value))
+
+    def _scheduler(self) -> Scheduler:
+        """Build a scheduler from the current invocation's retention."""
+        return Scheduler(desired_retention=self._desired_retention())
+
+    # -------------------------------------------------------- revocation hook
+
+    def _current_scope(self) -> str:
+        """Scope token of the active invocation, or the binding-less scope."""
+        binding = self.get_installation_binding()
+        return installation_scope(binding) if binding is not None else DEDICATED_SCOPE
+
+    def _deck_lock(self) -> asyncio.Lock:
+        key = self._current_scope()
+        lock = self._deck_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._deck_locks[key] = lock
+        return lock
+
+    async def on_installation_revoked(self, binding: InstallationBinding) -> None:
+        """Release the revoked installation's read-modify-write guard."""
+        self._deck_locks.pop(installation_scope(binding), None)
+
     # ---------------------------------------------------------------- storage
 
-    @staticmethod
-    def _storage_key(session_id: str) -> str:
-        return f"deck:{session_id}"
-
     async def _load_deck(self, session_id: str) -> dict[str, Any]:
-        """Load a session deck. Returns a fresh deck on first use."""
+        """Load the current installation's deck for one session."""
+        key = deck_storage_key(self._current_scope(), session_id)
         try:
-            raw = await self.get_plugin_storage(self._storage_key(session_id))
+            raw = await self.get_plugin_storage(key)
         except Exception:
             raw = None
         if not raw:
@@ -93,7 +185,9 @@ class WordFSRSPlugin(BasePlugin):
 
     async def _save_deck(self, session_id: str, deck: dict[str, Any]) -> None:
         payload = json.dumps(deck, ensure_ascii=False).encode("utf-8")
-        await self.set_plugin_storage(self._storage_key(session_id), payload)
+        await self.set_plugin_storage(
+            deck_storage_key(self._current_scope(), session_id), payload
+        )
 
     # ----------------------------------------------------------------- helpers
 
@@ -132,36 +226,38 @@ class WordFSRSPlugin(BasePlugin):
         word = word.strip()
         if not word:
             return False, self.t("add.usage")
-        deck = await self._load_deck(session_id)
-        key = word.lower()
-        if key in deck["cards"]:
-            entry = deck["cards"][key]
-            if meaning:
-                entry["meaning"] = meaning
-                await self._save_deck(session_id, deck)
-                return False, self.t("add.updated", word=word, meaning=meaning)
-            return False, self.t("add.exists", word=word)
-        card = Card()
-        deck["cards"][key] = {
-            "word": word,
-            "meaning": meaning,
-            "fsrs": card.to_dict(),
-            "added_at": time.time(),
-            "reviews": 0,
-        }
-        await self._save_deck(session_id, deck)
-        total = len(deck["cards"])
-        tip = self.t("add.meaning_line", meaning=meaning) if meaning else ""
-        return True, self.t("add.ok", word=word, tip=tip, total=total)
+        async with self._deck_lock():
+            deck = await self._load_deck(session_id)
+            key = word.lower()
+            if key in deck["cards"]:
+                entry = deck["cards"][key]
+                if meaning:
+                    entry["meaning"] = meaning
+                    await self._save_deck(session_id, deck)
+                    return False, self.t("add.updated", word=word, meaning=meaning)
+                return False, self.t("add.exists", word=word)
+            card = Card()
+            deck["cards"][key] = {
+                "word": word,
+                "meaning": meaning,
+                "fsrs": card.to_dict(),
+                "added_at": time.time(),
+                "reviews": 0,
+            }
+            await self._save_deck(session_id, deck)
+            total = len(deck["cards"])
+            tip = self.t("add.meaning_line", meaning=meaning) if meaning else ""
+            return True, self.t("add.ok", word=word, tip=tip, total=total)
 
     async def remove_word(self, session_id: str, word: str) -> str:
-        deck = await self._load_deck(session_id)
-        key = word.strip().lower()
-        if key not in deck["cards"]:
-            return self.t("del.not_found", word=word)
-        del deck["cards"][key]
-        await self._save_deck(session_id, deck)
-        return self.t("del.ok", word=word, total=len(deck["cards"]))
+        async with self._deck_lock():
+            deck = await self._load_deck(session_id)
+            key = word.strip().lower()
+            if key not in deck["cards"]:
+                return self.t("del.not_found", word=word)
+            del deck["cards"][key]
+            await self._save_deck(session_id, deck)
+            return self.t("del.ok", word=word, total=len(deck["cards"]))
 
     async def next_due(self, session_id: str) -> tuple[Optional[str], str]:
         """Pick the next card to review.
@@ -193,13 +289,14 @@ class WordFSRSPlugin(BasePlugin):
         if new_items:
             today = now.date().isoformat()
             introduced_today = deck["new_intro"].get(today, 0)
-            if self.daily_new_limit == 0 or introduced_today < self.daily_new_limit:
+            limit = self._daily_new_limit()
+            if limit == 0 or introduced_today < limit:
                 k, e = new_items[0]
                 return k, self._format_question(e, deck, session_id, kind="new")
             else:
                 soonest = self._soonest_msg(cards, now)
                 return None, self.t(
-                    "review.new_limit", limit=self.daily_new_limit, soonest=soonest
+                    "review.new_limit", limit=limit, soonest=soonest
                 )
 
         soonest = self._soonest_msg(cards, now)
@@ -240,26 +337,27 @@ class WordFSRSPlugin(BasePlugin):
     async def grade(
         self, session_id: str, word: str, rating_token: str
     ) -> str:
-        deck = await self._load_deck(session_id)
-        key = word.strip().lower()
-        e = deck["cards"].get(key)
-        if not e:
-            return self.t("grade.not_found", word=word)
-        rating = RATING_ALIASES.get(rating_token.strip().lower())
-        if rating is None:
-            return self.t("grade.invalid")
-        was_new = e.get("reviews", 0) == 0
-        card = Card.from_dict(e["fsrs"])
-        card, _log = self.scheduler.review_card(card, rating)
-        e["fsrs"] = card.to_dict()
-        e["reviews"] = e.get("reviews", 0) + 1
-        e["last_rating"] = int(rating)
+        async with self._deck_lock():
+            deck = await self._load_deck(session_id)
+            key = word.strip().lower()
+            e = deck["cards"].get(key)
+            if not e:
+                return self.t("grade.not_found", word=word)
+            rating = RATING_ALIASES.get(rating_token.strip().lower())
+            if rating is None:
+                return self.t("grade.invalid")
+            was_new = e.get("reviews", 0) == 0
+            card = Card.from_dict(e["fsrs"])
+            card, _log = self._scheduler().review_card(card, rating)
+            e["fsrs"] = card.to_dict()
+            e["reviews"] = e.get("reviews", 0) + 1
+            e["last_rating"] = int(rating)
 
-        if was_new:
-            today = _now().date().isoformat()
-            deck["new_intro"][today] = deck["new_intro"].get(today, 0) + 1
+            if was_new:
+                today = _now().date().isoformat()
+                deck["new_intro"][today] = deck["new_intro"].get(today, 0) + 1
 
-        await self._save_deck(session_id, deck)
+            await self._save_deck(session_id, deck)
         due = card.due
         if due.tzinfo is None:
             due = due.replace(tzinfo=datetime.timezone.utc)
@@ -296,7 +394,8 @@ class WordFSRSPlugin(BasePlugin):
         learning = total - new_cnt
         today = now.date().isoformat()
         intro_today = deck["new_intro"].get(today, 0)
-        limit_str = self.t("stats.unlimited") if self.daily_new_limit == 0 else str(self.daily_new_limit)
+        limit = self._daily_new_limit()
+        limit_str = self.t("stats.unlimited") if limit == 0 else str(limit)
         return self.t(
             "stats.body",
             total=total,

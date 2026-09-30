@@ -2,6 +2,7 @@
 # Please refer to https://langbot.app/docs/en/plugin/dev/tutor.html for more details.
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from tavily import TavilyClient
 
@@ -113,8 +114,8 @@ class TavilySearchTool(Tool):
         Returns:
             Search results as formatted string or error message
         """
-        # Get API key from plugin config
-        config = self.plugin.get_config()
+        # Get API key from the current invocation's installation config.
+        config = self.get_plugin_config()
         api_key = config.get("tavily_api_key")
 
         if not api_key:
@@ -132,8 +133,11 @@ class TavilySearchTool(Tool):
             # Process parameters
             processed_params = self._process_params(params)
 
-            # Execute search
-            search_results = client.search(**processed_params)
+            # Execute search off the event loop: TavilyClient.search is synchronous
+            # and would otherwise stall every other tenant on this shared worker.
+            search_results = await asyncio.to_thread(
+                client.search, **processed_params
+            )
 
             # Check if results exist
             if not search_results.get("results"):

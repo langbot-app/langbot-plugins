@@ -10,7 +10,7 @@ class SearchFAQ(Tool):
 
     async def call(self, params: dict[str, Any]) -> dict[str, Any]:
         query = params.get('query', '')
-        results = self.plugin.search(query)
+        results = await self.plugin.search(query)
         if not results:
             return {'message': 'No matching FAQ entries found.', 'results': []}
         return {

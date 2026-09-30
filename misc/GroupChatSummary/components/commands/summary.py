@@ -24,6 +24,9 @@ class Summary(Command):
                 yield CommandReturn(text="This command can only be used in group chats.")
                 return
 
+            # Shared placement loads this installation's buffers on demand.
+            await self.plugin.ensure_loaded()
+
             # Parse optional count parameter
             count = None
             if ctx.crt_params:
@@ -106,6 +109,7 @@ class Summary(Command):
         )
         async def status(self, ctx: ExecuteContext) -> AsyncGenerator[CommandReturn, None]:
             """Show how many messages are stored."""
+            await self.plugin.ensure_loaded()
             count = self.plugin.get_message_count(
                 ctx.session.launcher_type.value, ctx.session.launcher_id
             )
@@ -144,6 +148,7 @@ class Summary(Command):
         )
         async def clear(self, ctx: ExecuteContext) -> AsyncGenerator[CommandReturn, None]:
             """Clear the message buffer for this group."""
+            await self.plugin.ensure_loaded()
             key = self.plugin._group_key(
                 ctx.session.launcher_type.value, ctx.session.launcher_id
             )

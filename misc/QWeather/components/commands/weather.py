@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, AsyncGenerator
-import sys
 import logging
-from pathlib import Path
 import traceback
 
 from langbot_plugin.api.definition.components.command.command import Command, Subcommand
@@ -60,11 +58,6 @@ class Weather(Command):
     async def _get_qweather_text(self, city: str, config: dict) -> str:
         """Get weather using QWeather API and format as text"""
         try:
-            # Import local modules
-            plugin_path = Path(__file__).parent.parent.parent
-            if str(plugin_path) not in sys.path:
-                sys.path.insert(0, str(plugin_path))
-
             from pkg.weather_data import Weather as WeatherData, CityNotFoundError
 
             api_key = config.get('qweather_apikey', '')
@@ -75,7 +68,7 @@ class Weather(Command):
 
             # Get weather data
             w_data = WeatherData(city_name=city, api_key=api_key, api_type=api_type)
-            w_data.load_data()
+            await w_data.load_data()
 
             # Format as text
             weather_text = self._format_weather_text(w_data)

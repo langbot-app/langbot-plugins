@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from langbot_plugin.api.definition.plugin import BasePlugin
 
+DEFAULT_LANGUAGE = 'en_US'
+
+
 class EssentialCommands(BasePlugin):
+    """Essential commands plugin.
 
-    def __init__(self):
-        super().__init__()
-        self.language = 'en_US'  # Default language
-
-    async def initialize(self) -> None:
-        # Get language from config
-        if self.config and 'language' in self.config:
-            self.language = self.config['language']
-        print(f"EssentialCommands language set to: {self.language}")
+    One object graph serves every installation of this artifact, so the
+    configured language is resolved from the current invocation config on
+    every call instead of being captured in ``initialize()`` (shared placement
+    initializes plugins with an empty config).
+    """
 
     def get_language(self) -> str:
-        """Get the configured language."""
-        return self.language
+        """Language configured for the current invocation."""
+        return self.get_config().get('language') or DEFAULT_LANGUAGE

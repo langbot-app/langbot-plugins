@@ -24,6 +24,42 @@ class ResolvedPowerContext:
     request_id: str | None = None
 
 
+@dataclass(frozen=True)
+class PowerContextSettings:
+    """One invocation's PowerContext configuration.
+
+    Resolved from the active invocation config and never stored on the process-wide
+    plugin object, which serves every installation of this artifact digest.
+    """
+
+    server_url: str
+    api_token: str
+    timeout_seconds: float
+    allow_insecure_http: bool
+    scope_mode: str
+    explicit_scope_id: str
+    allow_default_scope: bool
+    auto_recall: bool
+    capture_user_messages: bool
+    max_context_bytes: int
+    search_limit: int
+
+    def new_client(self) -> PowerContextClient:
+        """Build a transport client for this invocation.
+
+        ``PowerContextClient`` holds no connection: every request opens its own
+        ``httpx.AsyncClient``, so a fresh instance per invocation is cheap and
+        keeps one installation's server URL and token out of every other one.
+        """
+
+        return PowerContextClient(
+            server_url=self.server_url,
+            api_token=self.api_token,
+            timeout_seconds=self.timeout_seconds,
+            allow_insecure_http=self.allow_insecure_http,
+        )
+
+
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -40,53 +76,51 @@ def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -
     return max(minimum, min(parsed, maximum))
 
 
-class PowerContextPlugin(BasePlugin):
-    client: PowerContextClient
-    scope_mode: str
-    explicit_scope_id: str
-    allow_default_scope: bool
-    auto_recall: bool
-    capture_user_messages: bool
-    max_context_bytes: int
-    search_limit: int
+def resolve_settings(config: dict[str, Any]) -> PowerContextSettings:
+    """Resolve one invocation's settings from its config snapshot.
 
-    async def initialize(self) -> None:
-        config = self.get_config()
-        self.scope_mode = (
-            str(config.get("scope_mode", "session") or "session").strip().lower()
-        )
-        if self.scope_mode not in {"session", "speaker", "bot"}:
-            logger.warning(
-                "Invalid scope_mode=%s; falling back to session", self.scope_mode
-            )
-            self.scope_mode = "session"
-        self.explicit_scope_id = str(config.get("scope_id", "") or "").strip()
-        self.allow_default_scope = bool(config.get("allow_default_scope", False))
-        self.auto_recall = bool(config.get("auto_recall", True))
-        self.capture_user_messages = bool(config.get("capture_user_messages", True))
-        self.max_context_bytes = _bounded_int(
+    The ``POWERCONTEXT_CLIENT_API_TOKEN`` environment fallback is evaluated here,
+    on every invocation, so a process that serves several installations never
+    reuses the credential resolved for another one.
+    """
+
+    scope_mode = str(config.get("scope_mode", "session") or "session").strip().lower()
+    if scope_mode not in {"session", "speaker", "bot"}:
+        logger.warning("Invalid scope_mode=%s; falling back to session", scope_mode)
+        scope_mode = "session"
+    return PowerContextSettings(
+        server_url=str(config.get("server_url", "http://127.0.0.1:8000")),
+        api_token=str(
+            config.get("api_token", "")
+            or os.environ.get("POWERCONTEXT_CLIENT_API_TOKEN", "")
+        ),
+        timeout_seconds=_bounded_float(config.get("timeout_seconds"), 8.0, 0.5, 60.0),
+        allow_insecure_http=bool(config.get("allow_insecure_http", False)),
+        scope_mode=scope_mode,
+        explicit_scope_id=str(config.get("scope_id", "") or "").strip(),
+        allow_default_scope=bool(config.get("allow_default_scope", False)),
+        auto_recall=bool(config.get("auto_recall", True)),
+        capture_user_messages=bool(config.get("capture_user_messages", True)),
+        max_context_bytes=_bounded_int(
             config.get("max_context_bytes"), 4000, 512, 32768
-        )
-        self.search_limit = _bounded_int(config.get("search_limit"), 5, 1, 50)
-        timeout_seconds = _bounded_float(config.get("timeout_seconds"), 8.0, 0.5, 60.0)
+        ),
+        search_limit=_bounded_int(config.get("search_limit"), 5, 1, 50),
+    )
 
-        self.client = PowerContextClient(
-            server_url=str(config.get("server_url", "http://127.0.0.1:8000")),
-            api_token=str(
-                config.get("api_token", "")
-                or os.environ.get("POWERCONTEXT_CLIENT_API_TOKEN", "")
-            ),
-            timeout_seconds=timeout_seconds,
-            allow_insecure_http=bool(config.get("allow_insecure_http", False)),
-        )
-        logger.info(
-            "[PowerContext] initialized: server=%s scope_mode=%s explicit_scope=%s auto_recall=%s capture=%s",
-            self.client.server_url,
-            self.scope_mode,
-            bool(self.explicit_scope_id),
-            self.auto_recall,
-            self.capture_user_messages,
-        )
+
+class PowerContextPlugin(BasePlugin):
+    """Process-wide plugin object; tenant configuration is read per invocation.
+
+    There is deliberately no ``initialize()`` override and no instance attribute
+    holding a server URL, token, or scope setting: a shared worker runs
+    ``initialize()`` once with an empty config, so anything cached there would be
+    either a default or another installation's value.
+    """
+
+    def settings(self) -> PowerContextSettings:
+        """Resolve this invocation's configuration without caching it on ``self``."""
+
+        return resolve_settings(self.get_config())
 
     async def resolve_identity(
         self,
@@ -96,17 +130,18 @@ class PowerContextPlugin(BasePlugin):
         sender_id: str = "",
         sender_name: str = "",
     ) -> ResolvedPowerContext:
+        settings = self.settings()
         identity = LangBotIdentity(
             bot_uuid=str(bot_uuid or ""),
             session_name=str(session_name or ""),
             sender_id=str(sender_id or ""),
             sender_name=str(sender_name or ""),
         )
-        key = binding_key(identity, self.scope_mode)
-        result = await self.client.resolve_scope(
-            explicit_scope_id=self.explicit_scope_id or None,
+        key = binding_key(identity, settings.scope_mode)
+        result = await settings.new_client().resolve_scope(
+            explicit_scope_id=settings.explicit_scope_id or None,
             binding_keys=[key],
-            allow_default=self.allow_default_scope,
+            allow_default=settings.allow_default_scope,
         )
         scope_id = result.data.get("scope_id")
         if not isinstance(scope_id, str) or not scope_id.strip():
