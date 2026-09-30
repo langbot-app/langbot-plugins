@@ -20,7 +20,7 @@ Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (f
 | DifyDatasetsConnector | 0.2.1 | `7f6c4dc7833407be49eb2acf9957ee734fd90f7e` | shared candidate | rejection fix `e48fb85` |
 | FastGPTConnector | 0.2.1 | `6614969605c8e57cfde607a64fbca92754f330b4` | shared candidate | rejection fix `e48fb85` |
 | LangRAG | 0.2.2 | `df66cee971f7a6efdfe99700f8848358b1626e06` | shared candidate | rejection fix `e48fb85` |
-| LongTermMemory | 0.2.0 | `7cb613ebb9632b7945e51274ba31d78cfdd51340` | shared candidate | KE `ee265c0` |
+| LongTermMemory | 0.2.1 | `27ae4cc73c7da423c0eb86bf14b768ba16349e61` | shared candidate | longterm-memory 0.2.1 `00b5869` |
 | RAGFlowConnector | 0.2.1 | `2800a8afda418b1facc1d097a0bd24148deaee13` | shared candidate | rejection fix `e48fb85` |
 
 Rows re-integrated after `bb34232fd`: **LangRAG** and **LocalAgent** at `9c68078`, **RunnerDemo** at `31c3119` (its evidence test plus the component-order fix) and **WeKnoraAgent** at `b085fdf`, all 0.2.1. LangRAG fences a cancelled caller's dispatched vector mutation and a reply whose count is not a nonnegative integer again, and telemetry failures no longer fail the operation they describe; LocalAgent's tree differs only in removed tests and its lockfile version. RunnerDemo's tree adds its in-tree two-binding test and README notes; WeKnoraAgent's narrows the `SHARED_RUNTIME.md` identity paragraph to what the client actually sends. `misc/GeneralParsers` sits outside this ledger: its trimmed test tree moved it to 0.1.9.
