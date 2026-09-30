@@ -5,6 +5,7 @@ import logging
 from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
+    FenceLifecycleError,
     serialized,
 )
 
@@ -270,64 +271,75 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # 2. Upload file to RAGFlow dataset
                 upload_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
                 files = {"file": (filename, file_bytes)}
-                # The intent is persisted before the upload leaves, so a
-                # cancellation after dispatch still leaves a fence behind.
-                upload_resp = await self._state.dispatched(
-                    self.plugin, kb_id,
-                    lambda: client.post(
-                        upload_url, headers=headers, files=files, timeout=60.0
-                    ),
-                    'RAGFlow upload outcome unknown',
-                )
-                upload_resp.raise_for_status()
-                upload_data = upload_resp.json()
 
-                if upload_data.get("code") != 0:
-                    error_msg = upload_data.get("message", "Unknown upload error")
-                    logger.error(f"[RAGFlowKnowledgeEngine] Upload failed: {error_msg}")
+                async def upload():
+                    response = await client.post(
+                        upload_url, headers=headers, files=files, timeout=60.0
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    if data.get("code") != 0:
+                        # The provider answered: the upload was rejected, so no
+                        # Host record is written and the fence can be released.
+                        return None, data.get("message") or "Unknown upload error"
+                    # Extract the document ID returned by RAGFlow
+                    docs = data.get("data", [])
+                    ragflow_doc_id = docs[0].get("id") if docs and isinstance(docs[0], dict) else None
+                    if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
+                        raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
+                    # The mapping is recorded before the fence is released: a
+                    # cancellation or a Host failure here must not leave an
+                    # uploaded document with no durable record of it.
+                    await self._save_document(kb_id, doc_id, {'upstream_id': ragflow_doc_id,
+                        'dataset_id': target_dataset_id, 'api_base_url': upstream_target,
+                        'status': 'created'})
+                    return ragflow_doc_id, None
+
+                # The intent is persisted before the upload leaves, and the fence
+                # is released only once the response was validated and the mapping
+                # recorded.
+                ragflow_doc_id, upload_error = await self._state.dispatched(
+                    self.plugin, kb_id, upload, 'RAGFlow upload outcome unknown',
+                )
+                if upload_error is not None:
+                    logger.error(f"[RAGFlowKnowledgeEngine] Upload failed: {upload_error}")
                     return IngestionResult(
                         document_id=doc_id,
                         status=DocumentStatus.FAILED,
-                        error_message=f"RAGFlow upload error: {error_msg}",
+                        error_message=f"RAGFlow upload error: {upload_error}",
                     )
-
-                # Extract the document ID returned by RAGFlow
-                docs = upload_data.get("data", [])
-                if not docs:
-                    raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
-
-                ragflow_doc_id = docs[0].get("id")
-                if not isinstance(ragflow_doc_id, str) or not ragflow_doc_id:
-                    raise AmbiguousMutationError("RAGFlow upload omitted upstream document ID; outcome requires reconciliation")
-                await self._save_document(kb_id, doc_id, {'upstream_id': ragflow_doc_id,
-                    'dataset_id': target_dataset_id, 'api_base_url': upstream_target,
-                    'status': 'created'})
 
                 # 3. Trigger parsing
                 chunks_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/chunks"
-                parse_resp = await self._state.dispatched(
-                    self.plugin, kb_id,
-                    lambda: client.post(
+
+                async def trigger_parse():
+                    response = await client.post(
                         chunks_url,
                         headers={**headers, "Content-Type": "application/json"},
                         json={"document_ids": [ragflow_doc_id]},
                         timeout=30.0,
-                    ),
-                    'RAGFlow parsing trigger outcome unknown',
-                )
-                parse_resp.raise_for_status()
-                parse_data = parse_resp.json()
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    if data.get("code") != 0:
+                        # The provider answered: parsing did not start, so the
+                        # fence can be released.
+                        return data.get("message") or "Unknown parsing error"
+                    return None
 
-                if parse_data.get("code") != 0:
-                    error_msg = parse_data.get("message", "Unknown parsing error")
+                parse_error = await self._state.dispatched(
+                    self.plugin, kb_id,
+                    trigger_parse, 'RAGFlow parsing trigger outcome unknown',
+                )
+                if parse_error is not None:
                     logger.warning(
-                        f"[RAGFlowKnowledgeEngine] Parsing trigger returned error: {error_msg}"
+                        f"[RAGFlowKnowledgeEngine] Parsing trigger returned error: {parse_error}"
                     )
                     # Document was uploaded but parsing failed to start
                     return IngestionResult(
                         document_id=ragflow_doc_id,
                         status=DocumentStatus.FAILED,
-                        error_message=f"RAGFlow parsing trigger error: {error_msg}",
+                        error_message=f"RAGFlow parsing trigger error: {parse_error}",
                     )
 
                 logger.info(
@@ -338,65 +350,72 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                 # Auto-trigger GraphRAG construction if enabled
                 auto_graphrag = config.get("auto_graphrag", False)
                 if auto_graphrag:
-                    try:
-                        graphrag_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_graphrag"
-                        gr_resp = await self._state.dispatched(
-                            self.plugin, kb_id,
-                            lambda: client.post(
-                                graphrag_url,
-                                headers={**headers, "Content-Type": "application/json"},
-                                timeout=30.0,
-                            ),
-                            'RAGFlow GraphRAG trigger outcome unknown',
+                    graphrag_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_graphrag"
+
+                    async def trigger_graphrag():
+                        response = await client.post(
+                            graphrag_url,
+                            headers={**headers, "Content-Type": "application/json"},
+                            timeout=30.0,
                         )
-                        gr_resp.raise_for_status()
-                        gr_data = gr_resp.json()
-                        if gr_data.get("code") == 0:
-                            task_id = gr_data.get("data", {}).get("graphrag_task_id", "unknown")
-                            logger.info(
-                                f"[RAGFlowKnowledgeEngine] GraphRAG construction triggered "
-                                f"(task_id={task_id})"
-                            )
-                        else:
-                            logger.warning(
-                                f"[RAGFlowKnowledgeEngine] GraphRAG trigger returned: "
-                                f"{gr_data.get('message')}"
-                            )
-                    except Exception as e:
+                        response.raise_for_status()
+                        data = response.json()
+                        if data.get("code") != 0:
+                            # The provider answered: GraphRAG did not start. That
+                            # is a resolved answer, not an unresolved state.
+                            return None, data.get("message") or "unknown reason"
+                        task = (data.get("data") or {}).get("graphrag_task_id", "unknown")
+                        return task, None
+
+                    # An unresolved GraphRAG outcome is not swallowed: it keeps
+                    # its own fence and the chain must not continue over it (the
+                    # RAPTOR dispatch would refuse it, and a later success must
+                    # never clear this fence).
+                    graphrag_task_id, graphrag_error = await self._state.dispatched(
+                        self.plugin, kb_id, trigger_graphrag,
+                        'RAGFlow GraphRAG trigger outcome unknown',
+                    )
+                    if graphrag_error is None:
+                        logger.info(
+                            f"[RAGFlowKnowledgeEngine] GraphRAG construction triggered "
+                            f"(task_id={graphrag_task_id})"
+                        )
+                    else:
                         logger.warning(
-                            f"[RAGFlowKnowledgeEngine] Failed to trigger GraphRAG: {e}"
+                            f"[RAGFlowKnowledgeEngine] GraphRAG trigger returned: {graphrag_error}"
                         )
 
                 # Auto-trigger RAPTOR construction if enabled
                 auto_raptor = config.get("auto_raptor", False)
                 if auto_raptor:
-                    try:
-                        raptor_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_raptor"
-                        rp_resp = await self._state.dispatched(
-                            self.plugin, kb_id,
-                            lambda: client.post(
-                                raptor_url,
-                                headers={**headers, "Content-Type": "application/json"},
-                                timeout=30.0,
-                            ),
-                            'RAGFlow RAPTOR trigger outcome unknown',
+                    raptor_url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/run_raptor"
+
+                    async def trigger_raptor():
+                        response = await client.post(
+                            raptor_url,
+                            headers={**headers, "Content-Type": "application/json"},
+                            timeout=30.0,
                         )
-                        rp_resp.raise_for_status()
-                        rp_data = rp_resp.json()
-                        if rp_data.get("code") == 0:
-                            task_id = rp_data.get("data", {}).get("raptor_task_id", "unknown")
-                            logger.info(
-                                f"[RAGFlowKnowledgeEngine] RAPTOR construction triggered "
-                                f"(task_id={task_id})"
-                            )
-                        else:
-                            logger.warning(
-                                f"[RAGFlowKnowledgeEngine] RAPTOR trigger returned: "
-                                f"{rp_data.get('message')}"
-                            )
-                    except Exception as e:
+                        response.raise_for_status()
+                        data = response.json()
+                        if data.get("code") != 0:
+                            # The provider answered: RAPTOR did not start.
+                            return None, data.get("message") or "unknown reason"
+                        task = (data.get("data") or {}).get("raptor_task_id", "unknown")
+                        return task, None
+
+                    raptor_task_id, raptor_error = await self._state.dispatched(
+                        self.plugin, kb_id, trigger_raptor,
+                        'RAGFlow RAPTOR trigger outcome unknown',
+                    )
+                    if raptor_error is None:
+                        logger.info(
+                            f"[RAGFlowKnowledgeEngine] RAPTOR construction triggered "
+                            f"(task_id={raptor_task_id})"
+                        )
+                    else:
                         logger.warning(
-                            f"[RAGFlowKnowledgeEngine] Failed to trigger RAPTOR: {e}"
+                            f"[RAGFlowKnowledgeEngine] RAPTOR trigger returned: {raptor_error}"
                         )
 
                 return IngestionResult(
@@ -404,8 +423,9 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
                     status=DocumentStatus.PROCESSING,
                 )
 
-        except AmbiguousMutationError:
-            # Already-dispatched upload with an unknown outcome: fence this KB.
+        except (AmbiguousMutationError, FenceLifecycleError):
+            # An already-dispatched mutation with an unknown outcome, or a
+            # mutation that was never dispatched: the caller must see it.
             raise
         except Exception as e:
             # An ambiguous failure already left its pre-dispatch fence in place.
@@ -457,39 +477,53 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
             # does not necessarily exist here; mappings written before the target
             # was recorded are equally unresolvable.
             raise RuntimeError('Upstream target changed; reconcile before deletion')
-        try:
+
+        url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async def delete_upstream():
             async with self.http_client() as client:
-                url = f"{api_base_url}/api/v1/datasets/{target_dataset_id}/documents"
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                resp = await self._state.dispatched(
-                    self.plugin, kb_id,
-                    lambda: client.request(
-                        "DELETE", url, headers=headers,
-                        json={"ids": [mapping['upstream_id']]},
-                        timeout=30.0,
-                    ),
-                    'RAGFlow delete outcome unknown',
+                response = await client.request(
+                    "DELETE", url, headers=headers,
+                    json={"ids": [mapping['upstream_id']]},
+                    timeout=30.0,
                 )
-                resp.raise_for_status()
-                data = resp.json()
+                response.raise_for_status()
+                data = response.json()
+            if data.get("code") != 0:
+                # The provider answered: the delete was rejected, so there is
+                # nothing to record and the fence can be released.
+                return False, data.get("message") or "Unknown error"
+            # The tombstone is recorded before the fence is released: a
+            # cancellation or a Host failure here must not leave a deleted
+            # document that the mapping still calls created.
+            await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
+            return True, None
 
-                if data.get("code") != 0:
-                    error_msg = data.get("message", "Unknown error")
-                    logger.error(
-                        f"[RAGFlowKnowledgeEngine] Delete failed for doc={document_id}: {error_msg}"
-                    )
-                    return False
+        try:
+            deleted, error = await self._state.dispatched(
+                self.plugin, kb_id, delete_upstream, 'RAGFlow delete outcome unknown',
+            )
 
-                await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
-                logger.info(
-                    f"[RAGFlowKnowledgeEngine] Document {document_id} deleted from "
-                    f"dataset {target_dataset_id}"
+            if not deleted:
+                logger.error(
+                    f"[RAGFlowKnowledgeEngine] Delete failed for doc={document_id}: {error}"
                 )
-                return True
+                return False
 
+            logger.info(
+                f"[RAGFlowKnowledgeEngine] Document {document_id} deleted from "
+                f"dataset {target_dataset_id}"
+            )
+            return True
+
+        except (AmbiguousMutationError, FenceLifecycleError):
+            # The delete was dispatched with an unknown outcome, or never
+            # dispatched at all: the caller must not read this as a plain failure.
+            raise
         except httpx.HTTPStatusError as e:
             # The provider answered, so the delete was rejected deterministically.
             logger.error(

@@ -40,6 +40,8 @@ class StorageFixture:
     def __init__(self):
         self.data = {}
         self.fail = False
+        # Optional ``key -> exception`` fault injection for one durable write.
+        self.write_fault = None
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.release.set()
@@ -59,6 +61,10 @@ class StorageFixture:
         async def commit():
             self.started.set()
             await self.release.wait()
+            if self.write_fault is not None:
+                fault = self.write_fault(key)
+                if fault is not None:
+                    raise fault
             if self.fail:
                 raise RuntimeError('fixture ambiguous commit')
             self.data[key] = value

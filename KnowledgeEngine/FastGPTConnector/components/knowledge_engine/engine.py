@@ -6,6 +6,7 @@ import logging
 from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
+    FenceLifecycleError,
     normalize_api_base_url,
     serialized,
 )
@@ -210,32 +211,39 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                     timeout=120.0,
                 )
                 response.raise_for_status()
-                return response.json()
-
-        try:
-            # Pre-persisted intent: a cancellation after dispatch must leave the
-            # ambiguity visible rather than lose the mutation.
-            result = await self._state.dispatched(
-                self.plugin, kb_id, upload, 'FastGPT upload outcome unknown'
-            )
-
+                result = response.json()
             if result.get("code") != 200:
-                error_msg = result.get("message", "Unknown error from FastGPT")
-                logger.error(f"[FastGPTKnowledgeEngine] Upload failed: {error_msg}")
-                return IngestionResult(
-                    document_id=doc_id,
-                    status=DocumentStatus.FAILED,
-                    error_message=error_msg,
-                )
-
+                # The provider answered: the upload was rejected, so no Host
+                # record is written and the fence can be released.
+                return None, None, result.get("message") or "Unknown error from FastGPT"
             resp_data = result.get("data", {})
             collection_id = resp_data.get("collectionId", "")
             if not isinstance(collection_id, str) or not collection_id:
                 raise AmbiguousMutationError("FastGPT upload omitted upstream collection ID; outcome requires reconciliation")
+            insert_len = (resp_data.get("results") or {}).get("insertLen", 0)
+            # The mapping is recorded before the fence is released: a
+            # cancellation or a Host failure here must not leave an uploaded
+            # collection with no durable record of it.
             await self._save_document(kb_id, doc_id, {'upstream_id': collection_id,
                 'dataset_id': dataset_id, 'status': 'created',
                 'api_base_url': upstream_target})
-            insert_len = resp_data.get("results", {}).get("insertLen", 0)
+            return collection_id, insert_len, None
+
+        try:
+            # Pre-persisted intent: the wrapped operation covers the request, the
+            # response validation and the Host mapping write, so the fence is
+            # released only once the outcome has been recorded.
+            collection_id, insert_len, error = await self._state.dispatched(
+                self.plugin, kb_id, upload, 'FastGPT upload outcome unknown'
+            )
+
+            if error is not None:
+                logger.error(f"[FastGPTKnowledgeEngine] Upload failed: {error}")
+                return IngestionResult(
+                    document_id=doc_id,
+                    status=DocumentStatus.FAILED,
+                    error_message=error,
+                )
 
             logger.info(
                 f"[FastGPTKnowledgeEngine] File uploaded: {filename} -> "
@@ -248,8 +256,9 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                 chunks_created=insert_len,
             )
 
-        except AmbiguousMutationError:
-            # Already-dispatched upload with an unknown outcome: fence this KB.
+        except (AmbiguousMutationError, FenceLifecycleError):
+            # An already-dispatched upload with an unknown outcome, or a mutation
+            # that was never dispatched: the caller must see it.
             raise
         except Exception as e:
             logger.error(f"[FastGPTKnowledgeEngine] Ingestion failed for {filename}: {e}")
@@ -296,26 +305,37 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
                     url, params={"id": mapping['upstream_id']}, headers=headers, timeout=30.0
                 )
                 response.raise_for_status()
-                return response.json()
+                result = response.json()
+            if result.get("code") != 200:
+                # The provider answered: the delete was rejected, so there is
+                # nothing to record and the fence can be released.
+                return False, result.get("message") or "Unknown error"
+            # The tombstone is recorded before the fence is released: a
+            # cancellation or a Host failure here must not leave a deleted
+            # collection that the mapping still calls created.
+            await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
+            return True, None
 
         try:
-            result = await self._state.dispatched(
+            deleted, error = await self._state.dispatched(
                 self.plugin, kb_id, delete_upstream, 'FastGPT delete outcome unknown'
             )
 
-            if result.get("code") != 200:
+            if not deleted:
                 logger.error(
-                    f"[FastGPTKnowledgeEngine] Delete failed for collection={document_id}: "
-                    f"{result.get('message', 'Unknown error')}"
+                    f"[FastGPTKnowledgeEngine] Delete failed for collection={document_id}: {error}"
                 )
                 return False
 
-            await self._save_document(kb_id, mapping['host_document_id'], {**mapping, 'status': 'deleted'})
             logger.info(
                 f"[FastGPTKnowledgeEngine] Collection deleted: {document_id}"
             )
             return True
 
+        except (AmbiguousMutationError, FenceLifecycleError):
+            # The delete was dispatched with an unknown outcome, or never
+            # dispatched at all: the caller must not read this as a plain failure.
+            raise
         except httpx.HTTPStatusError as e:
             # The provider answered, so the delete was rejected deterministically.
             logger.error(

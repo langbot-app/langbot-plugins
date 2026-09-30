@@ -12,7 +12,9 @@ recognises them. An unreadable fence record refuses the operation instead of
 being read as "no fence", and such a read is retried rather than cached. Only
 dispatched mutations whose outcome is unknown fence; a deterministic validation
 error raised before any remote call and ordinary cancellation before a call is
-dispatched do not.
+dispatched do not. A fence that cannot be persisted aborts the mutation before
+it is dispatched, and a fence is released only after the provider answer was
+confirmed and its Host record written.
 """
 import asyncio
 import hashlib
@@ -50,6 +52,35 @@ class FenceStateUnavailableError(RuntimeError):
     is fenced after an ambiguous mutation, so an unknown fence state fails
     closed. The read is not cached: the next attempt re-reads the durable state,
     and nothing has been dispatched while the state stays unknown.
+    """
+
+
+class FenceLifecycleError(RuntimeError):
+    """A mutation was aborted before dispatch because its fence is not in place.
+
+    Both failures below mean "this call dispatched nothing": the pre-dispatch
+    protection could not be persisted, or an earlier unresolved mutation is
+    still fenced. Call sites must report them instead of folding them into an
+    ordinary provider failure.
+    """
+
+
+class FencePersistError(FenceLifecycleError):
+    """The pre-dispatch fence record could not be persisted.
+
+    Raised by ``fence`` when the Host write of the fence record fails: the fence
+    is not in place, so ``dispatched`` aborts before its request instead of
+    dispatching a mutation whose protection does not exist.
+    """
+
+
+class FencedKnowledgeBaseError(FenceLifecycleError):
+    """A mutation was refused: an earlier mutation's outcome is unresolved.
+
+    Raised when a serialized operation, or a dispatch inside one, is attempted
+    while the knowledge base (or the whole installation) is still fenced. A
+    later successful operation therefore never clears an earlier unresolved
+    operation's fence.
     """
 
 
@@ -201,7 +232,7 @@ class SerialState:
         async with lock:
             await self._load_fences(plugin, binding)
             if not allow_fenced and self.is_fenced(binding, kb_identity):
-                raise RuntimeError(
+                raise FencedKnowledgeBaseError(
                     f"Knowledge base {kb_identity!r} fenced after an ambiguous mutation; "
                     "reconcile with the provider before retrying"
                 )
@@ -212,12 +243,26 @@ class SerialState:
                 raise
 
     async def dispatched(self, plugin, kb_identity, operation, reason):
-        """Dispatch a remote mutation under a pre-persisted intent.
+        """Dispatch one remote mutation under a pre-persisted fence.
 
-        The fence is written before the request goes out, so a cancellation after
-        dispatch (or an ambiguous failure) cannot leave a mutation with no marker
-        for reconciliation; a deterministic answer clears it again.
+        ``operation`` must cover the whole mutation: the provider request, the
+        response validation and the durable result/mapping write. The fence is
+        persisted before the request goes out — a failed persist aborts here,
+        before any remote call — and it is released only once ``operation`` has
+        returned, so an ambiguous outcome or a caller cancellation keeps the
+        knowledge base fenced for reconciliation. A knowledge base that is
+        already fenced is refused before anything is written or dispatched, so a
+        later successful operation never clears an earlier unresolved
+        operation's fence.
         """
+        binding = self.binding(plugin)
+        if self.is_fenced(binding, kb_identity):
+            # The enclosing serialized call loaded and validated the fence state,
+            # so this is a real unresolved mutation rather than a stale view.
+            raise FencedKnowledgeBaseError(
+                f"Knowledge base {kb_identity!r} fenced by an unresolved mutation; "
+                "reconcile with the provider before dispatching another mutation"
+            )
         await self.fence(plugin, kb_identity, reason)
         try:
             result = await operation()
@@ -232,22 +277,30 @@ class SerialState:
         return result
 
     async def fence(self, plugin, kb_identity, reason):
-        """Mark one knowledge base as requiring reconciliation.
+        """Persist one fence, then mark that knowledge base in this process.
 
-        The in-process marker is set synchronously; persisting it to Host storage
-        is best effort so that a caller cancellation cannot lose the fence.
+        The durable record is written first and a failed write is fatal
+        (``FencePersistError``), so a caller that fences before dispatching a
+        mutation aborts before its request instead of dispatching under a fence
+        that does not exist. Only a persisted fence sets the in-process marker,
+        so a failed write and a caller cancellation both leave no marker behind.
+        The residual race — the Host write landed but its acknowledgement was
+        lost — can make a later read load a fence for an operation that was
+        never dispatched; that is the conservative direction and is accepted.
         """
         binding = self.binding(plugin)
         fence_key = _kb_fence_key(kb_identity)
-        self._fenced_keys(binding).add(fence_key)
         payload = json.dumps({'kb_id': kb_identity, 'reason': reason}).encode()
         cancelled, failure = await _settle_commit(
             asyncio.create_task(plugin.set_plugin_storage(fence_key, payload))
         )
-        if failure is not None:
-            logger.warning("Could not persist fence for %r: %r", kb_identity, failure)
         if cancelled:
             raise asyncio.CancelledError
+        if failure is not None:
+            raise FencePersistError(
+                f"Could not persist fence for {kb_identity!r}: {failure!r}"
+            ) from failure
+        self._fenced_keys(binding).add(fence_key)
 
     async def clear_fence(self, plugin, kb_identity):
         """Drop the fence for one knowledge base, in process and in storage.
@@ -273,7 +326,15 @@ class SerialState:
         task = asyncio.create_task(plugin.set_plugin_storage(key, value))
         cancelled, failure = await _settle_commit(task)
         if failure is not None:
-            await self.fence(plugin, kb_identity, f'Host write outcome unknown: {failure!r}')
+            try:
+                await self.fence(plugin, kb_identity, f'Host write outcome unknown: {failure!r}')
+            except FencePersistError:
+                # The write failure is what the caller must see; a fence that
+                # could not be persisted is reported alongside it, not instead.
+                logger.error(
+                    "Could not persist fence for %r after a failed Host write",
+                    kb_identity, exc_info=True,
+                )
         if cancelled:
             raise asyncio.CancelledError
         if failure is not None:

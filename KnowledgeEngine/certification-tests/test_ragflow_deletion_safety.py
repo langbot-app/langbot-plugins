@@ -210,3 +210,162 @@ async def test_equivalent_configuration_of_the_recorded_upstream_is_accepted(mon
     await engine._save_config('kb', {**config, 'api_base_url': 'HTTPS://FIXTURE.INVALID:443/'})
     assert await engine.delete_document('kb', 'local-doc') is True
     assert [request.method for request in calls] == ['POST', 'POST', 'DELETE']
+
+
+def fence_key_fault(shared_state, message):
+    def fault(key):
+        return RuntimeError(message) if key.startswith(shared_state.FENCE_KEY_PREFIX) else None
+    return fault
+
+
+@pytest.mark.asyncio
+async def test_unpersistable_fence_aborts_the_upload_before_the_request(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    store.write_fault = fence_key_fault(shared_state, 'fixture fence write rejected')
+
+    # The pre-written protection cannot be persisted, so the upload must not be
+    # dispatched at all.
+    with pytest.raises(shared_state.FencePersistError, match='Could not persist fence'):
+        await engine.ingest(ingest_context(configuration('A')))
+    assert calls == []
+    # A mutation that was never dispatched leaves no fence behind...
+    assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert fence_records(store) == []
+    # ...only the durable pre-dispatch intent it had already recorded.
+    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_unpersistable_fence_aborts_the_delete_before_the_request(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    await engine._save_config('kb', configuration('A'))
+    await engine._save_document('kb', 'doc', created_mapping('https://fixture.invalid'))
+
+    store.write_fault = fence_key_fault(shared_state, 'fixture fence write rejected')
+    with pytest.raises(shared_state.FencePersistError, match='Could not persist fence'):
+        await engine.delete_document('kb', 'doc')
+    assert calls == []
+    assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert fence_records(store) == []
+    # The delete was never dispatched, so its mapping is still the recorded one.
+    assert (await engine._load_document('kb', 'doc'))['status'] == 'created'
+
+
+@pytest.mark.asyncio
+async def test_upload_response_that_fails_validation_keeps_the_fence(monkeypatch):
+    async def handler(request):
+        if request.method == 'POST' and request.url.path.endswith('/documents'):
+            # The provider answered 200 with a body the connector cannot decode:
+            # the upload may have committed, so the outcome is unresolved.
+            return httpx.Response(200, text='not json')
+        return acknowledge(request)
+
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, handler)
+    result = await engine.ingest(ingest_context(configuration('A')))
+    assert result.status == DocumentStatus.FAILED
+
+    # The whole mutation — response validation included — is inside the fence, so
+    # the unparsable answer keeps the knowledge base fenced.
+    assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert [record['kb_id'] for record in fence_records(store)] == ['kb']
+    assert [request.method for request in calls] == ['POST']
+    # The next mutation for this knowledge base is refused rather than dispatched
+    # over the unresolved upload.
+    with pytest.raises(RuntimeError, match='fenced'):
+        await engine.delete_document('kb', 'local-doc')
+
+
+@pytest.mark.asyncio
+async def test_unresolved_graphrag_keeps_the_fence_and_blocks_raptor(monkeypatch):
+    async def handler(request):
+        if request.url.path.endswith('/run_graphrag'):
+            raise httpx.ReadTimeout('fixture graphrag timeout')
+        return acknowledge(request)
+
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, handler)
+    config = {**configuration('A'), 'auto_graphrag': True, 'auto_raptor': True}
+    result = await engine.ingest(ingest_context(config))
+    assert result.status == DocumentStatus.FAILED
+
+    # The unknown GraphRAG outcome is unresolved: the chain stops there instead of
+    # running RAPTOR, whose success would have cleared the shared fence.
+    paths = [request.url.path for request in calls]
+    assert paths == [
+        '/api/v1/datasets/A/documents',
+        '/api/v1/datasets/A/chunks',
+        '/api/v1/datasets/A/run_graphrag',
+    ], 'the chain stops at the unresolved GraphRAG trigger'
+    assert not any(path.endswith('/run_raptor') for path in paths)
+    assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert [record['kb_id'] for record in fence_records(store)] == ['kb']
+    with pytest.raises(RuntimeError, match='fenced'):
+        await engine.on_knowledge_base_create('kb', configuration('A'))
+
+
+@pytest.mark.asyncio
+async def test_delete_cancellation_after_ack_before_the_tombstone_keeps_the_fence(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    await engine._save_config('kb', configuration('A'))
+    await engine._save_document('kb', 'doc', created_mapping('https://fixture.invalid'))
+
+    # The documented window: the provider has acknowledged the delete, the Host
+    # tombstone has not been written yet.
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    record = engine._save_document
+
+    async def gated_record(kb_id, host_document_id, value):
+        if value.get('status') == 'deleted':
+            entered.set()
+            await release.wait()
+        return await record(kb_id, host_document_id, value)
+
+    monkeypatch.setattr(engine, '_save_document', gated_record)
+    task = asyncio.create_task(engine.delete_document('kb', 'doc'))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+
+    # The delete was acknowledged upstream but its Host record does not exist, so
+    # the protection must not have been released: a retry would replay the delete.
+    assert (await engine._load_document('kb', 'doc'))['status'] == 'created'
+    assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert [record['kb_id'] for record in fence_records(store)] == ['kb']
+    with pytest.raises(RuntimeError, match='fenced'):
+        await engine.delete_document('kb', 'doc')
+    assert [request.method for request in calls] == ['DELETE']
+
+
+@pytest.mark.asyncio
+async def test_later_success_never_clears_an_unresolved_fence(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    plugin = engine.plugin
+    await engine._state.fence(plugin, 'kb', 'earlier upload outcome unknown')
+
+    ran = []
+
+    async def later_mutation():
+        ran.append(1)
+        return 'dispatched'
+
+    # The later mutation is refused instead of running and releasing the earlier
+    # operation's fence as if its own success had resolved it.
+    with pytest.raises(shared_state.FencedKnowledgeBaseError, match='unresolved'):
+        await engine._state.dispatched(plugin, 'kb', later_mutation, 'later mutation')
+    assert ran == []
+    assert engine._state.is_fenced(engine._state.binding(plugin), 'kb')
+    assert [record['kb_id'] for record in fence_records(store)] == ['kb']
