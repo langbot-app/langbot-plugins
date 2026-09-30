@@ -9,21 +9,23 @@ Integration base: `origin/main` at `9be9e9291ebc848c6fdd8006c50e6226bd822649` (f
 | ACPAgentRunner | 0.1.16 | `a5fcac59610a67957cc7c2b136eb55bb3dfb6d43` | dedicated only | nine Runner `ede6756` |
 | ClaudeCodeAgent | 0.1.14 | `d7e7442551d333166fc6fd6c2b863b3a1d4d89bb` | dedicated only | nine Runner `ede6756` |
 | CodexAgent | 0.1.20 | `897281bc02835e73b1877acfb34aed51fd561763` | dedicated only | nine Runner `ede6756` |
-| CozeAgent | 0.2.0 | `0a7168acf038bc6c4331b6315c4ba261a682604a` | shared candidate | nine Runner `ede6756` |
+| CozeAgent | 0.2.1 | `4e22dea87e567a23791ae96e2c8edbfc241a2283` | shared candidate | rejection fix `e48fb85` |
 | DashScopeAgent | 0.2.0 | `8ddf459a754461b8b5b0f253e3df603d600fa840` | shared candidate | nine Runner `ede6756` |
 | DeerFlowAgent | 0.2.0 | `da1275c8693a177ecb7cebb7fc91c3be1b4012ea` | shared candidate | four Runner `8bb55ec` |
-| DifyAgent | 0.2.0 | `a45e3ebe79d31a9ddf4daccaae6fcfbf72f96a91` | shared candidate | nine Runner `ede6756` |
+| DifyAgent | 0.2.1 | `597a16a950fb83ca7f6d641a5e74a891d14f5c98` | shared candidate | rejection fix `e48fb85` |
 | LangflowAgent | 0.2.0 | `e351b9f9a8a8550a0631d7d6e895a975f947f07d` | shared candidate | nine Runner `ede6756` |
-| N8nAgent | 0.2.0 | `fb0cede58b9ff07f65c0270665befde82be70767` | shared candidate | nine Runner `ede6756` |
-| TboxAgent | 0.2.0 | `c8dfbcf4f2dd1f094b5ef712b09db771aa5f3dd0` | shared candidate | nine Runner `ede6756` |
-| WeKnoraAgent | 0.2.1 | `846b019ac4872449889ceb2badd1cb33e46bb7fa` | shared candidate | four Runner `8bb55ec` |
-| DifyDatasetsConnector | 0.2.0 | `fb516e590cd025d109d68980c0bdc6b337bb5931` | shared candidate | KE `ee265c0` |
-| FastGPTConnector | 0.2.0 | `79112c601820cedd0004c114ef304c51faa1b9c6` | shared candidate | KE `ee265c0` |
-| LangRAG | 0.2.1 | `6ff50a5a4455e44fbc816ebed6596b8427cbd7b8` | shared candidate | KE `ee265c0` |
+| N8nAgent | 0.2.1 | `97a2295a0b2cb6791d0c2ee5437b744f8bb3d9a0` | shared candidate | rejection fix `e48fb85` |
+| TboxAgent | 0.2.1 | `04d3dfe127a78143fc9ccdbb207f2cf2e1146496` | shared candidate | rejection fix `e48fb85` |
+| WeKnoraAgent | 0.2.2 | `1b032d7533d60cd117f529fdf3dd4ecea308ffa1` | shared candidate | rejection fix `e48fb85` |
+| DifyDatasetsConnector | 0.2.1 | `7f6c4dc7833407be49eb2acf9957ee734fd90f7e` | shared candidate | rejection fix `e48fb85` |
+| FastGPTConnector | 0.2.1 | `6614969605c8e57cfde607a64fbca92754f330b4` | shared candidate | rejection fix `e48fb85` |
+| LangRAG | 0.2.2 | `df66cee971f7a6efdfe99700f8848358b1626e06` | shared candidate | rejection fix `e48fb85` |
 | LongTermMemory | 0.2.0 | `7cb613ebb9632b7945e51274ba31d78cfdd51340` | shared candidate | KE `ee265c0` |
-| RAGFlowConnector | 0.2.0 | `0af91f67a482a3a7f0aab487d5e12ffa0245c7a9` | shared candidate | KE `ee265c0` |
+| RAGFlowConnector | 0.2.1 | `2800a8afda418b1facc1d097a0bd24148deaee13` | shared candidate | rejection fix `e48fb85` |
 
 Rows re-integrated after `bb34232fd`: **LangRAG** and **LocalAgent** at `9c68078`, **RunnerDemo** at `31c3119` (its evidence test plus the component-order fix) and **WeKnoraAgent** at `b085fdf`, all 0.2.1. LangRAG fences a cancelled caller's dispatched vector mutation and a reply whose count is not a nonnegative integer again, and telemetry failures no longer fail the operation they describe; LocalAgent's tree differs only in removed tests and its lockfile version. RunnerDemo's tree adds its in-tree two-binding test and README notes; WeKnoraAgent's narrows the `SHARED_RUNTIME.md` identity paragraph to what the client actually sends. `misc/GeneralParsers` sits outside this ledger: its trimmed test tree moved it to 0.1.9.
+
+**Re-integrated at `e48fb85` after the certification rejection:** **DifyDatasetsConnector**, **FastGPTConnector** and **RAGFlowConnector** at 0.2.1 and **LangRAG** at 0.2.2 refuse a mutation whose persisted fence store cannot be read (the failed read is not cached), share one byte-identical `dispatched()` helper that fences before dispatch and clears the fence on a deterministic answer, and bind every recorded document mapping to the connector's normalized upstream target, so deletion refuses a mapping from another upstream before any remote call. **CozeAgent**, **DifyAgent**, **N8nAgent** and **TboxAgent** at 0.2.1 and **WeKnoraAgent** at 0.2.2 resolve upstream identities from the current invocation's installation binding and refuse in a shared worker that has none (five byte-identical `scoped_identity.py` files); Dify additionally accepts a legacy-owned human-input continuation once and rewrites it with the current owner. Evidence: certification suite `146 passed`; LangRAG `19` through pytest and through the CI unittest runner; the shared agents' identity suites executed in CI by the isolated-interpreter harness; all five KnowledgeEngine archives built locally (`DifyDatasetsConnector-0.2.1.lbpkg`). The Windows review host cannot complete the SDK's POSIX-only RPC/file-transfer stage, so that stage remains CI-only.
 
 Fifteen source candidates declare both `shared-runtime-v1` and `stateless-v1`; three stay dedicated (the three native coding Runners, whose process-local daemon hubs, shared workspace root and worker-HOME credentials cannot serve two installations from one process). The four KnowledgeEngine plugins moved from dedicated to shared candidate: their locks and fences are keyed by (installation binding, knowledge-base identity), persisted in installation-bound Host storage, released on installation revocation, and only a dispatched mutation with an unknown outcome fences. Ambiguous upstream mutations still need manual reconciliation, but that requirement is identical under dedicated and shared placement and is not a placement blocker. None is asserted certified or production-shared. The source tree identities include integration-only SDK requirement corrections: the four Runner candidates from `8bb55ec` now require `langbot-plugin>=0.7.4,<0.8`, and LangRAG now requires the same instead of `==0.6.1`; their source trees therefore intentionally differ from the lane tips. CI and contract corrections later changed some source trees; the per-plugin tree column identifies the current PR head, not the earlier lane tips.
 
