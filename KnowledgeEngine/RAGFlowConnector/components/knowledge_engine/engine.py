@@ -245,7 +245,10 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
         # configuration change cannot be mistaken for the same deployment.
         upstream_target = _normalize_base_url(api_base_url)
 
-        kb_id = context.get_collection_id()
+        # The Host knowledge-base id is the identity every entry point shares — the
+        # create hook, deletion and the fence/lock scope — so the collection id,
+        # which is a vector-store identity that need not equal it, is not used.
+        kb_id = context.knowledge_base_id
         await self._save_config(kb_id, config)
         if await self._load_document(kb_id, doc_id) is not None:
             raise RuntimeError('Existing upload intent; reconcile before retry')
@@ -525,7 +528,11 @@ class RAGFlowConnector(ConfigStore, KnowledgeEngine):
             # dispatched at all: the caller must not read this as a plain failure.
             raise
         except httpx.HTTPStatusError as e:
-            # The provider answered, so the delete was rejected deterministically.
+            # The provider answered, so this is not a transport ambiguity: a 4xx
+            # rejection is a resolved failure whose fence was released, while a
+            # 5xx keeps its fence (the provider or an intermediary may have
+            # committed the delete and then failed), so the next mutation for
+            # this knowledge base is still refused.
             logger.error(
                 f"[RAGFlowKnowledgeEngine] Delete rejected for doc={document_id}: {e}"
             )

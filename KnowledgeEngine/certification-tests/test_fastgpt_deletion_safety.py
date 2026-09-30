@@ -3,6 +3,7 @@
 Local HTTP fixture; real SDK objects via ``test_shared_state``'s loader.
 """
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -291,3 +292,153 @@ async def test_fastgpt_later_success_never_clears_an_unresolved_fence():
     assert ran == []
     assert engine._state.is_fenced(engine._state.binding(plugin), 'kb')
     assert [key for key in store.data if key.startswith(shared_state.FENCE_KEY_PREFIX)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [500, 400])
+async def test_fastgpt_delete_outcome_is_unknown_exactly_on_a_server_error(monkeypatch, status):
+    pc, ec = load_plugin('FastGPTConnector')
+    from components import shared_state
+
+    calls = []
+
+    async def service(request):
+        calls.append(request.method)
+        return httpx.Response(status, json={'message': 'upstream failed'})
+
+    bind_mock_http(monkeypatch, service)
+    store = StorageFixture()
+    engine = ec()
+    engine.plugin = bind(pc, store)
+    cfg = configuration('A')
+    await engine.on_knowledge_base_create('kb', cfg)
+    await engine._save_document('kb', 'host-doc', {
+        'upstream_id': 'upstream-doc', 'dataset_id': 'A', 'status': 'created',
+        'api_base_url': cfg['api_base_url']})
+
+    if status >= 500:
+        # The provider or a gateway failed after receiving the delete, so whether
+        # it was applied is unknown: the fence stays and the caller is told
+        # instead of being handed a resolved rejection.
+        with pytest.raises(shared_state.AmbiguousMutationError):
+            await engine.delete_document('kb', 'host-doc')
+        assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+        # The fence is durable, not just in this process.
+        assert json.loads(store.data[shared_state._kb_fence_key('kb')]) is not None
+        # Nothing was recorded as deleted, and the next mutation for this
+        # knowledge base is refused, also for a worker that restarts.
+        assert (await engine._load_document('kb', 'host-doc'))['status'] == 'created'
+        with pytest.raises(RuntimeError, match='fenced'):
+            await engine.delete_document('kb', 'host-doc')
+        restarted = ec()
+        restarted.plugin = bind(pc, store)
+        with pytest.raises(RuntimeError, match='fenced'):
+            await restarted.delete_document('kb', 'host-doc')
+    else:
+        # The provider answered with a rejection, so the delete did not happen.
+        assert await engine.delete_document('kb', 'host-doc') is False
+        assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+        assert json.loads(store.data[shared_state._kb_fence_key('kb')]) is None
+        restarted = ec()
+        restarted.plugin = bind(pc, store)
+        assert await restarted.delete_document('kb', 'host-doc') is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [500, 400])
+async def test_fastgpt_upload_outcome_is_unknown_exactly_on_a_server_error(monkeypatch, status):
+    pc, ec = load_plugin('FastGPTConnector')
+    from components import shared_state
+
+    async def service(request):
+        return httpx.Response(status, json={'message': 'upstream failed'})
+
+    bind_mock_http(monkeypatch, service)
+    store = StorageFixture()
+    engine = upload_engine(pc, ec, store)
+    cfg = configuration('A')
+
+    if status >= 500:
+        # A dispatched upload whose answer is a server error has an unknown
+        # outcome, so it is neither reported as a plain failure nor unfenced.
+        with pytest.raises(shared_state.AmbiguousMutationError):
+            await engine.ingest(ingest_context(cfg))
+        assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+        assert json.loads(store.data[shared_state._kb_fence_key('kb')]) is not None
+        assert (await engine._load_document('kb', 'local-doc'))['status'] == 'pending'
+        with pytest.raises(RuntimeError, match='fenced'):
+            await engine.on_knowledge_base_create('kb', cfg)
+        restarted = upload_engine(pc, ec, store)
+        with pytest.raises(RuntimeError, match='fenced'):
+            await restarted.on_knowledge_base_create('kb', cfg)
+    else:
+        # The provider answered with a rejection, so the upload is a failure with
+        # a resolved outcome and the knowledge base stays usable.
+        result = await engine.ingest(ingest_context(cfg))
+        assert result.status == DocumentStatus.FAILED
+        assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+        await engine.on_knowledge_base_create('kb', cfg)
+
+
+@pytest.mark.asyncio
+async def test_fastgpt_concurrent_first_load_cannot_resurrect_a_cleared_fence(monkeypatch):
+    pc, ec = load_plugin('FastGPTConnector')
+    from components import shared_state
+
+    store = StorageFixture()
+    seed = ec()
+    seed.plugin = bind(pc, store)
+    # An earlier ambiguous mutation left this knowledge base durably fenced.
+    await seed._state.fence(seed.plugin, 'cleared', 'earlier delete outcome unknown')
+
+    # The restarted worker's first fence load blocks on that record, so the
+    # delete of the fenced knowledge base is issued while the read is in flight.
+    store.gate_read(shared_state._kb_fence_key('cleared'))
+    engine = ec()
+    engine.plugin = bind(pc, store)
+    cfg = configuration('A')
+    loading = asyncio.create_task(engine.on_knowledge_base_create('fresh', cfg))
+    await asyncio.wait_for(store.gate_entered.wait(), 5)
+    clearing = asyncio.create_task(engine.on_knowledge_base_delete('cleared'))
+    for _ in range(200):
+        await asyncio.sleep(0)
+    # Both first calls share one Host read instead of one read per knowledge base.
+    assert store.keys_reads == 1
+    store.gate_release.set()
+    await loading
+    await clearing
+
+    assert store.keys_reads == 1
+    # The cleared knowledge base is usable: the snapshot that was read before
+    # the clear was not installed in its place.
+    assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'cleared')
+    await engine.on_knowledge_base_create('cleared', cfg)
+
+
+@pytest.mark.asyncio
+async def test_fastgpt_load_discards_a_snapshot_read_before_a_sibling_clear():
+    pc, ec = load_plugin('FastGPTConnector')
+    from components import shared_state
+
+    store = StorageFixture()
+    seed = ec()
+    seed.plugin = bind(pc, store)
+    await seed._state.fence(seed.plugin, 'kb', 'earlier delete outcome unknown')
+
+    store.gate_read(shared_state._kb_fence_key('kb'))
+    engine = ec()
+    engine.plugin = bind(pc, store)
+    cfg = configuration('A')
+    loading = asyncio.create_task(engine.on_knowledge_base_create('kb', cfg))
+    await asyncio.wait_for(store.gate_entered.wait(), 5)
+    # The operator path out of a fence lands while the load's Host read is in
+    # flight and already holds the fence record in hand.
+    await engine._state.clear_fence(engine.plugin, 'kb')
+    store.gate_release.set()
+    await loading
+
+    # The stale snapshot was discarded and re-read instead of installed: the
+    # cleared knowledge base neither fails this call nor stays fenced.
+    assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
+    assert store.keys_reads == 2
+    await engine.on_knowledge_base_create('kb', configuration('B'))

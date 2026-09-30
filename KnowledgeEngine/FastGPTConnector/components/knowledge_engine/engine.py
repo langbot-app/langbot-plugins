@@ -7,6 +7,7 @@ from components.shared_state import (
     AmbiguousMutationError,
     ConfigStore,
     FenceLifecycleError,
+    is_ambiguous_http_failure,
     normalize_api_base_url,
     serialized,
 )
@@ -260,6 +261,20 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             # An already-dispatched upload with an unknown outcome, or a mutation
             # that was never dispatched: the caller must see it.
             raise
+        except httpx.HTTPStatusError as e:
+            if is_ambiguous_http_failure(e):
+                # A 5xx or gateway answer is not proof the upload was not
+                # applied, so it is not a rejection: the fence stays and the
+                # caller must see the unknown outcome.
+                raise AmbiguousMutationError(
+                    f"FastGPT upload outcome unknown for {filename}: {e}"
+                ) from e
+            logger.error(f"[FastGPTKnowledgeEngine] Upload rejected for {filename}: {e}")
+            return IngestionResult(
+                document_id=doc_id,
+                status=DocumentStatus.FAILED,
+                error_message=str(e),
+            )
         except Exception as e:
             logger.error(f"[FastGPTKnowledgeEngine] Ingestion failed for {filename}: {e}")
             return IngestionResult(
@@ -337,6 +352,13 @@ class FastGPTConnector(ConfigStore, KnowledgeEngine):
             # dispatched at all: the caller must not read this as a plain failure.
             raise
         except httpx.HTTPStatusError as e:
+            if is_ambiguous_http_failure(e):
+                # A 5xx or gateway answer is not proof the delete was not
+                # applied, so it is not a rejection: the fence stays and the
+                # caller must see the unknown outcome.
+                raise AmbiguousMutationError(
+                    f"FastGPT delete outcome unknown for collection={document_id}: {e}"
+                ) from e
             # The provider answered, so the delete was rejected deterministically.
             logger.error(
                 f"[FastGPTKnowledgeEngine] Delete rejected for collection={document_id}: {e}"

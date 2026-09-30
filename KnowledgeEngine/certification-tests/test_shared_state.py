@@ -45,16 +45,41 @@ class StorageFixture:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.release.set()
+        # Host-read instrumentation: how many key listings were served, and
+        # one-shot gates that suspend the next read of one key so a test can land
+        # a concurrent write inside that reader's window.
+        self.keys_reads = 0
+        self.gates = {}
+        self.gate_entered = asyncio.Event()
+        self.gate_release = asyncio.Event()
+
+    def gate_read(self, key):
+        """Suspend the next ``get_plugin_storage(key)`` until ``gate_release``.
+
+        The gated reader captures the value it was answered with before it
+        blocks, so the caller can change that record while the read is in flight
+        exactly like a response computed before a concurrent write. Only the
+        first read of ``key`` is gated; later readers pass through.
+        """
+        self.gate_entered = asyncio.Event()
+        self.gate_release = asyncio.Event()
+        self.gates[key] = self.gate_entered
 
     async def get_plugin_storage_keys(self):
         if self.fail:
             raise RuntimeError('fixture storage offline')
+        self.keys_reads += 1
         return list(self.data)
 
     async def get_plugin_storage(self, key):
         if self.fail:
             raise RuntimeError('fixture storage offline')
-        return self.data[key]
+        value = self.data[key]
+        entered = self.gates.pop(key, None)
+        if entered is not None:
+            entered.set()
+            await self.gate_release.wait()
+        return value
 
     async def set_plugin_storage(self, key, value):
         # A detached Host commit survives cancellation of the caller, like real RPC.
@@ -339,10 +364,18 @@ async def test_installation_revocation_releases_process_local_state(name):
     engine._state._locks[(binding, 'kb')] = lock
     engine._state._fenced_keys(binding).add('ke.fence.v1.deadbeef')
     engine._state._fence_loaded.add(binding)
+    if hasattr(engine._state, '_fence_load_locks'):
+        # The single-flight load lock and the fence generation belong to the
+        # binding too, so a revoked installation must not keep a stale pair.
+        engine._state._fence_load_locks[binding] = asyncio.Lock()
+        engine._state._fence_generation[binding] = 3
     await plugin.on_installation_revoked(binding)
     assert (binding, 'kb') not in engine._state._locks
     assert binding not in engine._state._fenced
     assert binding not in engine._state._fence_loaded
+    if hasattr(engine._state, '_fence_load_locks'):
+        assert binding not in engine._state._fence_load_locks
+        assert binding not in engine._state._fence_generation
 
 
 @pytest.mark.asyncio

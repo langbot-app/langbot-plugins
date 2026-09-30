@@ -87,13 +87,17 @@ class FencedKnowledgeBaseError(FenceLifecycleError):
 def is_ambiguous_http_failure(exc):
     """Whether a failed provider call had an unknown outcome.
 
-    A response status means the provider answered, so the failure is
-    deterministic. A connection that was never established means nothing was
-    dispatched. Everything else (timeout, lost connection, unparsable response)
-    was dispatched with an unknown outcome.
+    Only a rejection the protocol makes unambiguous releases the caller's
+    protection: a 4xx response means the provider received and refused the
+    request, and a connection that was never established means nothing was
+    dispatched. A 5xx or gateway response is NOT proof that the request was not
+    applied — the provider or an intermediary may have committed the change and
+    then failed — so it stays ambiguous together with timeouts, lost connections
+    and unparsable responses.
     """
     if isinstance(exc, httpx.HTTPStatusError):
-        return False
+        response = getattr(exc, "response", None)
+        return response is None or response.status_code >= 500
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         return False
     return True
@@ -125,10 +129,14 @@ def _kb_identity(method, instance, args, kwargs):
     """Extract the knowledge-base identity from a serialized method's arguments.
 
     Reads a ``kb_id`` / ``collection_id`` / ``knowledge_base_id`` argument first,
-    then an argument exposing ``get_collection_id()`` or ``knowledge_base_id``
-    (ingestion passes the whole context). Returns ``None`` when the wrapped
-    method carries no knowledge-base identity, in which case the caller falls
-    back to an installation-wide lock and fence.
+    then an argument exposing ``knowledge_base_id`` or ``get_collection_id()``
+    (ingestion passes the whole context). The knowledge-base id is preferred: the
+    collection id is a vector-store identity that need not equal it, and every
+    other entry point of the connector is addressed by the knowledge-base id, so
+    locking and fencing on the collection id would split one knowledge base into
+    two independently protected scopes. Returns ``None`` when the wrapped method
+    carries no knowledge-base identity, in which case the caller falls back to an
+    installation-wide lock and fence.
     """
     try:
         bound = inspect.signature(method).bind_partial(instance, *args, **kwargs)
@@ -139,6 +147,9 @@ def _kb_identity(method, instance, args, kwargs):
         if isinstance(value, str) and value:
             return value
     for value in bound.arguments.values():
+        identity = getattr(value, 'knowledge_base_id', None)
+        if isinstance(identity, str) and identity:
+            return identity
         getter = getattr(value, 'get_collection_id', None)
         if callable(getter):
             try:
@@ -147,9 +158,6 @@ def _kb_identity(method, instance, args, kwargs):
                 continue
             if isinstance(identity, str) and identity:
                 return identity
-        identity = getattr(value, 'knowledge_base_id', None)
-        if isinstance(identity, str) and identity:
-            return identity
     return None
 
 
@@ -165,6 +173,12 @@ class SerialState:
         # binding -> set of fence keys; cache in front of persisted fences.
         self._fenced = {}
         self._fence_loaded = set()
+        # binding -> single-flight lock and mutation counter for the fence read.
+        self._fence_load_locks: dict = {}
+        self._fence_generation: dict = {}
+
+    def _bump_fence_generation(self, binding):
+        self._fence_generation[binding] = self._fence_generation.get(binding, 0) + 1
 
     @staticmethod
     def binding(plugin):
@@ -196,13 +210,38 @@ class SerialState:
         unknown, so it must not be mistaken for "no fences": the operation is
         refused with ``FenceStateUnavailableError`` and nothing is dispatched.
         The binding is not marked as loaded, so the next attempt re-reads and
-        the knowledge base becomes usable again once storage answers.
+        the knowledge base becomes usable again once storage answers. The read
+        is single-flight per installation, and a snapshot read before a sibling
+        operation changed the fence state is discarded instead of installed.
         """
         if binding in self._fence_loaded:
             return
+        lock = self._fence_load_locks.get(binding)
+        if lock is None:
+            lock = self._fence_load_locks[binding] = asyncio.Lock()
+        async with lock:
+            if binding in self._fence_loaded:
+                return
+            for _ in range(8):
+                generation = self._fence_generation.get(binding, 0)
+                snapshot = await self._read_fences(plugin, binding)
+                if generation == self._fence_generation.get(binding, 0):
+                    self._fenced_keys(binding).update(snapshot)
+                    self._fence_loaded.add(binding)
+                    return
+            raise FenceStateUnavailableError(
+                f"Fence state for {binding!r} kept changing while it was being read"
+            )
+
+    async def _read_fences(self, plugin, binding) -> set:
+        """Read the persisted fence keys for one installation.
+
+        An unreadable marker counts as fenced and a failed read refuses the
+        operation with ``FenceStateUnavailableError``; the read is never cached.
+        """
         try:
             keys = await plugin.get_plugin_storage_keys()
-            fenced = self._fenced_keys(binding)
+            snapshot = set()
             for key in keys:
                 if not key.startswith(FENCE_KEY_PREFIX):
                     continue
@@ -212,7 +251,8 @@ class SerialState:
                     # Unreadable marker: fail closed on this knowledge base.
                     marker = {'reason': 'unreadable fence record'}
                 if marker is not None:
-                    fenced.add(key)
+                    snapshot.add(key)
+            return snapshot
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -221,7 +261,6 @@ class SerialState:
                 f"Could not read persisted fences for {binding!r}; pending ambiguous "
                 f"mutations are unknown: {exc!r}"
             ) from exc
-        self._fence_loaded.add(binding)
 
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
         binding = self.binding(plugin)
@@ -301,6 +340,7 @@ class SerialState:
                 f"Could not persist fence for {kb_identity!r}: {failure!r}"
             ) from failure
         self._fenced_keys(binding).add(fence_key)
+        self._bump_fence_generation(binding)
 
     async def clear_fence(self, plugin, kb_identity):
         """Drop the fence for one knowledge base, in process and in storage.
@@ -312,6 +352,7 @@ class SerialState:
         binding = self.binding(plugin)
         fence_key = _kb_fence_key(kb_identity)
         self._fenced_keys(binding).discard(fence_key)
+        self._bump_fence_generation(binding)
         cancelled, failure = await _settle_commit(
             asyncio.create_task(plugin.set_plugin_storage(fence_key, b'null'))
         )
@@ -347,6 +388,8 @@ class SerialState:
             self._locks.pop(key, None)
         self._fenced.pop(binding, None)
         self._fence_loaded.discard(binding)
+        self._fence_load_locks.pop(binding, None)
+        self._fence_generation.pop(binding, None)
 
 
 def serialized(method=None, *, allow_fenced=False):
@@ -368,6 +411,9 @@ class ConfigStore:
 
     A JSON null tombstone makes missing KBs explicit without ambiguous delete RPCs.
     The one mutation lock also orders ingest/delete/create inside this worker.
+    Configuration and document mappings are keyed by the Host knowledge-base id;
+    records an earlier revision keyed by the ingestion collection id are resolved
+    and rewritten under the canonical key by ``_load_document``.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -420,12 +466,65 @@ class ConfigStore:
             json.dumps([kb_id, host_document_id]).encode()
         ).hexdigest()
 
+    async def _legacy_document(self, keys, kb_id, host_document_id):
+        """Find the mapping an earlier revision keyed by the collection id.
+
+        An earlier revision of this connector keyed a knowledge base's durable
+        records by the ingestion context's collection id, which need not equal
+        the Host knowledge-base id every other entry point uses. Such a record
+        names the identity it was written under, so the Host document id it
+        records resolves it. More than one candidate means the document cannot be
+        attributed without guesswork, so it is refused rather than picked.
+        """
+        matches = []
+        for candidate in keys:
+            if not candidate.startswith('ke.document.v1.'):
+                continue
+            item = json.loads(await self.plugin.get_plugin_storage(candidate))
+            if not isinstance(item, dict):
+                continue
+            legacy_kb_id = item.get('kb_id')
+            if (isinstance(legacy_kb_id, str) and legacy_kb_id and legacy_kb_id != kb_id
+                    and item.get('host_document_id') == host_document_id):
+                matches.append(item)
+        if len(matches) > 1:
+            raise ValueError('Ambiguous legacy document mapping; reconcile installation')
+        return matches[0] if matches else None
+
+    async def _migrate_legacy(self, kb_id, mapping):
+        """Rewrite a collection-keyed document record under the canonical key.
+
+        The mapping is rewritten canonically, and the configuration that the same
+        legacy identity holds is copied across when the canonical configuration is
+        missing, so a deletion that resolves the legacy mapping also finds the
+        settings it needs to reach the upstream. A legacy identity that is absent
+        leaves nothing to migrate.
+        """
+        await self._save_document(kb_id, mapping['host_document_id'], mapping)
+        legacy_kb_id = mapping.get('kb_id')
+        if not isinstance(legacy_kb_id, str) or not legacy_kb_id or legacy_kb_id == kb_id:
+            return
+        keys = await self.plugin.get_plugin_storage_keys()
+        legacy_key = self._key(legacy_kb_id)
+        if self._key(kb_id) in keys or legacy_key not in keys:
+            return
+        value = json.loads(await self.plugin.get_plugin_storage(legacy_key))
+        if isinstance(value, dict):
+            await self._save_config(kb_id, value)
+
     async def _load_document(self, kb_id, host_document_id):
         key = self._document_key(kb_id, host_document_id)
         keys = await self.plugin.get_plugin_storage_keys()
         if key in keys:
             value = json.loads(await self.plugin.get_plugin_storage(key))
         else:
+            # A canonical miss may be a record an earlier revision wrote under the
+            # collection key; resolving it migrates it (and the configuration it
+            # shares that identity with) to the canonical key.
+            legacy = await self._legacy_document(keys, kb_id, host_document_id)
+            if legacy is not None:
+                await self._migrate_legacy(kb_id, legacy)
+                return {**legacy, 'kb_id': kb_id, 'host_document_id': host_document_id}
             # Current Host passes the durable upstream ID on delete; older Host
             # revisions pass its file UUID. Resolve either without trusting an
             # arbitrary unrecorded identifier.

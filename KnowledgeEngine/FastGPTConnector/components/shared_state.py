@@ -98,13 +98,17 @@ def normalize_api_base_url(api_base_url):
 def is_ambiguous_http_failure(exc):
     """Whether a failed provider call had an unknown outcome.
 
-    A response status means the provider answered, so the failure is
-    deterministic. A connection that was never established means nothing was
-    dispatched. Everything else (timeout, lost connection, unparsable response)
-    was dispatched with an unknown outcome.
+    Only a rejection the protocol makes unambiguous releases the caller's
+    protection: a 4xx response means the provider received and refused the
+    request, and a connection that was never established means nothing was
+    dispatched. A 5xx or gateway response is NOT proof that the request was not
+    applied — the provider or an intermediary may have committed the change and
+    then failed — so it stays ambiguous together with timeouts, lost connections
+    and unparsable responses.
     """
     if isinstance(exc, httpx.HTTPStatusError):
-        return False
+        response = getattr(exc, "response", None)
+        return response is None or response.status_code >= 500
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         return False
     return True
@@ -176,6 +180,9 @@ class SerialState:
         # binding -> set of fence keys; cache in front of persisted fences.
         self._fenced = {}
         self._fence_loaded = set()
+        # binding -> single-flight lock and mutation counter for the fence read.
+        self._fence_load_locks: dict = {}
+        self._fence_generation: dict = {}
 
     @staticmethod
     def binding(plugin):
@@ -190,6 +197,9 @@ class SerialState:
     def _scope(binding, kb_identity):
         return (binding, kb_identity)
 
+    def _bump_fence_generation(self, binding):
+        self._fence_generation[binding] = self._fence_generation.get(binding, 0) + 1
+
     def _fenced_keys(self, binding):
         return self._fenced.setdefault(binding, set())
 
@@ -200,18 +210,16 @@ class SerialState:
             or _INSTALLATION_FENCE_KEY in fenced
         )
 
-    async def _load_fences(self, plugin, binding):
+    async def _read_fences(self, plugin, binding) -> set:
         """Read persisted fences for one binding, succeeded reads only.
 
         A failed read is not "no fences": it raises so the caller refuses this
-        operation, and it is not cached, so the next call retries the read
-        instead of treating the failure as permanent.
+        operation, and the result is not cached, so the next call retries the
+        read instead of treating the failure as permanent.
         """
-        if binding in self._fence_loaded:
-            return
         try:
+            fenced = set()
             keys = await plugin.get_plugin_storage_keys()
-            fenced = self._fenced_keys(binding)
             for key in keys:
                 if not key.startswith(FENCE_KEY_PREFIX):
                     continue
@@ -222,13 +230,44 @@ class SerialState:
                     marker = {'reason': 'unreadable fence record'}
                 if marker is not None:
                     fenced.add(key)
+            return fenced
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise FenceStateUnavailableError(
                 f"Fence state for {binding!r} is unavailable: {exc!r}"
             ) from exc
-        self._fence_loaded.add(binding)
+
+    async def _load_fences(self, plugin, binding):
+        """Read persisted fences for one binding, succeeded reads only.
+
+        A failed read is not "no fences": it raises so the caller refuses this
+        operation, and it is not cached, so the next call retries the read
+        instead of treating the failure as permanent. The read is single-flight
+        per installation, so concurrent first calls for one binding perform one
+        read, and a snapshot whose read started before a sibling operation
+        changed the fence state is discarded instead of installed: operations
+        lock per knowledge base, so another knowledge base's fence can be
+        cleared while this read is in flight.
+        """
+        if binding in self._fence_loaded:
+            return
+        lock = self._fence_load_locks.get(binding)
+        if lock is None:
+            lock = self._fence_load_locks[binding] = asyncio.Lock()
+        async with lock:
+            if binding in self._fence_loaded:
+                return
+            for _ in range(8):
+                generation = self._fence_generation.get(binding, 0)
+                snapshot = await self._read_fences(plugin, binding)
+                if generation == self._fence_generation.get(binding, 0):
+                    self._fenced_keys(binding).update(snapshot)
+                    self._fence_loaded.add(binding)
+                    return
+            raise FenceStateUnavailableError(
+                f"Fence state for {binding!r} kept changing while it was being read"
+            )
 
     async def run(self, plugin, kb_identity, operation, *, allow_fenced=False):
         binding = self.binding(plugin)
@@ -308,6 +347,7 @@ class SerialState:
                 f"Could not persist fence for {kb_identity!r}: {failure!r}"
             ) from failure
         self._fenced_keys(binding).add(fence_key)
+        self._bump_fence_generation(binding)
 
     async def clear_fence(self, plugin, kb_identity):
         """Drop the fence for one knowledge base, in process and in storage.
@@ -319,6 +359,7 @@ class SerialState:
         binding = self.binding(plugin)
         fence_key = _kb_fence_key(kb_identity)
         self._fenced_keys(binding).discard(fence_key)
+        self._bump_fence_generation(binding)
         cancelled, failure = await _settle_commit(
             asyncio.create_task(plugin.set_plugin_storage(fence_key, b'null'))
         )
@@ -354,6 +395,8 @@ class SerialState:
             self._locks.pop(key, None)
         self._fenced.pop(binding, None)
         self._fence_loaded.discard(binding)
+        self._fence_load_locks.pop(binding, None)
+        self._fence_generation.pop(binding, None)
 
 
 def serialized(method=None, *, allow_fenced=False):

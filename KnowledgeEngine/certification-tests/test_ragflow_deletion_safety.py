@@ -152,10 +152,10 @@ async def test_cancelled_delete_dispatch_fences_and_keeps_the_created_mapping(mo
 
 
 @pytest.mark.asyncio
-async def test_deterministic_upload_rejection_leaves_no_fence(monkeypatch):
+async def test_upload_rejection_leaves_no_fence(monkeypatch):
     async def handler(request):
         if request.method == 'POST' and request.url.path.endswith('/documents'):
-            return httpx.Response(500, text='rejected')
+            return httpx.Response(400, text='rejected')
         return acknowledge(request)
 
     store = StorageFixture()
@@ -163,8 +163,8 @@ async def test_deterministic_upload_rejection_leaves_no_fence(monkeypatch):
     result = await engine.ingest(ingest_context(configuration('A')))
     assert result.status == DocumentStatus.FAILED
 
-    # The provider answered, so the pre-dispatch intent was cleared again and the
-    # knowledge base remains usable.
+    # The provider refused the request, which is an unambiguous answer: the
+    # pre-dispatch intent was cleared again and the knowledge base is usable.
     assert not engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb')
     assert fence_records(store) == []
     await engine.on_knowledge_base_create('kb', configuration('A'))
@@ -369,3 +369,199 @@ async def test_later_success_never_clears_an_unresolved_fence(monkeypatch):
     assert ran == []
     assert engine._state.is_fenced(engine._state.binding(plugin), 'kb')
     assert [record['kb_id'] for record in fence_records(store)] == ['kb']
+
+
+def collection_context(config, collection_id):
+    """An ingestion context whose collection id is not the knowledge-base id."""
+    context = ingest_context(config)
+    context.collection_id = collection_id
+    return context
+
+
+@pytest.mark.asyncio
+async def test_differing_collection_and_knowledge_base_ids_share_one_identity(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    plugin = engine.plugin
+    binding = engine._state.binding(plugin)
+    # The fence is taken for the knowledge base the Host names; an ingestion
+    # context that carries a different collection id must observe the same one.
+    await engine._state.fence(plugin, 'kb', 'earlier upload outcome unknown')
+    context = collection_context(configuration('A'), 'collection-1')
+    with pytest.raises(shared_state.FencedKnowledgeBaseError):
+        await engine.ingest(context)
+    assert calls == [], 'a fenced knowledge base dispatches nothing'
+
+    await engine._state.clear_fence(plugin, 'kb')
+    result = await engine.ingest(context)
+    assert result.status == DocumentStatus.PROCESSING
+
+    # One identity for the mapping too: it is written under the knowledge-base
+    # key, so the deletion that names the knowledge base finds it.
+    assert (await engine._load_document('kb', 'local-doc'))['upstream_id'] == 'upstream-1'
+    assert await engine.delete_document('kb', 'local-doc') is True
+    assert [request.method for request in calls] == ['POST', 'POST', 'DELETE']
+    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'deleted'
+    assert not engine._state.is_fenced(binding, 'kb')
+
+
+@pytest.mark.asyncio
+async def test_legacy_collection_keyed_record_is_migrated(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+
+    # Records written by the revision that keyed a knowledge base by the
+    # ingestion collection id: neither the configuration nor the mapping is
+    # reachable under the knowledge-base key.
+    await engine._save_config('collection-1', configuration('A'))
+    await engine._save_document('collection-1', 'doc', created_mapping('https://fixture.invalid'))
+
+    assert await engine.delete_document('kb', 'doc') is True
+    assert [request.method for request in calls] == ['DELETE']
+
+    # Both records now resolve under the canonical key: the deletion tombstoned
+    # the canonical mapping, and the settings it needed came across with it.
+    assert engine._document_key('kb', 'doc') in store.data
+    assert (await engine._load_document('kb', 'doc'))['status'] == 'deleted'
+    assert (await engine._load_config('kb'))['api_key'] == 'A'
+
+
+@pytest.mark.asyncio
+async def test_legacy_collection_keyed_intent_is_found_by_an_ingest(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+
+    # A pending record from the revision that keyed by the collection id is the
+    # same upload intent the canonical check has to refuse.
+    await engine._save_document('collection-1', 'local-doc',
+                                {'upstream_id': '', 'dataset_id': 'A',
+                                 'api_base_url': 'https://fixture.invalid', 'status': 'pending'})
+    with pytest.raises(RuntimeError, match='Existing upload intent'):
+        await engine.ingest(collection_context(configuration('A'), 'collection-1'))
+    assert calls == []
+    assert (await engine._load_document('kb', 'local-doc'))['status'] == 'pending'
+
+
+INGESTION_STEPS = [
+    pytest.param('/documents', {}, id='upload'),
+    pytest.param('/chunks', {}, id='parse'),
+    pytest.param('/run_graphrag', {'auto_graphrag': True}, id='graphrag'),
+    pytest.param('/run_raptor', {'auto_raptor': True}, id='raptor'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status, fenced', [(503, True), (400, False)])
+@pytest.mark.parametrize('suffix, extra', INGESTION_STEPS)
+async def test_ingestion_failure_classification_on_every_step(
+        monkeypatch, suffix, extra, status, fenced):
+    async def handler(request):
+        if request.url.path.endswith(suffix):
+            return httpx.Response(status, text='fixture answer')
+        return acknowledge(request)
+
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, handler)
+    result = await engine.ingest(ingest_context({**configuration('A'), **extra}))
+    assert result.status == DocumentStatus.FAILED
+
+    # A gateway failure is not proof that the request was not applied, so the
+    # knowledge base stays fenced; a rejection is a resolved answer.
+    assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb') is fenced
+    assert bool(fence_records(store)) is fenced
+
+    if fenced:
+        # The next mutation is refused instead of being dispatched over the
+        # unresolved one.
+        with pytest.raises(RuntimeError, match='fenced'):
+            await engine.delete_document('kb', 'local-doc')
+    else:
+        # The rejection was resolved, so the knowledge base is usable again.
+        await engine.delete_document('kb', 'local-doc')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status, fenced', [(503, True), (400, False)])
+async def test_delete_failure_classification(monkeypatch, status, fenced):
+    async def handler(request):
+        if request.method == 'DELETE':
+            return httpx.Response(status, text='fixture answer')
+        return acknowledge(request)
+
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, handler)
+    await engine._save_config('kb', configuration('A'))
+    await engine._save_document('kb', 'doc', created_mapping('https://fixture.invalid'))
+
+    assert await engine.delete_document('kb', 'doc') is False
+    assert engine._state.is_fenced(engine._state.binding(engine.plugin), 'kb') is fenced
+    assert bool(fence_records(store)) is fenced
+    assert (await engine._load_document('kb', 'doc'))['status'] == 'created'
+
+    if fenced:
+        with pytest.raises(RuntimeError, match='fenced'):
+            await engine.delete_document('kb', 'doc')
+        assert [request.method for request in calls] == ['DELETE']
+    else:
+        # The rejection released the fence, so the delete may be retried.
+        assert await engine.delete_document('kb', 'doc') is False
+
+
+@pytest.mark.asyncio
+async def test_fence_snapshot_read_before_a_clear_is_discarded(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    state, plugin = engine._state, engine.plugin
+    binding = state.binding(plugin)
+    await state.fence(plugin, 'kb', 'earlier upload outcome unknown')
+
+    # The fence is read once for the installation, and the read is answered with
+    # the marker that existed before the clear below lands.
+    store.gate_read(shared_state._kb_fence_key('kb'))
+    load = asyncio.create_task(state._load_fences(plugin, binding))
+    await asyncio.wait_for(store.gate_entered.wait(), 5)
+    await state.clear_fence(plugin, 'kb')
+    assert not state.is_fenced(binding, 'kb')
+    store.gate_release.set()
+    await load
+
+    # The snapshot taken before the clear is discarded instead of re-fencing the
+    # knowledge base the operator just cleared.
+    assert not state.is_fenced(binding, 'kb')
+
+    async def operation():
+        return 'ran'
+
+    assert await state.run(plugin, 'kb', operation) == 'ran'
+
+
+@pytest.mark.asyncio
+async def test_fence_state_is_read_once_per_installation(monkeypatch):
+    store = StorageFixture()
+    engine, calls = engine_with(monkeypatch, store, acknowledge)
+    from components import shared_state
+
+    state, plugin = engine._state, engine.plugin
+    # A persisted fence for another knowledge base of the same installation gives
+    # the first load a marker to read, and so a window inside that read.
+    await state.fence(plugin, 'other', 'earlier upload outcome unknown')
+    store.gate_read(shared_state._kb_fence_key('other'))
+    before = store.keys_reads
+
+    async def operation():
+        return 'ran'
+
+    first = asyncio.create_task(state.run(plugin, 'kb', operation))
+    await asyncio.wait_for(store.gate_entered.wait(), 5)
+    second = asyncio.create_task(state.run(plugin, 'kb-2', operation))
+    await asyncio.sleep(.05)
+    store.gate_release.set()
+    assert await asyncio.gather(first, second) == ['ran', 'ran']
+
+    # Both knowledge bases share one installation: the persisted fence state was
+    # read once for the pair, not once per knowledge base.
+    assert store.keys_reads - before == 1
