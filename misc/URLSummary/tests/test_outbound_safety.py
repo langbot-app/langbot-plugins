@@ -56,6 +56,7 @@ from safe_fetch import (  # noqa: E402
     FetchAbortedError,
     FetchError,
     ResponseTooLargeError,
+    TruncatedResponseError,
 )
 
 PUBLIC_IP = "93.184.216.34"
@@ -134,6 +135,32 @@ def _route_connections(monkeypatch, port: int, attempted: list | None = None):
 
 def _page(plugin: URLSummary, server: "_Server", path: str, max_len: int = 8000):
     return asyncio.run(plugin.fetch_page(server.url(path), max_len))
+
+
+_SCRIPTED_PEERS: list = []
+"""Scripted peers stay open for the whole session: closing one while the client
+still has unread data makes Windows reset the connection (WSAECONNABORTED)."""
+
+
+def _scripted_peer(monkeypatch, raw_response: bytes, *, on_connect=None):
+    """Answer every connection with ``raw_response`` from a real socketpair.
+
+    No HTTP server is involved: the peer sends the scripted bytes and then stops
+    sending.  That reproduces, on every platform, the clean EOF a shut-down
+    socket shows on Linux, which is what makes the abort/truncation checks below
+    platform-independent.
+    """
+
+    def fake_create_connection(address, *args, **kwargs):
+        peer, client = socket.socketpair()
+        peer.sendall(raw_response)
+        peer.shutdown(socket.SHUT_WR)  # the peer simply stops sending
+        _SCRIPTED_PEERS.append(peer)
+        if on_connect is not None:
+            on_connect()
+        return client
+
+    monkeypatch.setattr(safe_fetch.socket, "create_connection", fake_create_connection)
 
 
 def _make_context(text: str) -> SimpleNamespace:
@@ -543,6 +570,7 @@ def test_fetch_deadline_stops_a_slow_peer():
             pass
 
     errors: list[Exception] = []
+    returned: list[object] = []
 
     with _Server() as server:
         server.responses["/slow"] = slow_body
@@ -550,7 +578,7 @@ def test_fetch_deadline_stops_a_slow_peer():
 
             def run():
                 try:
-                    safe_fetch.fetch_document(server.url("/slow"), timeout=1.0)
+                    returned.append(safe_fetch.fetch_document(server.url("/slow"), timeout=1.0))
                 except Exception as exc:  # noqa: BLE001 - recorded for the assertion
                     errors.append(exc)
                 finally:
@@ -562,14 +590,22 @@ def test_fetch_deadline_stops_a_slow_peer():
             assert finished.wait(10), "the fetch did not honour its deadline"
             elapsed = time.monotonic() - start
 
-    assert isinstance(errors[0], FetchAbortedError)
+    assert returned == [], "a timed-out fetch must not be returned as a document"
+    assert errors and isinstance(errors[0], FetchAbortedError)
     assert elapsed < 5
 
 
 def test_stop_event_aborts_an_in_flight_download():
+    """A cancelled in-flight fetch ends promptly and never returns a document.
+
+    The outcome must not depend on how the platform reports the shut-down
+    socket (exception vs clean EOF): either way the caller sees an abort, never
+    a partial document.
+    """
     started = threading.Event()
     finished = threading.Event()
     errors: list[Exception] = []
+    returned: list[object] = []
     stop_event = threading.Event()
 
     def slow_body(handler):
@@ -578,10 +614,10 @@ def test_stop_event_aborts_an_in_flight_download():
         handler.send_header("Content-Length", "1000000")
         handler.end_headers()
         try:
-            for _ in range(100):
+            for _ in range(400):
                 handler.wfile.write(b"x" * 1024)
                 handler.wfile.flush()
-                time.sleep(0.1)
+                time.sleep(0.05)
         except OSError:
             pass
 
@@ -592,8 +628,10 @@ def test_stop_event_aborts_an_in_flight_download():
             def run():
                 started.set()
                 try:
-                    safe_fetch.fetch_document(
-                        server.url("/slow"), timeout=30, stop_event=stop_event
+                    returned.append(
+                        safe_fetch.fetch_document(
+                            server.url("/slow"), timeout=30, stop_event=stop_event
+                        )
                     )
                 except Exception as exc:  # noqa: BLE001
                     errors.append(exc)
@@ -607,7 +645,63 @@ def test_stop_event_aborts_an_in_flight_download():
             stop_event.set()
 
     assert finished.wait(10), "the stop flag did not interrupt the in-flight download"
-    assert isinstance(errors[0], FetchAbortedError)
+    assert returned == [], "an aborted fetch must not be returned as a document"
+    assert errors and isinstance(errors[0], FetchAbortedError)
+
+
+def test_an_abort_that_reads_as_a_clean_eof_never_returns_a_body(monkeypatch):
+    """The Linux symptom: a shut-down socket reads as EOF mid-body.
+
+    The abort lands while the reader is blocked in the socket read, and that
+    read comes back as a plain EOF.  The fetch must abort instead of handing
+    the partial body back as a complete response.
+    """
+    raw = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html\r\n"
+        b"Content-Length: 1000000\r\n"
+        b"\r\n"
+        b"<html>partial"
+    )
+    stop_event = threading.Event()
+    real_read1 = http.client.HTTPResponse.read1
+    reads: list[int] = []
+
+    def read1(self, n=-1):
+        chunk = real_read1(self, n)
+        reads.append(len(chunk))
+        if not chunk:
+            # The cancel/deadline fires while this read is parked in the socket.
+            stop_event.set()
+        return chunk
+
+    _scripted_peer(monkeypatch, raw)
+    monkeypatch.setattr(http.client.HTTPResponse, "read1", read1)
+
+    with pytest.raises(FetchAbortedError):
+        safe_fetch.fetch_document(
+            f"http://{PUBLIC_IP}/partial", timeout=30, stop_event=stop_event
+        )
+
+    assert reads and reads[0] > 0, "the body must really have started before the EOF"
+
+
+def test_a_body_shorter_than_content_length_is_never_returned(monkeypatch):
+    """A peer that stops early must fail loudly, not look like a page."""
+    raw = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html\r\n"
+        b"Content-Length: 1000000\r\n"
+        b"\r\n"
+        b"<html>partial"
+    )
+    _scripted_peer(monkeypatch, raw)
+
+    with pytest.raises(TruncatedResponseError) as excinfo:
+        safe_fetch.fetch_document(f"http://{PUBLIC_IP}/partial")
+
+    assert "truncated" in str(excinfo.value)
+    assert "13 of 1000000" in str(excinfo.value)
 
 
 def _connect_to(port: int):
@@ -795,6 +889,57 @@ def test_cancelled_running_fetch_keeps_its_slot_until_the_worker_ends(monkeypatc
         assert slots._value == free
 
     asyncio.run(scenario())
+
+
+def test_cancel_during_the_body_frees_the_slot_and_stays_usable(monkeypatch):
+    """An aborted in-flight fetch ends, frees exactly one slot and stays usable."""
+    started = threading.Event()
+
+    def slow_body(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html")
+        handler.send_header("Content-Length", "1000000")
+        handler.end_headers()
+        try:
+            for _ in range(400):  # far longer than the test: only the abort ends it
+                handler.wfile.write(b"x" * 1024)
+                handler.wfile.flush()
+                started.set()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    async def scenario(port: int):
+        slots = main_mod._slots()
+        free = slots._value
+        plugin = URLSummary()
+
+        task = asyncio.create_task(
+            plugin.fetch_page(f"http://{PUBLIC_IP}:{port}/slow", 500)
+        )
+        await asyncio.to_thread(started.wait, 5)
+        assert slots._value == free - 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(300):
+            if slots._value == free:
+                break
+            await asyncio.sleep(0.02)
+        assert slots._value == free, "the aborted fetch did not release exactly one slot"
+
+        return await plugin.fetch_page(f"http://{PUBLIC_IP}:{port}/ok", 500)
+
+    with _Server() as server:
+        server.responses["/slow"] = slow_body
+        server.responses["/ok"] = lambda handler: _send(
+            handler, b"<html><head><title>Ok</title></head><body>after abort</body></html>"
+        )
+        _route_connections(monkeypatch, server.port)
+        title, text = asyncio.run(scenario(server.port))
+
+    assert title == "Ok" and "after abort" in text
 
 
 def test_slot_lease_releases_at_most_once():

@@ -59,6 +59,10 @@ certification requirements in the plugin request layer:
   watchdog thread shuts the socket down when either fires, because a socket
   timeout only bounds the idle time between two reads. The socket is closed on
   every exit path;
+- an aborted, timed-out or truncated response is never returned as a document:
+  every exit path re-checks the stop flag and the deadline (a shut-down socket
+  can read as a clean EOF), and a body shorter than its declared
+  `Content-Length` fails with `TruncatedResponseError` instead of being parsed;
 - the socket is opened directly, so no proxy environment variables or netrc
   credentials are consulted, and TLS keeps the default verification context;
 - userinfo, query string and fragment are stripped from every URL before it

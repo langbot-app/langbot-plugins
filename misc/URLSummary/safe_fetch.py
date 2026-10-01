@@ -25,6 +25,9 @@ This module therefore:
 * reads the body in bounded chunks with a hard cap on the decoded bytes, a
   total deadline and a cooperative stop flag, and closes the socket on every
   exit path;
+* never returns a partial body as if it were complete: every exit path re-checks
+  the stop flag and the deadline, and a body shorter than its declared
+  ``Content-Length`` fails with :class:`TruncatedResponseError`;
 * enforces that deadline and stop flag on *every* blocking step - DNS, connect,
   TLS handshake, status/header parsing and body reads - by shutting the socket
   down from a watchdog thread, because a socket timeout only bounds the idle
@@ -92,6 +95,22 @@ class FetchAbortedError(FetchError):
 
 class TooManyRedirectsError(FetchError):
     """The redirect chain is longer than :data:`MAX_REDIRECTS`."""
+
+
+class TruncatedResponseError(FetchError):
+    """The peer stopped before delivering the body it declared."""
+
+
+class _ByteCounter:
+    """Counts raw (still encoded) body bytes as they stream past."""
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def count(self, chunks: Iterable[bytes]) -> Iterator[bytes]:
+        for chunk in chunks:
+            self.total += len(chunk)
+            yield chunk
 
 
 def _strip_url_tail(value: str) -> str:
@@ -462,6 +481,7 @@ def _request_once(
         if status_code in _REDIRECT_STATUSES and response_headers.get("Location"):
             # The body of a redirect is not needed; dropping the connection
             # discards it without reading it.
+            _check_abort(stop_event, deadline)
             return _RawResponse(status_code, response_headers, b"", None)
 
         declared = response.length
@@ -471,9 +491,20 @@ def _request_once(
                 f"{redact_url(url)!r}"
             )
 
+        counter = _ByteCounter()
         decoder = _BodyDecoder(response_headers.get("Content-Encoding"), max_bytes)
-        chunks = decoder.decode(chunk for chunk in _raw_chunks(response, sock, stop_event, deadline))
+        chunks = decoder.decode(counter.count(_raw_chunks(response, sock, stop_event, deadline)))
         body = collect_bounded(chunks, max_bytes)
+
+        # Every exit path re-checks the abort state: a socket that the watch
+        # shut down can read as a clean EOF, and such a partial body must never
+        # be returned as if the response had been read completely.
+        _check_abort(stop_event, deadline)
+        if declared is not None and counter.total < declared:
+            raise TruncatedResponseError(
+                f"truncated response from {redact_url(url)!r}: "
+                f"{counter.total} of {declared} bytes received"
+            )
         charset = response_headers.get_content_charset()
         return _RawResponse(status_code, response_headers, body, charset)
     except FetchError:
@@ -524,6 +555,10 @@ def _raw_chunks(
         except socket.timeout as exc:
             raise FetchAbortedError(f"response read timed out: {exc}") from exc
         if not chunk:
+            # Reading a shut-down socket can surface as a clean EOF (the peer
+            # just stops sending); only an explicit re-check tells "the body
+            # ended" apart from "we aborted the read".
+            _check_abort(stop_event, deadline)
             return
         yield chunk
 
