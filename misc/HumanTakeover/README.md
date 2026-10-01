@@ -10,6 +10,7 @@ A human-takeover & manual-reply plugin for LangBot. It lets a human operator tak
 - **Web console (single Page component)**: Two-column layout with a collapsible info panel, following the LangBot design language and dark/light themes.
 - **All conversations**: Lists every private chat and group chat; group messages distinguish individual senders.
 - **Manual reply**: Send plain text, images (base64), and files (base64) from the console.
+- **Per-conversation drafts**: The text box and a staged image/file belong to the conversation they were entered in; switching conversations saves and restores them, and a reply only carries attachments chosen for the conversation it is sent to.
 - **10-minute auto-release**: If there is no human response within the configured timeout, the takeover is released automatically. A live countdown is shown during human silence.
 - **Trigger words**: When a user message contains a configured trigger word, the conversation is flagged as unhandled (WeChat-style red dot on the avatar), an alert toast is shown, and (optionally) the conversation is auto-taken-over.
 - **Profile cards**: Click a user/group avatar to view available info (ID, group, bot, adapter).
@@ -46,7 +47,8 @@ session has been saved. Interrupted migrations can be retried. The original keys
 remain as an untouched migration-time backup; they are not updated afterward.
 Subsequent startups read only the new records. Back up plugin storage before
 upgrading: **downgrading does not include conversations changed after migration**.
-The console's Clear storage action removes both formats and their history.
+The console's Clear storage action removes both formats and their history, and
+discards any unsent draft.
 
 A session record is limited to **8 MiB of UTF-8 JSON**, leaving room for SDK
 base64 encoding within the 16 MiB transport frame. Exceeding this limit raises an

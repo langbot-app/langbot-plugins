@@ -495,7 +495,11 @@
       currentKey: null,     // currentData 所属的 session_key(响应归属)
       loadSeq: 0,           // 会话加载的递增序号,用于丢弃过期响应
       loading: false,       // 当前会话的消息是否仍在加载
-      pendingImage: null,   // base64 data url
+      pendingImage: null,   // base64 data url(属于 attachmentOwner.image)
+      pendingFile: null,    // {base64, name}(属于 attachmentOwner.file)
+      attachmentOwner: { image: null, file: null },  // 附件所属的 session_key
+      drafts: {},           // session_key -> {text, image, file}:按会话保存的草稿
+      draftGen: 0,          // 草稿代次:切换/清空/显式清除时递增,作废在途附件读取
       timer: null,          // 倒计时定时器
       remaining: 0,
       timeout: 600,
@@ -602,9 +606,127 @@
         .replace(/"/g,'&quot;');
     }
 
+    // ====== 草稿归属 ======
+    // 输入框与附件只属于当前会话。切换会话时保存上一个会话的草稿并恢复目标
+    // 会话的草稿,同时递增草稿代次:上一个会话里尚未读完的附件读取就此作废,
+    // 否则 A 选的附件会在切到 B 之后才读出来,被当成 B 的附件发出去。
+    function emptyDraft() { return { text: '', image: null, file: null }; }
+
+    function draftSlot(key) {
+      if (!key) return null;
+      if (!state.drafts[key]) state.drafts[key] = emptyDraft();
+      return state.drafts[key];
+    }
+
+    function composerText() {
+      var el = document.getElementById('msgInput');
+      return el ? el.value : '';
+    }
+
+    // 把当前输入框与附件状态记到 key 名下
+    function saveDraft(key) {
+      var slot = draftSlot(key);
+      if (!slot) return;
+      slot.text = composerText();
+      slot.image = state.pendingImage || null;
+      slot.file = state.pendingFile || null;
+    }
+
+    // 用 key 名下的草稿重写输入框与附件预览
+    function restoreDraft(key) {
+      var slot = draftSlot(key);
+      var input = document.getElementById('msgInput');
+      if (input) input.value = slot ? (slot.text || '') : '';
+      state.pendingImage = slot ? (slot.image || null) : null;
+      state.pendingFile = slot ? (slot.file || null) : null;
+      state.attachmentOwner = {
+        image: state.pendingImage ? key : null,
+        file: state.pendingFile ? key : null
+      };
+      resetAttachmentInputs();
+      renderPreview();
+      if (input) autoGrow(input);
+    }
+
+    // 输入框与附件被清空时同步会话草稿槽(仅当前会话的槽)
+    function syncDraftSlot() {
+      var slot = state.drafts[state.current];
+      if (!slot) return;
+      slot.text = composerText();
+      slot.image = state.pendingImage || null;
+      slot.file = state.pendingFile || null;
+    }
+
+    // 清空输入框与附件预览(显式清除,因此在途附件读取一并作废)
+    function clearComposer() {
+      var input = document.getElementById('msgInput');
+      if (input) input.value = '';
+      state.pendingImage = null;
+      state.pendingFile = null;
+      state.attachmentOwner = { image: null, file: null };
+      state.draftGen++;
+      resetAttachmentInputs();
+      renderPreview();
+      if (input) autoGrow(input);
+    }
+
+    function resetAttachmentInputs() {
+      var ii = document.getElementById('imageInput');
+      if (ii) ii.value = '';
+      var fi = document.getElementById('fileInput');
+      if (fi) fi.value = '';
+    }
+
+    // 附件读取开始时捕获不可变的会话键与草稿代次;回调写入前必须两者都仍然成立
+    function captureAttachmentOwner() {
+      return { key: state.current, gen: state.draftGen };
+    }
+
+    function commitAttachment(owner, field, apply) {
+      // 读取期间切换了会话或清空了草稿:这个附件不再属于任何可见的会话,丢弃
+      if (!owner.key || owner.key !== state.current || owner.gen !== state.draftGen) {
+        resetAttachmentInputs();
+        return false;
+      }
+      apply();
+      state.attachmentOwner[field] = owner.key;
+      syncDraftSlot();
+      renderPreview();
+      return true;
+    }
+
+    // 发送成功后只清掉这次确实发出去的那部分输入:等待回复期间操作员新输入的
+    // 文字、新加入的附件必须保留(它们还没有被发出去)。
+    function consumeSentDraft(text, image, fileBase64) {
+      var input = document.getElementById('msgInput');
+      var cleared = false;
+      if (input && input.value === text) {
+        input.value = '';
+        cleared = true;
+      }
+      if (state.pendingImage && state.pendingImage === image) {
+        state.pendingImage = null;
+        state.attachmentOwner.image = null;
+        cleared = true;
+      }
+      if (state.pendingFile && state.pendingFile.base64 === fileBase64) {
+        state.pendingFile = null;
+        state.attachmentOwner.file = null;
+        cleared = true;
+      }
+      if (!cleared) return;
+      state.draftGen++;  // 这次草稿已经发出,针对它的在途附件读取作废
+      syncDraftSlot();
+      resetAttachmentInputs();
+      renderPreview();
+      if (input) autoGrow(input);
+    }
+
     // ====== 打开会话 ======
     async function openSession(key) {
       if (!key) return;
+      var prev = state.current;
+      var changed = prev !== key;
       state.current = key;
       // 切换会话:立即清空上一个会话的展示状态,并作废所有在途响应,
       // 否则旧会话迟到的响应会被画到新会话上(显示 A、发送却指向 B)。
@@ -612,8 +734,15 @@
       state.loading = !!key;
       state.currentData = null;
       state.currentKey = null;
-      clearPendingImage();
-      clearPendingFile();
+      if (changed) {
+        // 草稿按会话保存/恢复,并让上一个会话里仍在读取中的附件作废,
+        // 只清空 pending 值不足以阻止迟到的读取回调把 A 的附件写进来。
+        saveDraft(prev);
+        state.draftGen++;
+        restoreDraft(key);
+      } else {
+        draftSlot(key);
+      }
       clearConversationUI();
       updateComposerEnabled();
       renderSessions();
@@ -796,9 +925,16 @@
       var now = Date.now();
       if (state.lastSendAt && now - state.lastSendAt < 500) return;
       var input = document.getElementById('msgInput');
-      var text = input.value.trim();
-      if (!text && !state.pendingImage && !state.pendingFile) return;
+      var rawText = input.value;
+      var text = rawText.trim();
       var target = state.current;  // 本次发送的不可变目标
+      // 发送前再次校验归属:只带出确实属于本次目标会话的附件
+      var ownedImage = state.attachmentOwner.image === target ? (state.pendingImage || '') : '';
+      var ownedFile = state.attachmentOwner.file === target ? state.pendingFile : null;
+      if (!text && !ownedImage && !ownedFile) return;
+      var sendGen = state.draftGen;  // 本次发送的草稿代次
+      var sentImage = ownedImage || null;
+      var sentFile = ownedFile ? ownedFile.base64 : null;
       state.lastSendAt = now;
       state.sending = true;
       var btn = document.getElementById('sendBtn');
@@ -807,15 +943,20 @@
         var res = await langbot.api('/reply', {
           session_key: target,
           text: text,
-          image_base64: state.pendingImage || '',
-          file_base64: state.pendingFile ? state.pendingFile.base64 : '',
-          file_name: state.pendingFile ? state.pendingFile.name : ''
+          image_base64: ownedImage,
+          file_base64: ownedFile ? ownedFile.base64 : '',
+          file_name: ownedFile ? ownedFile.name : ''
         }, 'POST');
-        input.value = '';
-        clearPendingImage();
-        clearPendingFile();
-        autoGrow(input);
-        if (currentDataMatches() && res && res.takeover_active !== undefined) {
+        // 回复结果、输入清理与附件清理都绑定发送时会话与草稿代次:
+        // 期间切到了 B,A 的结果既不能把 B 显示成已接管,也不能清掉操作员
+        // 在 B 里新打的草稿/新选的附件。
+        if (state.current === target && state.draftGen === sendGen) {
+          consumeSentDraft(rawText, sentImage, sentFile);
+          state.drafts[target] = emptyDraft();  // 已发送的草稿不再随会话保存
+        }
+        if (state.current === target && state.currentKey === target && state.currentData &&
+            res && res.takeover_active !== undefined) {
+          // 接管标志只能写回它自己的会话(A 的回复不能把 B 显示成已接管)
           state.currentData.takeover_active = res.takeover_active;
           updateTakeoverUI(res.takeover_active, res.takeover_remaining);
         }
@@ -831,10 +972,12 @@
 
     function handleImageFile(file) {
       if (!file) return;
+      var owner = captureAttachmentOwner();
       var reader = new FileReader();
       reader.onload = function(e) {
-        state.pendingImage = e.target.result; // data:image/...;base64,...
-        renderPreview();
+        commitAttachment(owner, 'image', function() {
+          state.pendingImage = e.target.result; // data:image/...;base64,...
+        });
       };
       reader.readAsDataURL(file);
     }
@@ -861,21 +1004,29 @@
     }
     function clearPendingImage() {
       state.pendingImage = null;
-      document.getElementById('previewStrip').innerHTML = '';
+      state.attachmentOwner.image = null;
+      state.draftGen++;  // 显式清除:在途的图片读取作废
+      syncDraftSlot();
       document.getElementById('imageInput').value = '';
+      renderPreview();
     }
 
     function handleFileSelected(file) {
       if (!file) return;
+      var owner = captureAttachmentOwner();
       var reader = new FileReader();
       reader.onload = function(e) {
-        state.pendingFile = { base64: e.target.result, name: file.name };
-        renderPreview();
+        commitAttachment(owner, 'file', function() {
+          state.pendingFile = { base64: e.target.result, name: file.name };
+        });
       };
       reader.readAsDataURL(file);
     }
     function clearPendingFile() {
       state.pendingFile = null;
+      state.attachmentOwner.file = null;
+      state.draftGen++;  // 显式清除:在途的文件读取作废
+      syncDraftSlot();
       var fi = document.getElementById('fileInput');
       if (fi) fi.value = '';
       renderPreview();
@@ -989,6 +1140,8 @@
         state.currentKey = null;
         state.loadSeq++;
         state.loading = false;
+        state.drafts = {};   // 草稿随会话数据一起清除
+        clearComposer();     // 并作废仍在读取中的附件
         updateComposerEnabled();
         document.getElementById('chatHeader').style.display = 'none';
         document.getElementById('composer').style.display = 'none';

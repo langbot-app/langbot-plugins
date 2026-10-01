@@ -32,6 +32,11 @@ This module therefore:
   TLS handshake, status/header parsing and body reads - by shutting the socket
   down from a watchdog thread, because a socket timeout only bounds the idle
   time between two reads and a peer that drips bytes can outlive it forever;
+* runs every deadline-bounded ``getaddrinfo`` on a fixed resolver worker pool
+  with a fixed in-flight budget, so a lookup that a waiter abandoned keeps its
+  slot until it really ends and further lookups are refused with
+  :class:`ResolverBusyError` instead of accumulating threads or queueing
+  without limit;
 * opens the socket directly, so no proxy environment variables or netrc
   credentials are consulted;
 * verifies TLS with the default CA store and the original hostname (the
@@ -44,6 +49,7 @@ This module therefore:
 from __future__ import annotations
 
 import base64
+import collections
 import dataclasses
 import http.client
 import ipaddress
@@ -66,6 +72,12 @@ MAX_REDIRECTS = 5
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 5.0
 TOTAL_TIMEOUT = 15.0
+
+MAX_DNS_WORKERS = 4
+"""Fixed number of threads that run blocking ``getaddrinfo`` calls."""
+
+MAX_DNS_OUTSTANDING = 8
+"""Fixed cap on resolutions in flight, running and queued together."""
 
 _CHUNK_SIZE = 64 * 1024
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -99,6 +111,10 @@ class TooManyRedirectsError(FetchError):
 
 class TruncatedResponseError(FetchError):
     """The peer stopped before delivering the body it declared."""
+
+
+class ResolverBusyError(FetchError):
+    """The bounded resolver budget is exhausted; a lookup was refused."""
 
 
 class _ByteCounter:
@@ -288,9 +304,12 @@ def resolve_public_addresses(
 ) -> list[str]:
     """Resolve ``host`` and return its addresses, refusing non-public ones.
 
-    With a ``deadline`` the lookup runs on a helper thread and this call gives
-    up as soon as the deadline expires or ``stop_event`` is set: a resolver
-    that never answers is another way to pin a fetch slot forever.
+    With a ``deadline`` the lookup runs on the bounded resolver pool and this
+    call gives up as soon as the deadline expires or ``stop_event`` is set: a
+    resolver that never answers is another way to pin a fetch slot forever.
+    Giving up does not free the resolution's budget slot - that happens only
+    when ``getaddrinfo`` really ends - so a stalled resolver cannot be used to
+    accumulate unbounded background work.
     """
     infos = _getaddrinfo(host, port, deadline, stop_event)
 
@@ -308,38 +327,137 @@ def resolve_public_addresses(
     return addresses
 
 
+class _Resolution:
+    """One in-flight ``getaddrinfo`` call and its result slot."""
+
+    __slots__ = ("host", "port", "done", "infos", "error")
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.done = threading.Event()
+        self.infos: list | None = None
+        self.error: BaseException | None = None
+
+    def execute(self) -> None:
+        try:
+            self.infos = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        except BaseException as exc:  # noqa: BLE001 - reported to the waiter
+            self.error = exc
+
+
+class _ResolverPool:
+    """A fixed worker pool with a fixed, backpressured resolution budget.
+
+    A resolution holds one budget slot until its ``getaddrinfo`` call really
+    returns, even after the waiting caller has timed out or been cancelled, so
+    an abandoned lookup can never free budget early or accumulate off the
+    pool. The pool runs at most ``max_workers`` lookups at once, keeps at most
+    ``capacity`` in flight (running plus queued), and refuses further work
+    with :class:`ResolverBusyError` once the budget is exhausted instead of
+    queueing without limit or starting another thread.
+    """
+
+    def __init__(self, max_workers: int, capacity: int) -> None:
+        self._max_workers = max_workers
+        self._capacity = capacity
+        self._slots = threading.BoundedSemaphore(capacity)
+        self._condition = threading.Condition()
+        self._pending: collections.deque[_Resolution] = collections.deque()
+        self._threads = 0
+        self._running = 0
+        self._in_flight = 0
+
+    def stats(self) -> dict[str, int]:
+        """Return a live snapshot of the pool, always within the fixed caps."""
+        with self._condition:
+            return {
+                "max_workers": self._max_workers,
+                "workers": self._threads,
+                "capacity": self._capacity,
+                "running": self._running,
+                "queued": len(self._pending),
+                "in_flight": self._in_flight,
+            }
+
+    def submit(self, host: str, port: int) -> "_Resolution":
+        """Take a budget slot and queue ``host``; refuse when none is free."""
+        if not self._slots.acquire(blocking=False):
+            raise ResolverBusyError(
+                "resolver budget exhausted; refusing another DNS lookup"
+            )
+        resolution = _Resolution(host, port)
+        with self._condition:
+            self._in_flight += 1
+            self._pending.append(resolution)
+            idle = self._threads - self._running
+            if self._threads < self._max_workers and len(self._pending) > idle:
+                self._threads += 1
+                threading.Thread(
+                    target=self._work, name="safe-fetch-dns", daemon=True
+                ).start()
+            self._condition.notify()
+        return resolution
+
+    def _work(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending:
+                    self._condition.wait()
+                resolution = self._pending.popleft()
+                self._running += 1
+            try:
+                resolution.execute()
+            finally:
+                # The slot is returned only now, when the resolver call has
+                # really ended - never when a waiter gave up on it.
+                with self._condition:
+                    self._running -= 1
+                    self._in_flight -= 1
+                self._slots.release()
+                resolution.done.set()
+
+
+_RESOLVER_POOL = _ResolverPool(MAX_DNS_WORKERS, MAX_DNS_OUTSTANDING)
+
+
+def resolver_stats() -> dict[str, int]:
+    """Return the resolver pool's budget state (bounded by the module caps)."""
+    return _RESOLVER_POOL.stats()
+
+
 def _getaddrinfo(host: str, port: int, deadline: float | None, stop_event: Any) -> list:
-    """Run ``getaddrinfo``, optionally bounded by a deadline/stop flag."""
+    """Resolve ``host``, bounded by a deadline/stop flag when one is given.
+
+    Without a ``deadline`` the lookup runs inline: it cannot outlive its caller
+    and therefore needs no background budget. With a ``deadline`` it runs on
+    the bounded resolver pool; a waiter that times out or is cancelled stops
+    waiting but the resolution keeps its budget slot until it really ends, and
+    further lookups are refused with :class:`ResolverBusyError` while the
+    budget is exhausted.
+    """
     if deadline is None:
         try:
             return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
             raise BlockedTargetError(f"cannot resolve host {host!r}: {exc}") from exc
 
-    result: dict[str, Any] = {}
-
-    def lookup() -> None:
-        try:
-            result["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except BaseException as exc:  # noqa: BLE001 - reported to the caller
-            result["error"] = exc
-
-    thread = threading.Thread(target=lookup, name="safe-fetch-dns", daemon=True)
-    thread.start()
-    while thread.is_alive():
+    resolution = _RESOLVER_POOL.submit(host, port)
+    while True:
         if stop_event is not None and stop_event.is_set():
             raise FetchAbortedError("fetch cancelled while resolving host")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FetchAbortedError("fetch deadline exceeded while resolving host")
-        thread.join(min(0.05, remaining))
+        if resolution.done.wait(min(0.05, remaining)):
+            break
 
-    error = result.get("error")
+    error = resolution.error
     if error is not None:
         raise BlockedTargetError(
             f"cannot resolve host {host!r}: {redact_text(str(error))}"
         ) from _scrub_exception(error)
-    return result["infos"]
+    return resolution.infos or []
 
 
 def validate_url(url: str) -> tuple[str, str, int, str]:

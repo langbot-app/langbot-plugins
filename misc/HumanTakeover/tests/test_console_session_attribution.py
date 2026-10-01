@@ -7,9 +7,16 @@ target) was already B. The same attribution gap existed for the takeover
 response and for the polling writeback, and a switch did not clear the previous
 conversation or block sending.
 
+Round-4 findings, also covered here: an attachment read started in A could
+complete after the switch and be posted with B's reply (`late_attachment_writeback`),
+the shared text box leaked A's draft into B (`draft_typed_in_a_is_not_sent_from_b`),
+and a `/reply` response for A could mark B as taken over and delete B's draft
+(`reply_result_binds_to_sending_session`).
+
 The console is a browser page, so these tests run its real inline script inside
-a fake DOM (tests/js/console_attribution_harness.mjs) with API responses that are
-resolved manually, which makes "the older response lands last" deterministic.
+a fake DOM (tests/js/console_attribution_harness.mjs) with API responses and
+FileReader reads that are completed manually, which makes "the older response
+lands last" and "the attachment read finishes after the switch" deterministic.
 Skipped when no `node` binary is available.
 
 Run from HumanTakeover: python -m pytest tests
@@ -142,3 +149,109 @@ def test_current_session_still_applies_its_own_responses(obs):
     assert after_send["displayedKey"] == "Z"
     assert after_send["takeoverActive"] is False
     assert after_send["buttonText"] == "接管"
+
+
+def test_late_attachment_read_stays_out_of_the_other_session(obs):
+    """An attachment read started in A must not be written into B (F1)."""
+    scenario = obs["late_attachment_writeback"]
+    assert scenario["readStarted"] == 1, "the attachment read never started"
+    assert scenario["beforeLate"]["displayedKey"] == "B"
+    assert scenario["beforeLate"]["pendingImage"] is None
+
+    after_late = scenario["afterLate"]
+    assert after_late["current"] == "B"
+    assert after_late["pendingImage"] is None, "A's attachment was staged in B's composer"
+    assert after_late["pendingFileName"] is None
+    assert after_late["previewChildren"] == 0, "A's attachment preview was rendered while B was on screen"
+
+    assert scenario["replySent"] is True
+    assert scenario["replyKey"] == "B"
+    assert scenario["replyText"] == "hello from B"
+    assert scenario["replyImage"] == "", "A's attachment was posted with B's reply"
+    assert scenario["leakedImage"] is False
+
+
+def test_attachment_committed_in_one_session_stays_with_it(obs):
+    """A's staged attachment must not travel with B's reply, and must come back to A."""
+    scenario = obs["attachment_stays_with_its_session"]
+    in_a = scenario["inA"]
+    assert in_a["pendingFileName"] == "A-doc.txt"
+    assert in_a["previewChildren"] == 1
+
+    in_b = scenario["inB"]
+    assert in_b["displayedKey"] == "B"
+    assert in_b["pendingFileName"] is None, "A's attachment was still staged while B was on screen"
+    assert in_b["pendingFileBase64"] is None
+    assert in_b["previewChildren"] == 0
+
+    assert scenario["replyKey"] == "B"
+    assert scenario["attachmentLeakedToB"] is False
+    assert scenario["replyImage"] == ""
+    assert scenario["replyFile"] == ""
+    assert scenario["replyFileName"] == ""
+
+    back_in_a = scenario["backInA"]
+    assert back_in_a["current"] == "A"
+    assert back_in_a["pendingFileName"] == "A-doc.txt", "A's attachment was lost instead of kept per session"
+    assert back_in_a["pendingFileBase64"] == "data:text/plain;base64,QS1ET0M="
+    assert back_in_a["previewChildren"] == 1
+
+
+def test_draft_typed_in_one_session_is_not_sent_from_another(obs):
+    """The shared text box must not carry A's draft into B (F1)."""
+    scenario = obs["draft_typed_in_a_is_not_sent_from_b"]
+    assert scenario["inB"]["current"] == "B"
+    assert scenario["inB"]["inputValue"] == "", "A's text draft was left in the box after switching to B"
+    assert scenario["replies"] == [], "a reply was posted from B carrying A's draft"
+    assert scenario["leakedDraft"] is False
+
+    back_in_a = scenario["backInA"]
+    assert back_in_a["current"] == "A"
+    assert back_in_a["inputValue"] == "private draft for A", "the draft was not restored for its own session"
+
+
+def test_reply_result_does_not_bind_to_another_session(obs):
+    """A's reply result must not repaint B, nor clean up B's draft/attachment (F2)."""
+    scenario = obs["reply_result_binds_to_sending_session"]
+    assert scenario["replyKey"] == "A"
+    assert scenario["replyText"] == "answer for A"
+
+    before = scenario["beforeResponse"]
+    assert before["current"] == "B"
+    assert before["takeoverActive"] is False
+    assert before["inputValue"] == "B draft typed while A replied"
+    assert before["pendingFileName"] == "B-doc.txt"
+
+    after = scenario["afterResponse"]
+    assert after["displayedKey"] == "B"
+    assert after["takeoverActive"] is False, "A's reply result marked B as taken over"
+    assert after["buttonText"] == "接管"
+    assert after["countdownShown"] is False, "A's reply result started B's countdown"
+    assert after["inputValue"] == "B draft typed while A replied", "A's reply cleanup deleted B's draft"
+    assert after["pendingFileName"] == "B-doc.txt", "A's reply cleanup deleted B's attachment"
+
+
+def test_send_only_carries_attachments_owned_by_the_target_session(obs):
+    """Defence in depth: an attachment sourced from another session is never posted."""
+    scenario = obs["foreign_attachment_is_never_posted"]
+    assert scenario["replySent"] is True
+    assert scenario["replyKey"] == "B"
+    assert scenario["replyText"] == "text for B"
+    assert scenario["replyImage"] == "", "an attachment owned by A was posted with B's reply"
+    assert scenario["replyFile"] == ""
+    assert scenario["replyFileName"] == ""
+
+
+def test_reply_cleanup_keeps_content_added_while_sending(obs):
+    """The reply cleanup may only consume the draft that was actually sent."""
+    scenario = obs["composer_typed_during_send_is_kept"]
+    assert scenario["replyText"] == "first message"
+    after = scenario["afterReply"]
+    assert after["current"] == "C"
+    assert after["inputValue"] == "second message typed while sending", (
+        "the reply cleanup deleted text typed after the send"
+    )
+    assert after["pendingFileName"] == "late.txt", "the reply cleanup deleted an attachment picked after the send"
+    refreshed = scenario["afterRefresh"]
+    assert refreshed["displayedKey"] == "C"
+    assert refreshed["inputValue"] == "second message typed while sending"

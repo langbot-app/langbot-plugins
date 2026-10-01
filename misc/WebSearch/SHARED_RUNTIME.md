@@ -59,6 +59,13 @@ certification requirements in the plugin request layer:
   watchdog thread shuts the socket down when either fires, because a socket
   timeout only bounds the idle time between two reads. The socket is closed on
   every exit path;
+- every deadline-bounded DNS lookup runs on a fixed resolver worker pool with a
+  fixed in-flight budget (`MAX_DNS_WORKERS` threads, `MAX_DNS_OUTSTANDING`
+  lookups running + queued): a lookup whose waiter timed out or was cancelled
+  keeps its budget slot until `getaddrinfo` really returns, so it can never
+  free budget early or accumulate off the pool, and once the budget is
+  exhausted a further lookup is refused with `ResolverBusyError` instead of
+  starting another thread or queueing without limit;
 - an aborted, timed-out or truncated response is never returned as a document:
   every exit path re-checks the stop flag and the deadline (a shut-down socket
   can read as a clean EOF), and a body shorter than its declared
@@ -71,9 +78,14 @@ certification requirements in the plugin request layer:
 
 ## Limits
 
-- A DNS lookup that the resolver never answers is abandoned on a helper thread:
-  the fetch returns at its deadline and gives the slot back, while the stalled
-  resolver thread dies on its own.
+- A DNS lookup that the resolver never answers cannot be killed, so the fetch
+  returns at its deadline while the lookup is still running. It runs inside the
+  fixed resolver pool above and holds its budget slot until the resolver really
+  returns, so repeated deadline/cancel timeouts fill the pool's fixed budget
+  instead of growing the process thread count; further lookups are then refused
+  with `ResolverBusyError` until a slot frees. Lookups the resolver does answer
+  reuse the same bounded workers (an idle pool is at most `MAX_DNS_WORKERS`
+  threads).
 - A cancelled invocation still cannot un-do I/O that has already been issued,
   but the stop flag and the absolute deadline shut the socket down, so an
   abandoned worker ends at the next blocking-socket return (bounded by the
@@ -83,5 +95,8 @@ certification requirements in the plugin request layer:
 - Tests drive the real fetch path against a local HTTP server (target refusals,
   redirect re-validation, DNS pinning, TLS context, byte/parse caps, deadline,
   cancellation, a peer that never completes its response headers, the slot
-  ownership cases and the redaction of error results/logs); they do not fetch
-  the public internet.
+  ownership cases and the redaction of error results/logs); they also prove the
+  resolver budget is independent of the waiter (a timed-out lookup does not free
+  it, a further lookup is refused while it is exhausted, it comes back only when
+  the lookup really ends, and the pool stays within its fixed worker/queue caps
+  under repeated timeouts). They do not fetch the public internet.

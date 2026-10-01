@@ -1012,3 +1012,108 @@ def test_tool_error_and_log_never_repeat_url_credentials_or_query(monkeypatch, c
         assert "alice" not in text, text
     assert PUBLIC_IP in result  # the useful, non-secret part survives
 
+
+# --------------------------------------------------------------------------- #
+# F1 (fourth round) - an abandoned lookup keeps its own bounded budget
+# --------------------------------------------------------------------------- #
+def _gated_resolver(gate, calls):
+    """``getaddrinfo`` stand-in that blocks until ``gate`` is set."""
+
+    def getaddrinfo(host, port, **kwargs):
+        calls.append(host)
+        gate.wait(10)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, port))]
+
+    return getaddrinfo
+
+
+def _dns_threads():
+    return [t for t in threading.enumerate() if t.name == "safe-fetch-dns"]
+
+
+def _drain_resolver_pool(timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while safe_fetch.resolver_stats()["in_flight"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return safe_fetch.resolver_stats()
+
+
+def test_abandoned_waiter_does_not_free_the_resolver_budget(monkeypatch):
+    """A timed-out waiter must not return budget the resolver still uses."""
+    assert _drain_resolver_pool()["in_flight"] == 0
+    gate = threading.Event()
+    monkeypatch.setattr(safe_fetch.socket, "getaddrinfo", _gated_resolver(gate, []))
+    try:
+        for index in range(safe_fetch.MAX_DNS_OUTSTANDING):
+            started = time.monotonic()
+            with pytest.raises(FetchAbortedError):
+                safe_fetch.fetch_document(f"http://slow{index}.example/", timeout=0.3)
+            # The waiter returned on time even though the lookup never ended.
+            assert time.monotonic() - started < 5
+
+        stats = safe_fetch.resolver_stats()
+        # Every waiter gave up, yet every resolution is still with the resolver:
+        # the budget must not have been handed back early.
+        assert stats["in_flight"] == safe_fetch.MAX_DNS_OUTSTANDING
+        assert stats["running"] + stats["queued"] == safe_fetch.MAX_DNS_OUTSTANDING
+
+        # While the budget is exhausted a further request is refused, not
+        # queued behind the abandoned work.
+        started = time.monotonic()
+        with pytest.raises(safe_fetch.ResolverBusyError):
+            safe_fetch.fetch_document("http://one-too-many.example/", timeout=2.0)
+        assert time.monotonic() - started < 2, "the refusal was not immediate"
+    finally:
+        gate.set()
+
+
+def test_resolver_budget_returns_only_when_the_lookup_really_ends(monkeypatch):
+    """The budget comes back when the abandoned lookup really finishes."""
+    assert _drain_resolver_pool()["in_flight"] == 0
+    gate = threading.Event()
+    monkeypatch.setattr(safe_fetch.socket, "getaddrinfo", _gated_resolver(gate, []))
+    try:
+        with pytest.raises(FetchAbortedError):
+            safe_fetch.fetch_document("http://slow.example/", timeout=0.3)
+        # The abandoned resolution still holds its budget slot.
+        assert safe_fetch.resolver_stats()["in_flight"] == 1
+    finally:
+        gate.set()
+
+    assert _drain_resolver_pool()["in_flight"] == 0
+    # The budget is back: the next resolution runs to completion.
+    addresses = safe_fetch.resolve_public_addresses(
+        "next.example", 443, time.monotonic() + 5
+    )
+    assert addresses == [PUBLIC_IP]
+
+
+def test_resolver_pool_is_bounded_under_repeated_timeouts(monkeypatch):
+    """Repeated timeouts cannot grow the pool or its queue without limit."""
+    assert _drain_resolver_pool()["in_flight"] == 0
+    gate = threading.Event()
+    monkeypatch.setattr(safe_fetch.socket, "getaddrinfo", _gated_resolver(gate, []))
+    try:
+        for index in range(safe_fetch.MAX_DNS_OUTSTANDING):
+            with pytest.raises(FetchAbortedError):
+                safe_fetch.fetch_document(f"http://flood{index}.example/", timeout=0.2)
+
+        stats = safe_fetch.resolver_stats()
+        assert stats["workers"] <= safe_fetch.MAX_DNS_WORKERS
+        assert stats["in_flight"] == safe_fetch.MAX_DNS_OUTSTANDING
+        assert len(_dns_threads()) <= safe_fetch.MAX_DNS_WORKERS
+
+        threads_before = len(_dns_threads())
+        for _ in range(25):
+            with pytest.raises(safe_fetch.ResolverBusyError):
+                safe_fetch.resolve_public_addresses(
+                    "flood.example", 80, time.monotonic() + 0.5
+                )
+
+        stats = safe_fetch.resolver_stats()
+        assert len(_dns_threads()) == threads_before, "a refusal created a thread"
+        assert stats["workers"] <= safe_fetch.MAX_DNS_WORKERS
+        assert stats["queued"] <= safe_fetch.MAX_DNS_OUTSTANDING
+        assert stats["in_flight"] == safe_fetch.MAX_DNS_OUTSTANDING
+    finally:
+        gate.set()

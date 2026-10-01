@@ -48,6 +48,12 @@ requirements in the plugin request layer:
   connect, the TLS handshake, status/header parsing and the body: a watchdog thread shuts
   the socket down when either fires, because a socket timeout only bounds the idle time
   between two reads. The socket is closed on every exit path;
+- every deadline-bounded DNS lookup runs on a fixed resolver worker pool with a fixed
+  in-flight budget (`MAX_DNS_WORKERS` threads, `MAX_DNS_OUTSTANDING` lookups running +
+  queued): a lookup whose waiter timed out or was cancelled keeps its budget slot until
+  `getaddrinfo` really returns, so it can never free budget early or accumulate off the
+  pool, and once the budget is exhausted a further lookup is refused with
+  `ResolverBusyError` instead of starting another thread or queueing without limit;
 - an aborted, timed-out or truncated response is never returned as a document: every exit
   path re-checks the stop flag and the deadline (a shut-down socket can read as a clean
   EOF), and a body shorter than its declared `Content-Length` fails with
@@ -79,14 +85,22 @@ in-flight fetches, the stop flag and the absolute deadline end a download that n
 a complete status line, a fetch cancelled while queued and a failed executor submission
 still release their slot exactly once, a worker that is still running is never released
 early, and no error message, log record or traceback repeats the URL's userinfo, query or
-fragment. Page content is served locally; no vendor account is used.
+fragment. It also proves the resolver budget is independent of the waiter: a timed-out
+lookup does not free it, a further lookup is refused (`ResolverBusyError`) while it is
+exhausted, the budget comes back only when the lookup really ends, and the pool stays
+within its fixed worker/queue caps under repeated timeouts. Page content is served
+locally; no vendor account is used.
 
 ## Known limits
 
 - Fetching and summarization are Host-model and network dependent.
-- A DNS lookup that the resolver never answers is abandoned on a helper thread:
-  the fetch returns at its deadline and gives the slot back, while the stalled
-  resolver thread dies on its own. The plugin enforces its own target and size
+- A DNS lookup that the resolver never answers cannot be killed, so the fetch returns at
+  its deadline while the lookup is still running. It runs inside the fixed resolver pool
+  above and holds its budget slot until the resolver really returns, so repeated
+  deadline/cancel timeouts fill the pool's fixed budget instead of growing the process
+  thread count; further lookups are then refused with `ResolverBusyError` until a slot
+  frees. Lookups that the resolver does answer reuse the same bounded workers (an idle
+  pool is at most `MAX_DNS_WORKERS` threads). The plugin enforces its own target and size
   policy, but a deployment SHOULD still apply egress policy as defence in depth.
 - No claim of certification; independent review and two-Workspace invocation acceptance
   are still required.
