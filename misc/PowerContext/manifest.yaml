@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: PowerContext
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/PowerContext
-  version: 0.1.1
+  version: 0.1.2
   label:
     en_US: PowerContext
     zh_Hans: PowerContext
@@ -44,8 +44,8 @@ spec:
         en_US: API Token
         zh_Hans: API Token
       description:
-        en_US: Optional PowerContext bearer token. Falls back to POWERCONTEXT_CLIENT_API_TOKEN. Keep configuration access restricted.
-        zh_Hans: 可选的 PowerContext Bearer Token。留空时读取 POWERCONTEXT_CLIENT_API_TOKEN。请限制配置访问权限。
+        en_US: Bearer token for this installation's Server. Leave empty only when that Server requires no authentication. Never read from the process environment.
+        zh_Hans: 本安装所连接 Server 的 Bearer Token。仅在该 Server 无需鉴权时留空。不会从进程环境变量读取。
     - name: allow_insecure_http
       type: boolean
       required: false

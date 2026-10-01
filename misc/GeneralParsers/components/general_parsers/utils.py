@@ -6,6 +6,7 @@ from typing import Callable, Any
 
 import chardet
 
+_PAGE_MARKER_RE = re.compile(r'<!-- PAGE:\d+ -->\n?')
 _LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*")
 _CJK_CHAR_RE = re.compile(
     r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
@@ -42,6 +43,11 @@ def count_words(text: str) -> int:
     if not text:
         return 0
     return len(_LATIN_WORD_RE.findall(text)) + len(_CJK_CHAR_RE.findall(text))
+
+
+def strip_page_markers(text: str) -> str:
+    """Remove the ``<!-- PAGE:N -->`` markers the PDF parser emits."""
+    return _PAGE_MARKER_RE.sub('', text)
 
 
 def config_bool(value: Any) -> bool:

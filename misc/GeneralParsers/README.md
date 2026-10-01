@@ -39,6 +39,7 @@ Official LangBot parser plugin that extracts structured text from files for Know
 
 - **Optional Vision Model Support** - Configure a vision-capable LLM to OCR scanned PDF pages, recognize embedded PDF/DOCX images, and parse direct image uploads
 - **Improved PDF Parsing** - PyMuPDF-based extraction preserves page boundaries, merges tables into output, and emits richer document metadata
+- **Isolated PDF Execution** - Every PDF parse runs in its own short-lived process with a hard timeout, so the non-thread-safe PyMuPDF dependency (which keeps module-level page state) can never mix one installation's document text into another's, and a native fault or cancellation only takes down that process
 - **Scanned PDF Handling** - Detects likely scanned pages and uses the vision model for OCR when configured
 - **Cross-Format Image Recognition** - Embedded PDF/DOCX images and direct image uploads can be turned into inline recognition text for downstream retrieval
 - **Header/Footer Filtering** - Repeated page headers and footers are detected and removed from PDF output

@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 import logging
+from importlib.util import find_spec
 from pathlib import Path
 
 
@@ -13,16 +14,15 @@ logging.disable(logging.CRITICAL)
 
 
 def _install_optional_dependency_stubs() -> None:
-    try:
-        import markdown  # noqa: F401
-    except ModuleNotFoundError:
+    # Presence is probed without importing: importing the real PyMuPDF here would
+    # put its module-level page state into this process, which the isolation
+    # tests assert never happens.
+    if find_spec('markdown') is None:
         markdown_module = types.ModuleType('markdown')
         markdown_module.markdown = lambda text, extensions=None: text
         sys.modules['markdown'] = markdown_module
 
-    try:
-        import fitz  # noqa: F401
-    except ModuleNotFoundError:
+    if find_spec('fitz') is None and find_spec('pymupdf') is None:
         sys.modules['fitz'] = types.ModuleType('fitz')
 
 

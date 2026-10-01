@@ -7,6 +7,8 @@ from .sites import model
 def process(url: str, brief_len: int, **kwargs) -> str:
     """处理网页内容"""
 
+    brief_len = model.clamp_brief_len(brief_len)
+
     adapter_cls: model.SiteAdapterBase = model.SiteAdapterBase
 
     found = False

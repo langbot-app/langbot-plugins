@@ -141,7 +141,23 @@
     var state = { settings: {}, sessions: [], today: '' };
     var searchQuery = '';
 
-    function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : s); return d.innerHTML; }
+    function el(tag, className) {
+      var node = document.createElement(tag);
+      if (className) node.className = className;
+      return node;
+    }
+
+    function textEl(tag, className, text) {
+      var node = el(tag, className);
+      node.textContent = text == null ? '' : String(text);
+      return node;
+    }
+
+    function actionButton(label, className, handler) {
+      var button = textEl('button', className, label);
+      button.addEventListener('click', handler);
+      return button;
+    }
 
     function toast(msg) {
       var t = document.getElementById('toast');
@@ -172,44 +188,95 @@
       }
       document.getElementById('sessCount').textContent = (state.sessions || []).length;
 
+      // Session ids and labels reach the DOM as node text, element properties or
+      // event-listener closures only. They are never concatenated into markup, so
+      // an id containing quotes cannot close an attribute or a JS string.
+      wrap.replaceChildren();
       if (rows.length === 0) {
-        wrap.innerHTML = '<div class="empty">' + langbot.t('empty', 'No sessions tracked yet. Counters appear after users chat.') + '</div>';
+        wrap.appendChild(textEl('div', 'empty', langbot.t('empty', 'No sessions tracked yet. Counters appear after users chat.')));
         return;
       }
 
-      var html = '<table><thead><tr>' +
-        '<th data-i18n="colSession">Session</th>' +
-        '<th data-i18n="colUsage">Usage today</th>' +
-        '<th data-i18n="colLimit">Limit</th>' +
-        '<th style="text-align:right;" data-i18n="colActions">Actions</th>' +
-        '</tr></thead><tbody>';
+      wrap.appendChild(buildTable(rows));
+    }
 
+    function buildTable(rows) {
+      var table = document.createElement('table');
+      var head = document.createElement('thead');
+      var headRow = document.createElement('tr');
+      headRow.appendChild(textEl('th', null, langbot.t('colSession', 'Session')));
+      headRow.appendChild(textEl('th', null, langbot.t('colUsage', 'Usage today')));
+      headRow.appendChild(textEl('th', null, langbot.t('colLimit', 'Limit')));
+      var actionsHead = textEl('th', null, langbot.t('colActions', 'Actions'));
+      actionsHead.style.textAlign = 'right';
+      headRow.appendChild(actionsHead);
+      head.appendChild(headRow);
+      table.appendChild(head);
+
+      var body = document.createElement('tbody');
       for (var i = 0; i < rows.length; i++) {
-        var r = rows[i];
-        var eff = r.effective_limit;
-        var unlimited = !eff || eff <= 0;
-        var pct = unlimited ? 0 : Math.min(100, Math.round((r.count / eff) * 100));
-        var full = !unlimited && r.count >= eff;
-        var usageText = unlimited ? (r.count + ' / ∞') : (r.count + ' / ' + eff);
-        var overrideBadge = (r.limit == null)
-          ? '<span class="badge">' + langbot.t('default', 'default') + '</span>'
-          : '<span class="badge" style="background:#dbeafe;color:#2563eb;">' + langbot.t('override', 'override') + '</span>';
-
-        html += '<tr>' +
-          '<td><div class="session-label">' + esc(r.label) + '</div>' +
-            '<div class="hint">' + esc(r.last_active || '') + '</div></td>' +
-          '<td class="usage">' + usageText +
-            '<div class="bar' + (full ? ' full' : '') + '"><span style="width:' + pct + '%"></span></div></td>' +
-          '<td><input class="lim-input" type="number" min="0" value="' + (r.limit == null ? '' : r.limit) + '" ' +
-            'placeholder="' + (st_default()) + '" onchange="setLimit(\'' + esc(r.id) + '\', this.value)"> ' + overrideBadge + '</td>' +
-          '<td><div class="row-actions">' +
-            '<button class="btn btn-ghost" onclick="resetOne(\'' + esc(r.id) + '\')">' + langbot.t('reset', 'Reset') + '</button>' +
-            '<button class="btn btn-ghost" style="color:#ef4444;border-color:#fca5a5;" onclick="removeOne(\'' + esc(r.id) + '\')">' + langbot.t('remove', 'Remove') + '</button>' +
-          '</div></td>' +
-        '</tr>';
+        body.appendChild(buildRow(rows[i]));
       }
-      html += '</tbody></table>';
-      wrap.innerHTML = html;
+      table.appendChild(body);
+      return table;
+    }
+
+    function buildRow(r) {
+      var eff = r.effective_limit;
+      var unlimited = !eff || eff <= 0;
+      var pct = unlimited ? 0 : Math.min(100, Math.round((r.count / eff) * 100));
+      var full = !unlimited && r.count >= eff;
+      var usageText = unlimited ? (r.count + ' / ∞') : (r.count + ' / ' + eff);
+
+      var row = document.createElement('tr');
+
+      var sessionCell = document.createElement('td');
+      sessionCell.appendChild(textEl('div', 'session-label', r.label));
+      sessionCell.appendChild(textEl('div', 'hint', r.last_active || ''));
+      row.appendChild(sessionCell);
+
+      var usageCell = el('td', 'usage');
+      usageCell.appendChild(document.createTextNode(usageText));
+      var bar = el('div', 'bar' + (full ? ' full' : ''));
+      var fill = document.createElement('span');
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      usageCell.appendChild(bar);
+      row.appendChild(usageCell);
+
+      var limitCell = document.createElement('td');
+      var input = document.createElement('input');
+      input.className = 'lim-input';
+      input.type = 'number';
+      input.min = '0';
+      input.value = r.limit == null ? '' : r.limit;
+      input.placeholder = st_default();
+      input.addEventListener('change', function() { setLimit(r.id, input.value); });
+      limitCell.appendChild(input);
+      limitCell.appendChild(document.createTextNode(' '));
+      limitCell.appendChild(overrideBadge(r.limit));
+      row.appendChild(limitCell);
+
+      var actionsCell = document.createElement('td');
+      var actions = el('div', 'row-actions');
+      actions.appendChild(actionButton(langbot.t('reset', 'Reset'), 'btn btn-ghost', function() { resetOne(r.id); }));
+      var remove = actionButton(langbot.t('remove', 'Remove'), 'btn btn-ghost', function() { removeOne(r.id); });
+      remove.style.color = '#ef4444';
+      remove.style.borderColor = '#fca5a5';
+      actions.appendChild(remove);
+      actionsCell.appendChild(actions);
+      row.appendChild(actionsCell);
+
+      return row;
+    }
+
+    function overrideBadge(limit) {
+      var badge = textEl('span', 'badge', langbot.t(limit == null ? 'default' : 'override', limit == null ? 'default' : 'override'));
+      if (limit != null) {
+        badge.style.background = '#dbeafe';
+        badge.style.color = '#2563eb';
+      }
+      return badge;
     }
 
     function st_default() {

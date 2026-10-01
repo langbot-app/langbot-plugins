@@ -11,9 +11,11 @@ claim of live tenant acceptance.
   `capture_user_messages`, `max_context_bytes`, `search_limit` — is resolved by
   `PowerContextPlugin.settings()` from `self.get_config()` inside the invocation. No config
   value is copied onto the plugin object or any component object.
-- The `POWERCONTEXT_CLIENT_API_TOKEN` environment fallback is evaluated inside
-  `resolve_settings()` on every invocation, so a process serving several installations never
-  reuses a credential resolved for another one.
+- The bearer token is resolved from that same per-invocation config and from nowhere else. The
+  process environment is not consulted: a process-global credential combined with an
+  installation-chosen `server_url` would let one installation send the worker's credential to a
+  host it controls. A token configured for installation A is never sent to installation B's
+  endpoint.
 - `PowerContextSettings.new_client()` builds the transport client for the invocation that is
   about to issue a request. `PowerContextClient` holds no connection: every request opens its
   own `httpx.AsyncClient`, so the client is a thin descriptor carrying this invocation's
@@ -37,8 +39,8 @@ claim of live tenant acceptance.
   task-local.
 - Historical context is injected as untrusted data with an explicit boundary; the plugin does
   not authorize or act on it.
-- `api_token` is a Host-stored configuration string. Restrict access to plugin configuration,
-  prefer `POWERCONTEXT_CLIENT_API_TOKEN`, and use HTTPS for a remote Server.
+- `api_token` is a Host-stored configuration string scoped to one installation, never a process
+  environment variable. Restrict access to plugin configuration and use HTTPS for a remote Server.
 - Remote cleartext HTTP stays rejected unless `allow_insecure_http` is explicitly enabled; that
   is a deployment decision, not a network sandbox.
 - Tests drive the real plugin and component objects through two `InstallationBinding` values

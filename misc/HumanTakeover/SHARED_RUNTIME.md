@@ -18,6 +18,11 @@ plugin treats its own object as a process-wide singleton.
 - Sessions and message history are loaded lazily on the first invocation of each
   installation (`load_state()`), so the EventListener and the console Page
   sharing this object always see the invoking installation's sessions.
+- One installation may serve several bots/adapters, so a session key carries the
+  trusted bot identity resolved from the event query
+  (`<bot_uuid>:<launcher_type>_<launcher_id>`). Events without a trusted bot uuid
+  are not recorded, a session refuses another bot's or adapter's identity, and
+  pre-identity (unscoped) keys are frozen rather than merged into a bot's session.
 
 ## Binding-keyed, released on revocation
 
@@ -33,8 +38,11 @@ plugin treats its own object as a process-wide singleton.
   write tenant state instead of falling back to a shared key.
 - The per-session write lock and the ambiguous-write fence
   (`storage_uncertain` / `load_failed`) are per installation: one installation's
-  failed write never blocks a sibling. Recovery is explicit
-  (`reconcile()` re-reads that installation's rows).
+  failed write never blocks a sibling. Every state-changing path re-checks the
+  fence after acquiring the installation lock, so a caller already queued for that
+  lock cannot cross a failure that landed while it waited; only the explicit
+  recovery path (`reconcile()`, which re-reads that installation's rows) lifts the
+  barrier, and an ordinary load never clears it.
 - `on_installation_revoked(binding)` drops that installation's cached sessions,
   history, lock and fence before returning.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -173,7 +174,7 @@ class DailyLimitPlugin(BasePlugin):
         else:
             st.settings = seed
             st.sessions = {}
-        self._normalize_settings(st)
+        self._normalize_settings(st.settings)
         print(
             f"[DailyLimit] initialized scope={st.scope}: "
             f"default_limit={st.settings['default_limit']}, "
@@ -183,14 +184,13 @@ class DailyLimitPlugin(BasePlugin):
 
     # ------------------------------------------------------------------- helpers
 
-    def _normalize_settings(self, st: _InstallationState) -> None:
-        s = st.settings
-        s["default_limit"] = max(0, int(s.get("default_limit", 50)))
-        s["tz_offset"] = max(-12, min(14, int(s.get("tz_offset", 8))))
-        s["reset_hour"] = max(0, min(23, int(s.get("reset_hour", 0))))
-        s["silent_mode"] = bool(s.get("silent_mode", False))
-        if not s.get("limit_message"):
-            s["limit_message"] = DEFAULT_LIMIT_MESSAGE
+    def _normalize_settings(self, settings: dict) -> None:
+        settings["default_limit"] = max(0, int(settings.get("default_limit", 50)))
+        settings["tz_offset"] = max(-12, min(14, int(settings.get("tz_offset", 8))))
+        settings["reset_hour"] = max(0, min(23, int(settings.get("reset_hour", 0))))
+        settings["silent_mode"] = bool(settings.get("silent_mode", False))
+        if not settings.get("limit_message"):
+            settings["limit_message"] = DEFAULT_LIMIT_MESSAGE
 
     def _logical_today(self, st: _InstallationState) -> str:
         tz = timezone(timedelta(hours=st.settings["tz_offset"]))
@@ -218,6 +218,41 @@ class DailyLimitPlugin(BasePlugin):
             ).encode("utf-8"),
         )
 
+    async def _transaction(self, mutate, *, rollback: bool = True):
+        """Apply one state change of one installation under its installation lock.
+
+        Read, modify, serialize and await the Host write inside the same critical
+        section. ``persist`` overwrites the whole row, so two overlapping writers
+        of one installation must not interleave: an admin write that serialized an
+        older snapshot would otherwise be able to land after a newer one and roll
+        it back. Holding the lock across the Host call makes the durable row match
+        call order; nothing is ever serialized from state that another writer has
+        already moved past.
+
+        ``mutate`` returns ``(changed, result)``; ``result`` is what this method
+        returns. With ``rollback`` the in-memory state is restored when the
+        mutation raises, the write fails or the call is cancelled, so memory stays
+        equal to the last snapshot that actually landed instead of diverging from
+        a write that never happened.
+
+        The counter path opts out of ``rollback`` on purpose: a message that was
+        already answered keeps consuming quota (never back-credits usage), and the
+        next successful write persists the whole snapshot again.
+        """
+
+        st = await self._state()
+        async with st.lock:
+            before = (copy.deepcopy(st.settings), copy.deepcopy(st.sessions)) if rollback else None
+            try:
+                changed, result = mutate(st)
+                if changed:
+                    await self.persist(st)
+            except BaseException:
+                if before is not None:
+                    st.settings, st.sessions = before
+                raise
+            return result
+
     # --------------------------------------------------------- runtime (listener)
 
     async def check_and_count(self, session_id: str, label: str) -> tuple[bool, str]:
@@ -227,8 +262,8 @@ class DailyLimitPlugin(BasePlugin):
         message is non-empty, the listener should reply with it; an empty
         message means "block silently".
         """
-        st = await self._state()
-        async with st.lock:
+
+        def count(st: _InstallationState) -> tuple[bool, tuple[bool, str]]:
             today = self._logical_today(st)
             sess = st.sessions.get(session_id)
             if sess is None:
@@ -247,92 +282,101 @@ class DailyLimitPlugin(BasePlugin):
             # 0 means unlimited
             if limit <= 0:
                 sess["count"] = int(sess.get("count", 0)) + 1
-                await self.persist(st)
-                return True, ""
+                return True, (True, "")
 
             if int(sess.get("count", 0)) >= limit:
-                await self.persist(st)
                 if st.settings.get("silent_mode"):
-                    return False, ""
-                return False, st.settings.get("limit_message") or DEFAULT_LIMIT_MESSAGE
+                    return True, (False, "")
+                return True, (False, st.settings.get("limit_message") or DEFAULT_LIMIT_MESSAGE)
 
             sess["count"] = int(sess.get("count", 0)) + 1
-            await self.persist(st)
-            return True, ""
+            return True, (True, "")
+
+        return await self._transaction(count, rollback=False)
 
     # ----------------------------------------------------------- management (page)
 
     async def snapshot(self) -> dict:
         """Return a JSON-serializable view of the invoking installation's state."""
         st = await self._state()
-        today = self._logical_today(st)
-        rows = []
-        for sid, sess in st.sessions.items():
-            count = int(sess.get("count", 0)) if sess.get("date") == today else 0
-            rows.append(
-                {
-                    "id": sid,
-                    "label": sess.get("label", sid),
-                    "limit": sess.get("limit"),
-                    "effective_limit": self._effective_limit(st, sess),
-                    "count": count,
-                    "date": sess.get("date"),
-                    "last_active": sess.get("last_active"),
-                }
-            )
-        rows.sort(key=lambda r: (r.get("last_active") or ""), reverse=True)
-        return {
-            "settings": dict(st.settings),
-            "today": today,
-            "sessions": rows,
-        }
+        async with st.lock:
+            today = self._logical_today(st)
+            rows = []
+            for sid, sess in st.sessions.items():
+                count = int(sess.get("count", 0)) if sess.get("date") == today else 0
+                rows.append(
+                    {
+                        "id": sid,
+                        "label": sess.get("label", sid),
+                        "limit": sess.get("limit"),
+                        "effective_limit": self._effective_limit(st, sess),
+                        "count": count,
+                        "date": sess.get("date"),
+                        "last_active": sess.get("last_active"),
+                    }
+                )
+            rows.sort(key=lambda r: (r.get("last_active") or ""), reverse=True)
+            return {
+                "settings": dict(st.settings),
+                "today": today,
+                "sessions": rows,
+            }
 
     async def update_settings(self, patch: dict) -> None:
-        st = await self._state()
         allowed = {"default_limit", "limit_message", "silent_mode", "tz_offset", "reset_hour"}
-        for k, v in (patch or {}).items():
-            if k in allowed and v is not None:
-                st.settings[k] = v
-        self._normalize_settings(st)
-        await self.persist(st)
+
+        def apply(st: _InstallationState) -> tuple[bool, None]:
+            candidate = dict(st.settings)
+            for k, v in (patch or {}).items():
+                if k in allowed and v is not None:
+                    candidate[k] = v
+            # Validate on the copy first, then swap: a rejected value must not
+            # leave a half-updated settings dict behind.
+            self._normalize_settings(candidate)
+            st.settings = candidate
+            return True, None
+
+        await self._transaction(apply)
 
     async def set_session_limit(self, session_id: str, limit) -> bool:
-        st = await self._state()
-        sess = st.sessions.get(session_id)
-        if sess is None:
-            return False
-        if limit is None or limit == "":
-            sess["limit"] = None
-        else:
-            sess["limit"] = max(0, int(limit))
-        await self.persist(st)
-        return True
+        def apply(st: _InstallationState) -> tuple[bool, bool]:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                return False, False
+            if limit is None or limit == "":
+                sess["limit"] = None
+            else:
+                sess["limit"] = max(0, int(limit))
+            return True, True
+
+        return await self._transaction(apply)
 
     async def reset_session(self, session_id: str) -> bool:
-        st = await self._state()
-        sess = st.sessions.get(session_id)
-        if sess is None:
-            return False
-        sess["count"] = 0
-        sess["date"] = self._logical_today(st)
-        await self.persist(st)
-        return True
+        def apply(st: _InstallationState) -> tuple[bool, bool]:
+            sess = st.sessions.get(session_id)
+            if sess is None:
+                return False, False
+            sess["count"] = 0
+            sess["date"] = self._logical_today(st)
+            return True, True
+
+        return await self._transaction(apply)
 
     async def reset_all(self) -> int:
-        st = await self._state()
-        today = self._logical_today(st)
-        n = 0
-        for sess in st.sessions.values():
-            sess["count"] = 0
-            sess["date"] = today
-            n += 1
-        await self.persist(st)
-        return n
+        def apply(st: _InstallationState) -> tuple[bool, int]:
+            today = self._logical_today(st)
+            for sess in st.sessions.values():
+                sess["count"] = 0
+                sess["date"] = today
+            return True, len(st.sessions)
+
+        return await self._transaction(apply)
 
     async def delete_session(self, session_id: str) -> bool:
-        st = await self._state()
-        if session_id in st.sessions:
+        def apply(st: _InstallationState) -> tuple[bool, bool]:
+            if session_id not in st.sessions:
+                return False, False
             del st.sessions[session_id]
-            await self.persist(st)
-            return True
-        return False
+            return True, True
+
+        return await self._transaction(apply)

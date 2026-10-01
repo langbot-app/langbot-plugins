@@ -4,7 +4,7 @@ metadata:
   author: langbot-team
   name: ScheNotify
   repository: https://github.com/langbot-app/langbot-plugins/tree/main/misc/ScheNotify
-  version: 0.2.5
+  version: 0.2.6
   description:
     en_US: Schedule notifications with natural language. LLM can help you set 
       reminders at specific times.

@@ -3,13 +3,79 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import weakref
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from langbot_plugin.api.definition.components.tool.tool import Tool
 
 from .mux import process
 
 import logging
+
+MAX_CONCURRENT_FETCHES = 4
+"""Upper bound on page fetches one process keeps in flight for this tool."""
+
+FETCH_SLOT_WAIT_SECONDS = 10.0
+"""How long a call may wait for a free fetch slot before it is rejected."""
+
+_slots_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+_slots_guard = threading.Lock()
+
+
+def _slots() -> asyncio.Semaphore:
+    """Return the bounded fetch-slot pool of the running event loop.
+
+    ``asyncio.Semaphore`` binds to the loop that first waits on it, while the
+    shared runtime and the test suite each drive their own loop, so the pool is
+    keyed by loop. It holds no tenant data.
+    """
+    loop = asyncio.get_running_loop()
+    with _slots_guard:
+        slots = _slots_by_loop.get(loop)
+        if slots is None:
+            slots = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+            _slots_by_loop[loop] = slots
+        return slots
+
+
+def _worker(
+    url: str,
+    brief_len: int,
+    stop_event: threading.Event,
+    slots: asyncio.Semaphore,
+    loop: asyncio.AbstractEventLoop,
+) -> str:
+    """Run the blocking adapter dispatch inside a worker thread.
+
+    The slot is released here, not in the async caller: cancelling the
+    invocation cannot interrupt a thread that is already downloading, so
+    releasing earlier would let abandoned downloads pile up past the bound.
+    """
+    try:
+        return process(url, brief_len, stop_event=stop_event)
+    finally:
+        try:
+            loop.call_soon_threadsafe(slots.release)
+        except RuntimeError:
+            # The loop is gone (plugin unloaded); nothing left to bound.
+            pass
+
+
+def _redact(url: str) -> str:
+    """Drop credentials and the query string before a URL is logged."""
+    try:
+        parts = urlsplit(url)
+    except (TypeError, ValueError, AttributeError):
+        return '<unparsable url>'
+    netloc = parts.hostname or ''
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    query = '?…' if parts.query else ''
+    return urlunsplit((parts.scheme, netloc, parts.path, query, ''))
 
 
 class VisitWeb(Tool):
@@ -20,11 +86,32 @@ class VisitWeb(Tool):
             if 'brief_len' not in params:
                 params['brief_len'] = 4096
 
-            print(f'start visit web: {params["url"]}')
-            # The site adapters fetch with the blocking `requests` library. Run the
-            # whole call in a worker thread so the shared event loop keeps serving
-            # other tenants while this page is fetched/parsed.
-            return await asyncio.to_thread(process, params['url'], params['brief_len'])
+            url = params['url']
+            logging.info("start visit web: %s", _redact(url))
+
+            # The site adapters fetch and parse synchronously, so the whole call
+            # runs in a worker thread: the shared event loop keeps serving other
+            # tenants. Slot accounting and cancellation are described in
+            # _worker/safe_fetch.
+            loop = asyncio.get_running_loop()
+            slots = _slots()
+            try:
+                await asyncio.wait_for(slots.acquire(), timeout=FETCH_SLOT_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                return "error visit web: too many concurrent page fetches, please retry later"
+
+            stop_event = threading.Event()
+            future = loop.run_in_executor(
+                None, _worker, url, params['brief_len'], stop_event, slots, loop
+            )
+            try:
+                return await future
+            except asyncio.CancelledError:
+                # Cancelling the future does not stop the already-running
+                # thread; the flag makes the fetch close its socket and return
+                # at the next chunk boundary.
+                stop_event.set()
+                raise
         except Exception as e:
             logging.error("[Webwlkr] error visit web: {}".format(e))
             return "error visit web:{}".format(e)

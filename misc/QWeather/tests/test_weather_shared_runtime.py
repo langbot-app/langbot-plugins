@@ -92,6 +92,50 @@ class _SlowHttp:
         return _FakeResponse(_payload_for(url))
 
 
+class _ControlHttp:
+    """Network stand-in with controllable failing and hanging branches.
+
+    ``hang_suffixes`` maps a URL suffix to how long that request's cancellation
+    teardown takes. The branch never completes on its own; only cancellation can
+    end it.
+    """
+
+    def __init__(self, *, failing_suffix: str | None = None, hang_suffixes: dict[str, float] | None = None):
+        self.failing_suffix = failing_suffix
+        self.hang_suffixes = dict(hang_suffixes or {})
+        self.hang_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.hang_tasks: dict[str, asyncio.Task] = {}
+        self.tasks: list[asyncio.Task] = []
+
+    async def wait_for_hangs(self, count: int, timeout: float = 1.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while len(self.hang_tasks) < count:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(f"only {len(self.hang_tasks)} of {count} hanging requests started")
+            await asyncio.sleep(0.005)
+
+    async def __call__(self, url, params=None):
+        if "city/" not in url:
+            self.tasks.append(asyncio.current_task())
+        for suffix, cleanup in self.hang_suffixes.items():
+            if url.endswith(suffix):
+                self.hang_tasks[suffix] = asyncio.current_task()
+                self.hang_started.set()
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Cancellation still needs a teardown; a caller that returns
+                    # before this finishes leaves a request task behind.
+                    await asyncio.sleep(cleanup)
+                    raise
+        if self.failing_suffix is not None and url.endswith(self.failing_suffix):
+            # Wait until a sibling request is provably in flight, then fail.
+            await self.hang_started.wait()
+            raise weather_data.APIError("upstream rejected the request")
+        return _FakeResponse(_payload_for(url))
+
+
 class WeatherSharedRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._original_get_data = weather_data._get_data
@@ -152,6 +196,71 @@ class WeatherSharedRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(keys_b, ["KEY-B"] * 8)
         self.assertNotIn("KEY-B", keys_a)
         self.assertNotIn("KEY-A", keys_b)
+
+    async def test_failed_fan_out_leaves_no_request_task_running(self) -> None:
+        """F-01: a failing branch must cancel and await its fan-out siblings.
+
+        ``asyncio.gather`` propagates the first exception without cancelling the
+        other tasks, so pre-fix the hanging request outlived the failed call
+        while still holding this invocation's API key.
+        """
+        from pkg.weather_data import Weather as WeatherData
+
+        http = _ControlHttp(failing_suffix="/indices/1d", hang_suffixes={"/astronomy/sun": 0.0})
+        weather_data._get_data = http
+        data = WeatherData(city_name="Testville", api_key="KEY-A", api_type=0)
+
+        try:
+            with self.assertRaises(weather_data.APIError):
+                await data.load_data()
+
+            hang_task = http.hang_tasks.get("/astronomy/sun")
+            self.assertIsNotNone(hang_task, "the hanging sibling request never started")
+            # The invocation is over (the error already propagated): no request
+            # task may still be alive holding this call's API key.
+            self.assertTrue(
+                all(task.done() for task in http.tasks),
+                "a request task outlived the failed load_data() call",
+            )
+            self.assertTrue(hang_task.cancelled())
+        finally:
+            for task in http.tasks:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_invocation_leaves_no_request_task_running(self) -> None:
+        """F-01 cancel path: cancellation must await the fan-out teardown.
+
+        One sibling's teardown finishes immediately while the other's takes
+        longer; returning before both complete would leave the slow request
+        running after the invocation was cancelled.
+        """
+        from pkg.weather_data import Weather as WeatherData
+
+        http = _ControlHttp(hang_suffixes={"/weather/now": 0.0, "/astronomy/sun": 0.2})
+        weather_data._get_data = http
+        data = WeatherData(city_name="Testville", api_key="KEY-A", api_type=0)
+
+        loader = asyncio.ensure_future(data.load_data())
+        try:
+            await http.wait_for_hangs(2)
+            loader.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await loader
+            self.assertTrue(
+                all(task.done() for task in http.tasks),
+                "a request task outlived the cancelled load_data() call",
+            )
+            self.assertTrue(http.hang_tasks["/astronomy/sun"].cancelled())
+        finally:
+            if not loader.done():
+                loader.cancel()
+                await asyncio.gather(loader, return_exceptions=True)
+            for task in http.tasks:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":

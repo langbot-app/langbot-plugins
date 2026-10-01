@@ -113,6 +113,9 @@ Example:
 
 - Reminder time must be in the future, past times will be rejected
 - Reminder messages will be sent to the same session where the reminder was set
+- Listing and deleting are scoped to the exact session that set the reminder (bot + person/group + target id), so reminders set from another bot or from a group with the same id are neither shown nor deleted
+- At most 100 reminders can be pending per installation, and each message is limited to 2000 characters
+- A reminder whose delivery fails stays queued and is retried on the next check
 - Unsent reminders will be lost after plugin restart (persistence will be supported in future versions)
 
 ## Developer Info

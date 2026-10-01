@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import logging
-import os
 from typing import Any
 
 from langbot_plugin.api.definition.plugin import BasePlugin
@@ -79,9 +78,12 @@ def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -
 def resolve_settings(config: dict[str, Any]) -> PowerContextSettings:
     """Resolve one invocation's settings from its config snapshot.
 
-    The ``POWERCONTEXT_CLIENT_API_TOKEN`` environment fallback is evaluated here,
-    on every invocation, so a process that serves several installations never
-    reuses the credential resolved for another one.
+    The bearer token is taken only from this invocation's configuration. The
+    process environment is deliberately never consulted: one worker serves
+    several installations of this artifact, so a process-global credential could
+    be paired with any installation's ``server_url`` and sent to a host that
+    installation controls. Installations that need a bearer token set it in
+    their own configuration.
     """
 
     scope_mode = str(config.get("scope_mode", "session") or "session").strip().lower()
@@ -90,10 +92,7 @@ def resolve_settings(config: dict[str, Any]) -> PowerContextSettings:
         scope_mode = "session"
     return PowerContextSettings(
         server_url=str(config.get("server_url", "http://127.0.0.1:8000")),
-        api_token=str(
-            config.get("api_token", "")
-            or os.environ.get("POWERCONTEXT_CLIENT_API_TOKEN", "")
-        ),
+        api_token=str(config.get("api_token", "") or ""),
         timeout_seconds=_bounded_float(config.get("timeout_seconds"), 8.0, 0.5, 60.0),
         allow_insecure_http=bool(config.get("allow_insecure_http", False)),
         scope_mode=scope_mode,

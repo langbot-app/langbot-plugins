@@ -122,41 +122,73 @@
       document.getElementById('count').textContent =
         filtered.length + ' / ' + entries.length + ' ' + langbot.t('entries', 'entries');
 
+      // Entry fields reach the DOM as node text or as element properties only.
+      // They are never concatenated into markup, so a question cannot close an
+      // attribute or open a script/event-handler context.
+      listEl.replaceChildren();
       if (filtered.length === 0) {
-        listEl.innerHTML = '<div class="empty">' + langbot.t('empty', 'No FAQ entries yet. Add one above.') + '</div>';
+        listEl.appendChild(el('div', 'empty', langbot.t('empty', 'No FAQ entries yet. Add one above.')));
         return;
       }
 
-      var html = '';
       for (var i = 0; i < filtered.length; i++) {
         var e = filtered[i];
-        if (editingId === e.id) {
-          html += '<div class="entry edit-form">' +
-            '<input type="text" id="editQ" value="' + esc(e.question) + '">' +
-            '<textarea id="editA" rows="3">' + esc(e.answer) + '</textarea>' +
-            '<div class="edit-actions">' +
-              '<button class="btn btn-ghost" onclick="cancelEdit()">' + langbot.t('cancel', 'Cancel') + '</button>' +
-              '<button class="btn btn-primary" onclick="saveEdit(\'' + e.id + '\')">' + langbot.t('save', 'Save') + '</button>' +
-            '</div>' +
-          '</div>';
-        } else {
-          html += '<div class="entry">' +
-            '<div class="entry-q">Q: ' + esc(e.question) + '</div>' +
-            '<div class="entry-a">' + esc(e.answer) + '</div>' +
-            '<div class="entry-actions">' +
-              '<button class="btn btn-ghost" onclick="startEdit(\'' + e.id + '\')">' + langbot.t('edit', 'Edit') + '</button>' +
-              '<button class="btn btn-ghost" style="color:#ef4444;border-color:#fca5a5;" onclick="deleteEntry(\'' + e.id + '\')">' + langbot.t('delete', 'Delete') + '</button>' +
-            '</div>' +
-          '</div>';
-        }
+        listEl.appendChild(editingId === e.id ? editForm(e) : entryRow(e));
       }
-      listEl.innerHTML = html;
     }
 
-    function esc(s) {
-      var d = document.createElement('div');
-      d.textContent = s;
-      return d.innerHTML;
+    function el(tag, className, text) {
+      var node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = text;
+      return node;
+    }
+
+    function actionButton(label, className, handler) {
+      var button = el('button', className, label);
+      button.addEventListener('click', handler);
+      return button;
+    }
+
+    function entryRow(e) {
+      var row = el('div', 'entry');
+      row.appendChild(el('div', 'entry-q', 'Q: ' + e.question));
+      row.appendChild(el('div', 'entry-a', e.answer));
+      var actions = el('div', 'entry-actions');
+      actions.appendChild(actionButton(langbot.t('edit', 'Edit'), 'btn btn-ghost', function() {
+        startEdit(e.id);
+      }));
+      var remove = actionButton(langbot.t('delete', 'Delete'), 'btn btn-ghost', function() {
+        deleteEntry(e.id);
+      });
+      remove.style.color = '#ef4444';
+      remove.style.borderColor = '#fca5a5';
+      actions.appendChild(remove);
+      row.appendChild(actions);
+      return row;
+    }
+
+    function editForm(e) {
+      var box = el('div', 'entry edit-form');
+      var question = el('input');
+      question.type = 'text';
+      question.id = 'editQ';
+      question.value = e.question;
+      var answer = el('textarea');
+      answer.id = 'editA';
+      answer.rows = 3;
+      answer.value = e.answer;
+      var actions = el('div', 'edit-actions');
+      actions.appendChild(actionButton(langbot.t('cancel', 'Cancel'), 'btn btn-ghost', function() {
+        cancelEdit();
+      }));
+      actions.appendChild(actionButton(langbot.t('save', 'Save'), 'btn btn-primary', function() {
+        saveEdit(e.id);
+      }));
+      box.appendChild(question);
+      box.appendChild(answer);
+      box.appendChild(actions);
+      return box;
     }
 
     async function loadEntries() {

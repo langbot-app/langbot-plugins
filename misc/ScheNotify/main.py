@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import datetime
+import itertools
 import logging
 from typing import Any
 
 from langbot_plugin.api.definition.plugin import BasePlugin
 from langbot_plugin.api.entities.builtin.platform import message as platform_message
+from langbot_plugin.api.proxies.invocation import (
+    bind_invocation,
+    current_binding,
+    current_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +31,24 @@ LEGACY_SCOPE = ""
 # Bounded wait for a revoked installation's loop to observe cancellation.
 LOOP_STOP_TIMEOUT = 5.0
 
+# One installation's in-memory queue, and the reminder text kept per event, are
+# bounded so a single session cannot grow the shared worker's memory without limit.
+MAX_EVENTS_PER_INSTALLATION = 100
+MAX_MESSAGE_LENGTH = 2000
 
-def _start_detached(coro: Any) -> asyncio.Task:
-    """Start one installation's scheduler with a context of its own.
 
-    A task created inside an invocation inherits that invocation's authority,
-    which is revoked when the invocation returns — every Host call it makes
-    afterwards then fails with "Plugin invocation has ended". The scheduler
-    therefore runs in a fresh context: it keeps its installation scope as an
-    explicit argument instead of reading it from an invocation.
+def session_key(bot_uuid: Any, target_type: Any, target_id: Any) -> tuple[str, str, str]:
+    """Return the full session identity a reminder belongs to.
+
+    A target id alone does not identify a session: two bots of one installation,
+    or the person/group namespaces, can reuse the same id. The tuple is always
+    derived from the trusted platform session, never from user parameters.
     """
-    return contextvars.Context().run(asyncio.create_task, coro)
+    return (str(bot_uuid or ""), str(target_type or ""), str(target_id or ""))
+
+
+def _event_session_key(event: dict[str, Any]) -> tuple[str, str, str]:
+    return session_key(event.get("bot_uuid"), event.get("target_type"), event.get("target_id"))
 
 
 class ScheNotify(BasePlugin):
@@ -54,6 +66,12 @@ class ScheNotify(BasePlugin):
         # Installation-keyed process state, released on revocation.
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._loops: dict[str, asyncio.Task] = {}
+        # Binding each loop was started under, so a worker upgrade (same scope
+        # token, new revision) restarts it instead of keeping stale authority.
+        self._loop_bindings: dict[str, Any] = {}
+        # Stable per-process event ids, so a delivery can be matched to exactly
+        # the event it sent even when a sibling invocation edits the list.
+        self._event_ids = itertools.count(1)
 
     async def initialize(self) -> None:
         """Process-scoped initialization only.
@@ -94,15 +112,42 @@ class ScheNotify(BasePlugin):
     def _events_for_scope(self, scope: str) -> list[dict[str, Any]]:
         return self._events.get(scope, [])
 
+    def session_key(self, bot_uuid: Any, target_type: Any, target_id: Any) -> tuple[str, str, str]:
+        """Return the trusted session identity used by the schedule commands.
+
+        Components pass the platform session fields here; the result is the same
+        key ``add_scheduled_event`` stores, so listing and deleting never match
+        another session of the installation.
+        """
+        return session_key(bot_uuid, target_type, target_id)
+
     def _ensure_loop(self, scope: str) -> None:
-        """Start the scheduler of one installation from inside its invocation."""
+        """Start (or refresh) the scheduler of the invoking installation.
+
+        The invocation's handler, config and binding are captured here: the
+        detached loop re-enters them at fire time so every Host send stays
+        attributable to the installation that scheduled the reminder. A worker
+        upgrade keeps the scope token (the revision is excluded from it) but
+        presents a new binding, so the loop is restarted under the new authority
+        instead of sending with the superseded revision.
+        """
+        handler = getattr(self, "plugin_runtime_handler", None)
+        config = current_config(handler)
+        binding = current_binding(handler)
+
         task = self._loops.get(scope)
         if task is not None and not task.done():
-            return
-        self._loops[scope] = _start_detached(self._check_loop_wrapper(scope))
+            if self._loop_bindings.get(scope) == binding:
+                return
+            task.cancel()
+        self._loop_bindings[scope] = binding
+        self._loops[scope] = asyncio.create_task(
+            self._check_loop_wrapper(scope, handler, config, binding)
+        )
 
     async def _stop_loop(self, scope: str) -> None:
         task = self._loops.pop(scope, None)
+        self._loop_bindings.pop(scope, None)
         if task is None:
             return
         task.cancel()
@@ -117,21 +162,25 @@ class ScheNotify(BasePlugin):
     # ------------------------------------------------------------------ #
     # Scheduler
     # ------------------------------------------------------------------ #
-    async def _check_loop_wrapper(self, scope: str):
+    async def _check_loop_wrapper(self, scope: str, handler: Any, config: Any, binding: Any):
         """Check one installation's due events until that binding is revoked.
 
-        The loop carries its installation scope explicitly instead of reading it
-        from an invocation: detached work has no invocation context, so it never
-        reads config or any other invocation-scoped API.
+        A detached task keeps no usable invocation of its own — the invocation
+        that started it has ended and is marked inactive. It therefore re-enters
+        the handler, config and binding captured when it started, so every send
+        this loop makes carries the scheduling installation's authority instead
+        of falling back to the worker's connection default. ``on_installation_revoked``
+        cancels the task, which exits this scope and drops the authority with it.
         """
-        while True:
-            try:
-                await self._check_scheduled_events(scope)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"Error in check loop: {e}", exc_info=True)
-            await asyncio.sleep(CHECK_INTERVAL_SECONDS)  # Check every minute
+        with bind_invocation(handler, config=config, binding=binding):
+            while True:
+                try:
+                    await self._check_scheduled_events(scope)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in check loop: {e}", exc_info=True)
+                await asyncio.sleep(CHECK_INTERVAL_SECONDS)  # Check every minute
 
     async def _check_scheduled_events(self, scope: str):
         """Send notifications for this installation's due events."""
@@ -140,22 +189,34 @@ class ScheNotify(BasePlugin):
         events = self._events.get(scope)
         if not events:
             return
-        logger.debug(f"Scheduled events: {events}")
+        # Log the queue size, not the reminder text: the content is tenant data.
+        logger.debug("Installation scope %s has %d pending events", scope, len(events))
 
-        events_to_remove = []
-
-        for event in events:
+        # Snapshot: a sibling invocation of the same installation may append or
+        # delete entries while this loop is awaiting a send.
+        delivered_ids = []
+        for event in list(events):
             if now >= event["time"]:
                 # Send notification
                 try:
                     await self._send_notification(event)
-                    events_to_remove.append(event)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    logger.error(f"Failed to send notification: {e}", exc_info=True)
+                    # Keep the failed event queued and record the failure: dropping
+                    # it here would silently lose the tenant's reminder.
+                    event["failed_attempts"] = event.get("failed_attempts", 0) + 1
+                    event["last_error"] = str(e)
+                    logger.error(
+                        "Failed to send notification %s: %s", event["id"], e, exc_info=True
+                    )
+                    continue
+                delivered_ids.append(event["id"])
 
-        # Remove sent events
-        for event in events_to_remove:
-            events.remove(event)
+        # Remove exactly the events this pass delivered, by stable id: a sibling
+        # invocation may already have removed them, and the list may have grown.
+        delivered = set(delivered_ids)
+        events[:] = [event for event in events if event["id"] not in delivered]
 
     async def _send_notification(self, event: dict[str, Any]):
         """
@@ -168,16 +229,14 @@ class ScheNotify(BasePlugin):
             platform_message.Plain(text=f"{NOTIFY_PREFIX}{event['message']}")
         ])
 
-        # Send message using saved session info
-        try:
-            await self.send_message(
-                bot_uuid=event["bot_uuid"],
-                target_type=event["target_type"],
-                target_id=event["target_id"],
-                message_chain=message_chain
-            )
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}", exc_info=True)
+        # Send message using saved session info. Failures propagate so the
+        # scheduler can keep the event queued and record the failed attempt.
+        await self.send_message(
+            bot_uuid=event["bot_uuid"],
+            target_type=event["target_type"],
+            target_id=event["target_id"],
+            message_chain=message_chain
+        )
 
     async def add_scheduled_event(
         self,
@@ -186,7 +245,7 @@ class ScheNotify(BasePlugin):
         bot_uuid: str,
         target_type: str,
         target_id: str
-    ):
+    ) -> bool:
         """
         Add a scheduled event (called from schedule_notify tool).
 
@@ -196,47 +255,84 @@ class ScheNotify(BasePlugin):
             bot_uuid: Bot UUID
             target_type: "person" or "group"
             target_id: Target ID
+
+        Returns:
+            True when the event was queued, False when this installation already
+            holds the maximum number of pending events.
         """
         scope = self._scope()
-        self._events.setdefault(scope, []).append({
+        events = self._events.setdefault(scope, [])
+        if len(events) >= MAX_EVENTS_PER_INSTALLATION:
+            logger.warning(
+                "Installation scope %s reached the %d-event limit; reminder rejected",
+                scope,
+                MAX_EVENTS_PER_INSTALLATION,
+            )
+            return False
+        events.append({
+            "id": next(self._event_ids),
             "time": time,
-            "message": message,
+            "message": str(message)[:MAX_MESSAGE_LENGTH],
             "bot_uuid": bot_uuid,
             "target_type": target_type,
             "target_id": target_id,
+            "failed_attempts": 0,
         })
         self._ensure_loop(scope)
+        return True
 
-    async def get_scheduled_events(self, target_id: str | None = None) -> list[dict[str, Any]]:
+    async def get_scheduled_events(
+        self, session_key: tuple[str, str, str] | None = None
+    ) -> list[dict[str, Any]]:
         """
-        Get this installation's scheduled events, optionally filtered by target_id.
+        Get this installation's scheduled events, optionally filtered by session.
 
         Args:
-            target_id: Optional target ID for filtering
+            session_key: Optional ``(bot_uuid, target_type, target_id)`` of one
+                trusted session, as returned by ``session_key()``
 
         Returns:
-            List of scheduled events (a copy; mutating it does not change the schedule)
+            A new list of the pending event records; the records are the live
+            dicts, so callers must not mutate them.
         """
         scope = self._scope()
         events = self._events_for_scope(scope)
 
-        if target_id is None:
+        if session_key is None:
             return list(events)
 
-        # Filter by target_id
+        # Filter by the full session identity, never by target_id alone.
         return [
             event for event in events
-            if event.get("target_id") == target_id
+            if _event_session_key(event) == session_key
         ]
 
-    async def delete_scheduled_event(self, event: dict[str, Any]):
+    async def delete_scheduled_event(
+        self,
+        event: dict[str, Any],
+        session_key: tuple[str, str, str] | None = None,
+    ) -> bool:
         """
         Delete a scheduled event of this installation.
 
         Args:
             event: Event to delete
+            session_key: When given, the caller's trusted session identity; the
+                event is only removed when it belongs to that session.
+
+        Returns:
+            True when the event was removed from this installation's schedule.
         """
         scope = self._scope()
         events = self._events_for_scope(scope)
-        if event in events:
-            events.remove(event)
+        if session_key is not None and _event_session_key(event) != session_key:
+            return False
+
+        event_id = event.get("id")
+        for index, existing in enumerate(events):
+            if existing is event or (
+                event_id is not None and existing.get("id") == event_id
+            ):
+                del events[index]
+                return True
+        return False

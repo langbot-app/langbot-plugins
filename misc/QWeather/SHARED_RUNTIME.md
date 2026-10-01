@@ -11,6 +11,10 @@ claim of live tenant acceptance.
   `httpx.AsyncClient` and is awaited by the command handler. The previous synchronous
   `requests.Session().get` chain is gone, so a slow upstream no longer stalls other tenants
   sharing the event loop. Per-request timeout is 10 s.
+- The fan-out is structured: if one request fails, or the invocation is cancelled, the
+  remaining request tasks are cancelled and awaited to completion before the error is
+  propagated, so no request task (and no in-flight use of this invocation's API key)
+  outlives the command call.
 - The command module no longer mutates `sys.path` at import or call time; the plugin root is
   only expected on `sys.path` the way the SDK loads `components`/`pkg` packages.
 

@@ -30,11 +30,15 @@ class ScheCommand(Command):
             config = self.plugin.get_config()
             language = config.get("language", "zh_Hans")
 
-            # Get target_id from session
-            target_id = str(context.session.launcher_id)
+            # Get the full session identity from the trusted session: a target id
+            # alone is shared by other bots and by the person/group namespaces.
+            session = context.session
+            session_key = self.plugin.session_key(
+                session.bot_uuid, session.launcher_type.value, str(session.launcher_id)
+            )
 
             # Get scheduled events from plugin
-            scheduled_events = await self.plugin.get_scheduled_events(target_id)
+            scheduled_events = await self.plugin.get_scheduled_events(session_key)
 
             if not scheduled_events or len(scheduled_events) == 0:
                 if language == "en_US":

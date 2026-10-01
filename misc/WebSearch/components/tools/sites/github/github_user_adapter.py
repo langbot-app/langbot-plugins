@@ -29,7 +29,7 @@ class GithubUserSiteAdapter(SiteAdapterBase):
     @classmethod
     def process(cls, url: str, brief_len: int, **kwargs) -> dict:
         """处理网页内容"""
-        status_code, raw_html = cls.get_html(url)
+        status_code, raw_html = cls.get_html(url, **kwargs)
         if status_code != 200:
             return cls.make_ret(
                 status_code=status_code,
@@ -122,7 +122,7 @@ class GithubUserSiteAdapter(SiteAdapterBase):
         # # 从html中用正则提取
         # briefs = cls.regexp_brief(raw_html, "Email", r'"Email:(.*?)"', briefs)
 
-        briefs.append("brief raw: "+raw)
+        briefs.append("brief raw: "+raw[:brief_len])
 
         return cls.make_ret(
             status_code=status_code,

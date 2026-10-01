@@ -33,9 +33,11 @@ powercontext server run --env-file .env
 
 ## Configuration
 
-Set `server_url` and, when Server authentication is enabled, `api_token`. If the setting is empty, the plugin reads
-`POWERCONTEXT_CLIENT_API_TOKEN` from the Plugin Runtime environment. Loopback HTTP is accepted. A remote HTTP URL is
-rejected unless `allow_insecure_http` is explicitly enabled; use HTTPS for persistent or multi-user deployments.
+Set `server_url` and, when Server authentication is enabled, `api_token`. The token belongs to this installation:
+it is read only from the installation's own configuration and never from a process environment variable, so a shared
+worker cannot send one installation's process credential to another installation's Server. Loopback HTTP is accepted.
+A remote HTTP URL is rejected unless `allow_insecure_http` is explicitly enabled; use HTTPS for persistent or
+multi-user deployments.
 
 Choose one Scope setup:
 
@@ -70,8 +72,8 @@ entry without deleting its revision history.
 
 - Historical context is data, not an instruction override.
 - Do not put credentials or secrets into Memory.
-- Prefer `POWERCONTEXT_CLIENT_API_TOKEN`; otherwise restrict access to plugin configuration because LangBot currently
-  stores `api_token` as a string setting.
+- Set `api_token` in this installation's own configuration; the plugin never reads a bearer token from the process
+  environment. Restrict access to plugin configuration because LangBot currently stores `api_token` as a string setting.
 - Keep `allow_default_scope` off in multi-chat deployments unless sharing is intentional.
 - Prefer HTTPS for a remote Server; HTTP exposes content and bearer credentials in transit.
 

@@ -1,9 +1,9 @@
 """Two installations drive one URLSummary object graph under shared-runtime-v1.
 
 URLSummary relies on the stateless component model: the ``URLDetector`` listener
-reads ``plugin.get_config()`` per event and every fetch builds its own
-``aiohttp.ClientSession``. These tests drive the same component object across two
-distinct ``InstallationBinding`` values.
+reads ``plugin.get_config()`` per event and every fetch binds its own
+target-validated connection (see ``safe_fetch.py``). These tests drive the same
+component object across two distinct ``InstallationBinding`` values.
 """
 
 from __future__ import annotations
@@ -120,62 +120,6 @@ def test_config_model_and_summary_are_resolved_per_event(monkeypatch):
     # Nothing from the invocation was stored on the shared listener or plugin.
     assert set(vars(listener)) == {"registered_handlers", "plugin"}
     assert plugin._legacy_config == {}
-
-
-class _FakeResponse:
-    status = 200
-    headers = {"Content-Type": "text/html"}
-
-    def __init__(self, html: str):
-        self._html = html
-
-    async def text(self, errors: str = "replace") -> str:
-        return self._html
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, html: str):
-        self._html = html
-
-    def get(self, url, **kwargs):
-        return _FakeResponse(self._html)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-def test_each_fetch_uses_its_own_client_session(monkeypatch):
-    plugin, _handler, _listener = _wire()
-    sessions: list[_FakeSession] = []
-    html = "<html><head><title>Title</title></head><body><p>Hello world</p></body></html>"
-
-    def make_session(*args, **kwargs):
-        session = _FakeSession(html)
-        sessions.append(session)
-        return session
-
-    monkeypatch.setattr(
-        main_mod,
-        "aiohttp",
-        SimpleNamespace(ClientTimeout=lambda **kwargs: None, ClientSession=make_session),
-    )
-
-    first = asyncio.run(plugin.fetch_page("https://example.com/a", 100))
-    second = asyncio.run(plugin.fetch_page("https://example.com/b", 100))
-
-    assert len(sessions) == 2
-    assert sessions[0] is not sessions[1]
-    assert first[0] == "Title" and "Hello world" in first[1]
-    assert second[0] == "Title" and "Hello world" in second[1]
 
 
 if __name__ == "__main__":

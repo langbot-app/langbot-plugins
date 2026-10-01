@@ -23,6 +23,25 @@ claim of live tenant acceptance.
 - `GeneralParsersPlugin.on_installation_revoked(binding)` calls `release_telemetry(binding)`,
   dropping that installation's store on uninstall/disable/workspace-removal/upgrade.
 
+## PDF execution boundary
+
+- PyMuPDF is not thread safe and its table finder keeps module-level page state
+  (`EDGES` / `CHARS` in `pymupdf.table`, unchanged across the supported 1.x line). Parsing
+  it from the shared worker's thread pool let concurrent installations re-enter those
+  globals and could return another installation's page text or crash the shared process.
+- Every PDF parse therefore runs in a dedicated short-lived interpreter process
+  (`components/general_parsers/isolated_process.py` + `process_worker.py`) that owns the
+  complete lifecycle: open document -> font/header/footer pass -> `find_tables()` ->
+  table extraction -> text/image extraction -> close document.
+- The boundary is released only after that process has exited. A hard timeout
+  (`DEFAULT_TIMEOUT_SECONDS`, 300 s), a cancellation or a crash terminates and reaps the
+  worker before the caller resumes, so no dependency work can keep running into a later
+  request. PyMuPDF module state only ever exists inside the per-parse worker; the shared
+  process never imports it.
+- Supported dependency range: `PyMuPDF>=1.24.0,<2.0.0` (see `requirements.txt`). The
+  process boundary is what makes the shared runtime safe on this whole range; the range is
+  bounded to the 1.x line this implementation is verified against.
+
 ## Page scoping
 
 `PageRequest` carries no binding. `ParserObservabilityPage` resolves the current

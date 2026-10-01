@@ -20,6 +20,10 @@ EventListener all reach their data through that single object.
   another installation's cache.
 - This plugin declares no config, so no tenant configuration is captured on the
   shared object.
+- The manager page renders entry text through DOM nodes and element properties
+  (`textContent` / `value`) and binds its controls with `addEventListener`; no
+  entry field is interpolated into markup, so a stored question or answer cannot
+  add attributes or event handlers to the page.
 
 ## Per binding, released on revocation
 
@@ -68,3 +72,12 @@ one installation never appears in the other's entries, search results, Page or
 Tool output, that a fresh object ("restart of the loader") reloads each
 installation's own row, that revocation drops only the revoked binding, and that
 dedicated binding-less workers keep the legacy key.
+
+`tests/test_page_attribute_injection.py` renders
+`components/pages/manager/index.html` with `tests/page_dom_probe.js` (Node)
+against a recording DOM, with a question of `" onfocus="alert(1)" data-x="` and an
+answer containing `</textarea><img src=x onerror=...>`. It asserts that no markup
+string carries the entry text, that parsing every markup string yields no
+event-handler attribute, and that the list and the edit form still show the entry
+through element properties (pre-fix, the edit form produced an `onfocus`
+attribute).

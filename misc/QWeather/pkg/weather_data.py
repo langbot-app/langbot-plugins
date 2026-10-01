@@ -41,7 +41,7 @@ class Weather:
     def __url__(self):
         self.url_geoapi = "https://geoapi.qweather.com/v2/city/"
         if self.api_type == 2 or self.api_type == 1:
-            self.url_weather_api = "https://api.qweather.com/v7/weather"
+            self.url_weather_api = "https://api.qweather.com/v7/weather/"
             self.url_weather_warning = "https://api.qweather.com/v7/warning/now"
             self.url_air = "https://api.qweather.com/v7/air/now"
             self.url_hourly = "https://api.qweather.com/v7/weather/24h"
@@ -74,6 +74,29 @@ class Weather:
 
     async def load_data(self):
         self.city_id = await self._get_city_id()
+        tasks = [
+            asyncio.ensure_future(coro)
+            for coro in (
+                self._now(),
+                self._daily(),
+                self._air(),
+                self._warning(),
+                self._hourly(),
+                self._info(),
+                self._sun(),
+            )
+        ]
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            # Structured concurrency: the failing branch must not outlive this
+            # invocation. Cancel every sibling and wait for all of them to
+            # finish (each holds this call's API key) before propagating the
+            # original error/cancellation.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         (
             self.now,
             self.daily,
@@ -82,9 +105,7 @@ class Weather:
             self.hourly,
             self.info,
             self.sun
-        ) = await asyncio.gather(
-            self._now(), self._daily(), self._air(), self._warning(), self._hourly(), self._info(), self._sun()
-        )
+        ) = results
         self._data_validate()
 
     async def _get_city_id(self, api_type: str = "lookup"):

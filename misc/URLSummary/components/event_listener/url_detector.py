@@ -13,6 +13,24 @@ URL_PATTERN = re.compile(r'https?://[^\s<>\]\)，。！？、]+')
 
 logger = logging.getLogger("URLSummary.detector")
 
+DEFAULT_MAX_CONTENT_LENGTH = 8000
+MAX_CONTENT_LENGTH = 100_000
+
+
+def _clamp_max_content_length(value) -> int:
+    """Keep the configured extraction length inside a sane range."""
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONTENT_LENGTH
+    return max(1, min(length, MAX_CONTENT_LENGTH))
+
+
+def _redact_url(url: str) -> str:
+    """Drop credentials and the query string before a URL is logged."""
+    without_query = re.split(r'([?#])', url, maxsplit=1)[0]
+    return re.sub(r'//[^/@]*@', '//', without_query)
+
 
 class URLDetector(EventListener):
     """Detects URLs in messages and triggers auto-summarization."""
@@ -64,7 +82,7 @@ class URLDetector(EventListener):
 
             plugin = self.plugin
             config = plugin.get_config()
-            max_len = config.get("max_content_length", 8000)
+            max_len = _clamp_max_content_length(config.get("max_content_length"))
             language = config.get("language", "zh_Hans")
 
             # Get model
@@ -93,7 +111,7 @@ class URLDetector(EventListener):
                     ]))
 
                 except Exception as e:
-                    logger.warning(f"Failed to summarize {url}: {e}")
+                    logger.warning(f"Failed to summarize {_redact_url(url)}: {e}")
 
         except Exception as e:
             logger.error(f"Error in _handle_message: {e}\n{traceback.format_exc()}")

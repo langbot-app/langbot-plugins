@@ -1,7 +1,21 @@
 import re
-import requests
 import random
 from bs4 import BeautifulSoup
+
+from . import safe_fetch
+
+DEFAULT_BRIEF_LEN = 4096
+MAX_BRIEF_CHARS = 100_000
+MAX_TITLE_CHARS = 500
+
+
+def clamp_brief_len(value) -> int:
+    """Keep the caller-supplied output length inside a sane range."""
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_BRIEF_LEN
+    return max(1, min(length, MAX_BRIEF_CHARS))
 
 
 __site_adapters__ = []
@@ -52,20 +66,22 @@ class SiteAdapterBase:
         return True
 
     @classmethod
-    def get_html(cls, url: str, timeout: int=10) -> (int, str):
+    def get_html(cls, url: str, timeout: float = safe_fetch.TOTAL_TIMEOUT, **kwargs) -> (int, str):
         """获取网页的HTML内容
-        
+
         反反爬策略应该在此应用
+
+        目标校验、重定向逐跳校验、字节上限与总截止时间都在
+        ``safe_fetch`` 中实施；这里再限制交给解析器的字符数。
         """
-        r = requests.get(
+        document = safe_fetch.fetch_document(
             url,
             timeout=timeout,
-            headers={
-                'User-Agent': random.choice(user_agents)
-            }
+            headers={'User-Agent': random.choice(user_agents)},
+            **kwargs,
         )
-        
-        return r.status_code, r.text
+
+        return document.status_code, document.text[:safe_fetch.MAX_PARSE_CHARS]
 
     @classmethod
     def extra_plain(cls, raw_html: str) -> str:
@@ -82,9 +98,16 @@ class SiteAdapterBase:
     def extra_title_element(cls, raw_html: str) -> str:
         """提取网页的标题元素的纯文字"""
         soup = BeautifulSoup(raw_html, 'html.parser')
-        raw = soup.title.string
 
-        return raw
+        element = soup.title
+        if element is None:
+            return ''
+
+        title = element.string
+        if title is None:
+            title = element.get_text()
+
+        return title.strip()[:MAX_TITLE_CHARS]
 
     @classmethod
     def regexp_brief(cls, raw_html: str, key: str, regexp: str, briefs: list[str]) -> list[str]:
@@ -125,7 +148,9 @@ class SiteAdapterBase:
     @classmethod
     def process(cls, url: str, brief_len: int, **kwargs) -> dict:
         """处理网页内容"""
-        status_code, raw_html = cls.get_html(url)
+        brief_len = clamp_brief_len(brief_len)
+
+        status_code, raw_html = cls.get_html(url, **kwargs)
         if status_code != 200:
             return {
                 "status": status_code,

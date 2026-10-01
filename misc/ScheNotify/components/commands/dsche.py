@@ -50,11 +50,15 @@ class DscheCommand(Command):
                 yield CommandReturn(text=reply)
                 return
 
-            # Get target_id from session
-            target_id = str(context.session.launcher_id)
+            # Get the full session identity from the trusted session: a target id
+            # alone is shared by other bots and by the person/group namespaces.
+            session = context.session
+            session_key = self.plugin.session_key(
+                session.bot_uuid, session.launcher_type.value, str(session.launcher_id)
+            )
 
             # Get scheduled events from plugin
-            scheduled_events = await self.plugin.get_scheduled_events(target_id)
+            scheduled_events = await self.plugin.get_scheduled_events(session_key)
 
             if index < 0 or index >= len(scheduled_events):
                 if language == "en_US":
@@ -66,8 +70,14 @@ class DscheCommand(Command):
 
             event = scheduled_events[index]
 
-            # Delete the event
-            await self.plugin.delete_scheduled_event(event)
+            # Delete the event; the plugin re-checks that it belongs to this session.
+            if not await self.plugin.delete_scheduled_event(event, session_key):
+                if language == "en_US":
+                    reply = '[Notify] Index out of range'
+                else:
+                    reply = '[Notify] 索引超出范围'
+                yield CommandReturn(text=reply)
+                return
 
             if language == "en_US":
                 reply = f'[Notify] Deleted notification: {event["time"]} {event["message"]}'

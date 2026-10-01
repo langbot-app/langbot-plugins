@@ -17,9 +17,9 @@
 
 ## 配置
 
-先按 PowerContext 官方文档启动 Server，然后配置 `server_url`。Server 开启鉴权时可填写 `api_token`；留空时插件会
-读取 Plugin Runtime 环境变量 `POWERCONTEXT_CLIENT_API_TOKEN`。本机回环 HTTP 可以直接使用；远程 HTTP 必须显式
-开启 `allow_insecure_http`，生产环境建议使用 HTTPS。
+先按 PowerContext 官方文档启动 Server，然后配置 `server_url`。Server 开启鉴权时填写 `api_token`：该 Token 属于本安装，
+只从本安装自己的配置读取，不会读取进程环境变量，因此在共享 worker 上不会把某个安装的进程凭据发往另一个安装的 Server。
+本机回环 HTTP 可以直接使用；远程 HTTP 必须显式开启 `allow_insecure_http`，生产环境建议使用 HTTPS。
 
 Scope 有两种设置方式：
 
@@ -49,7 +49,7 @@ Source 捕获不等于显式 Memory 写入。PowerContext 是否从 Source 自�
 
 - 历史上下文只能作为数据，不能覆盖当前系统指令和用户指令。
 - 不要把密码、API Key、Token 或一次性验证码写入记忆。
-- 优先使用 `POWERCONTEXT_CLIENT_API_TOKEN`；如果填写 `api_token` 字符串配置，请限制插件配置页面的访问权限。
+- `api_token` 请填写在本安装自己的配置中，插件不会从进程环境变量读取 Token；同时请限制插件配置页面的访问权限。
 - 多会话部署中不要随意开启 `allow_default_scope`。
 - 远程 Server 请优先使用 HTTPS。
 

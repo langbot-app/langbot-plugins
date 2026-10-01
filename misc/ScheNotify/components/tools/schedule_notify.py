@@ -36,11 +36,13 @@ class ScheduleNotify(Tool):
                 "time_passed": "计划时间已经过去",
                 "success": "计划成功:\n将在{time}提醒您：{message}",
                 "no_session": "错误：无法获取会话信息，请先发送一条消息",
+                "too_many": "错误：本会话的计划提醒数量已达上限，请先删除一些提醒",
             },
             "en_US": {
                 "time_passed": "The scheduled time has already passed",
                 "success": "Scheduled successfully:\nWill remind you at {time}: {message}",
                 "no_session": "Error: Cannot get session info, please send a message first",
+                "too_many": "Error: This installation has reached its scheduled reminder limit; delete some reminders first",
             }
         }
 
@@ -80,8 +82,12 @@ class ScheduleNotify(Tool):
 
             real_date = datetime.datetime.fromtimestamp(time_stamp)
 
-            # Get session info
-            bot_uuid = session.using_conversation.bot_uuid if session.using_conversation else None
+            # Get session info. The bot uuid is part of the session identity, so
+            # it is taken from the trusted session (falling back to its active
+            # conversation) and stored with the target type and id.
+            bot_uuid = session.bot_uuid or (
+                session.using_conversation.bot_uuid if session.using_conversation else None
+            )
             target_type = session.launcher_type.value
             target_id = str(session.launcher_id)
 
@@ -89,13 +95,15 @@ class ScheduleNotify(Tool):
                 return self._get_message("no_session")
 
             # Add to plugin's scheduled events with session info
-            await self.plugin.add_scheduled_event(
+            queued = await self.plugin.add_scheduled_event(
                 time=real_date,
                 message=message,
                 bot_uuid=bot_uuid,
                 target_type=target_type,
                 target_id=target_id
             )
+            if not queued:
+                return self._get_message("too_many")
 
             return self._get_message("success", time=real_date, message=message)
 

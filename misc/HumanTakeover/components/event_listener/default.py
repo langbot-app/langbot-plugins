@@ -52,29 +52,47 @@ class DefaultEventListener(EventListener):
         async def on_ai_responded(event_context: context.EventContext):
             await self._handle_ai_responded(event_context)
 
+    async def _bot_uuid_for(self, event_context: context.EventContext) -> str:
+        """Return the trusted bot identity of this event, or "" when unavailable.
+
+        The bot uuid comes from the Host query, not from the serialized event, so it
+        cannot be chosen by the payload. It is required: a session keyed without it
+        could collide with another bot's conversation.
+        """
+        try:
+            bot_uuid = await event_context.get_bot_uuid()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("HumanTakeover get_bot_uuid failed: %s", e)
+            bot_uuid = ""
+        return str(bot_uuid or "")
+
     async def _handle_received(
         self, event_context: context.EventContext, session_type: str
     ):
         event = event_context.event
         plugin = self.plugin
 
-        session_key = plugin.make_session_key(event.launcher_type, event.launcher_id)
+        # 获取 bot uuid(用于人工回复时主动发送): 会话键必须包含 Bot 身份,
+        # 否则同一安装内多个 Bot/适配器的同 ID 会话会互相覆盖历史与回复目标。
+        bot_uuid = await self._bot_uuid_for(event_context)
+        if not bot_uuid:
+            logger.error(
+                "HumanTakeover dropped an event without a trusted bot uuid; "
+                "refusing to key a session without bot identity"
+            )
+            return
 
-        # 获取 bot uuid(用于人工回复时主动发送)
-        try:
-            bot_uuid = await event_context.get_bot_uuid()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("HumanTakeover get_bot_uuid failed: %s", e)
-            bot_uuid = ""
+        session_key = plugin.make_session_key(
+            event.launcher_type, event.launcher_id, bot_uuid
+        )
 
         # 收消息时缓存适配器(此时 bot 在线,避免人工发送时反复请求出错)
         adapter = ""
-        if bot_uuid:
-            try:
-                bot_info = await plugin.get_bot_info(bot_uuid)
-                adapter = bot_info.get("adapter") or ""
-            except Exception as e:  # noqa: BLE001
-                logger.warning("HumanTakeover get_bot_info for adapter failed: %s", e)
+        try:
+            bot_info = await plugin.get_bot_info(bot_uuid)
+            adapter = bot_info.get("adapter") or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("HumanTakeover get_bot_info for adapter failed: %s", e)
 
         # 提取发送者信息与会话名称
         sender_id = str(event.sender_id)
@@ -143,16 +161,23 @@ class DefaultEventListener(EventListener):
         """记录 AI 的回复内容,便于在面板中查看完整对话。"""
         event = event_context.event
         plugin = self.plugin
-        session_key = plugin.make_session_key(event.launcher_type, event.launcher_id)
+
+        # 与收消息一致: 会话键必须携带可信 Bot 身份,否则会写入另一个 Bot 的历史。
+        bot_uuid = await self._bot_uuid_for(event_context)
+        if not bot_uuid:
+            logger.error(
+                "HumanTakeover dropped an AI response without a trusted bot uuid; "
+                "refusing to key a session without bot identity"
+            )
+            return
+
+        session_key = plugin.make_session_key(
+            event.launcher_type, event.launcher_id, bot_uuid
+        )
 
         # 若该会话已接管,理论上不会触发 AI 回复;保险起见再次校验
         if plugin.is_taken_over(session_key):
             return
-
-        try:
-            bot_uuid = await event_context.get_bot_uuid()
-        except Exception:  # noqa: BLE001
-            bot_uuid = ""
 
         response_text = getattr(event, "response_text", "") or ""
         if not response_text:

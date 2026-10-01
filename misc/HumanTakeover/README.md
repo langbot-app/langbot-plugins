@@ -68,26 +68,48 @@ An acknowledged commit remains in the cache even if its caller was cancelled.
 Any remote mutation error, including a timeout or lost connection, has an unknown
 commit outcome: it marks storage uninitialized and blocks further writes, clear,
 and ordinary reinitialization. Do not assume the write was rejected or retry it.
-An operator must first establish that the old host operations have finished (or
-stop the old host writer), reconcile persisted data, then reload using
-`await plugin.initialize(storage_reconciled=True)` or restart the plugin. A mere
-read or plugin restart while old host requests can still commit is **not** safe
-reconciliation. Partial clear/migration can then be retried.
+The barrier is re-checked after the installation lock is acquired, so a caller that
+was already queued for that lock when the failure happened is blocked too and
+cannot write over the unknown outcome. An operator must first establish that the
+old host operations have finished (or stop the old host writer), reconcile
+persisted data, then reload using `await plugin.reconcile()` or restart the plugin;
+that explicit recovery path is the only one that lifts the barrier. A mere read,
+an ordinary load, or plugin restart while old host requests can still commit is
+**not** safe reconciliation. Partial clear/migration can then be retried.
 If a manual reply was delivered but saving its
 history failed, the console explicitly warns **not to resend** it.
 
+## Session identity
+
+A session key is `<bot_uuid>:<launcher_type>_<launcher_id>`: the trusted bot uuid
+resolved from the event query is part of the key, so one installation that serves
+several bots/adapters keeps separate history, takeover state and reply targets per
+bot - two bots with the same group/user id no longer share one record. An event
+whose bot identity cannot be resolved is not recorded at all, and a session record
+rejects a different bot's or adapter's identity, so a foreign event cannot rewrite
+the reply target of an existing session.
+
+Rows written before session keys carried the bot identity keep their old key and
+are left untouched: an unscoped key may already contain two bots' history, so it is
+never migrated or merged into a bot-scoped session. They stay readable, are never
+written by another bot's events (new messages always use a bot-scoped key), and
+remain replyable only while their stored bot uuid is known. The console may list
+such a row next to the bot-scoped session that continues the same conversation.
+
 ### Storage regression tests
 
-With `langbot-plugin==0.5.7` installed, run from `HumanTakeover/`:
+With the shared-runtime SDK (`langbot-plugin`) installed, run from `HumanTakeover/`:
 
 ```sh
-python -m unittest discover -s tests -v
+python -m pytest tests -q
 ```
 
 Tests cover migration/readback, bounded per-session writes, concurrent updates,
-rollback/error reporting, retention and clearing. The stdio test uses the real
-SDK and an OS subprocess, with a synthetic Host KV sink; it is not a full LangBot
-deployment or a live database test.
+failure-barrier handling, rollback/error reporting, bot-identity scoping,
+retention and clearing. The stdio test uses the real SDK and an OS subprocess,
+with a synthetic Host KV sink; it is not a full LangBot deployment or a live
+database test, and it needs a host that can spawn that child process (it fails on
+Windows with `WinError 10106`).
 
 ## Components
 

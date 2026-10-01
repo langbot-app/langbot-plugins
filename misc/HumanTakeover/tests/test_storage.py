@@ -78,6 +78,31 @@ class DetachedHost(StorageHost):
         return await asyncio.shield(self.remote)
 
 
+class PausableHost(StorageHost):
+    """Holds one chosen action in flight, then fails it after the pause.
+
+    Unlike ``DetachedHost`` the caller stays blocked until the test releases it,
+    so another caller can be queued behind the installation lock first.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pause_action = None
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
+        self.pause_error = None
+
+    async def call_action(self, action, data):
+        if action != self.pause_action:
+            return await super().call_action(action, data)
+        self.pause_action = None
+        self.paused.set()
+        await self.release.wait()
+        if self.pause_error is not None:
+            raise self.pause_error("remote outcome unknown")
+        return await super().call_action(action, data)
+
+
 async def open_plugin(host):
     plugin = HumanTakeover()
     plugin.config = {}
@@ -165,7 +190,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_aggregate_history_above_frame_limit_can_record(self):
         for i in range(1200):
             key = f"group_{i}"
-            self.plugin._ensure_session(key, "group", key, "fixture", key)
+            self.plugin._ensure_session(key, "group", key, "fixture-bot", key)
             self.plugin.messages[key] = [{"content": "x" * 1024} for _ in range(11)]
         await record(self.plugin, "group_0", "persist-me")
         restarted = await open_plugin(self.host)
@@ -516,6 +541,83 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         (await open_plugin(host)).messages, plugin.messages
                     )
+
+    async def _queued_operation_cannot_cross_barrier(self, first, second, pause_action):
+        """Run ``first`` so it fails only after ``second`` passed its fence check."""
+        host = PausableHost()
+        plugin = await open_plugin(host)
+        await record(plugin, "group_1", "baseline")
+        before = copy.deepcopy((plugin.sessions, plugin.messages))
+        before_data = dict(host.data)
+        host.pause_action = pause_action
+        host.pause_error = TimeoutError
+        failing = asyncio.create_task(first(plugin))
+        await host.paused.wait()
+        queued = asyncio.create_task(second(plugin))
+        await asyncio.sleep(0.01)
+        self.assertTrue(
+            plugin._loaded, "the barrier only exists once the writer has failed"
+        )
+        self.assertFalse(queued.done(), "the second operation must wait for the lock")
+        host.release.set()
+        with self.assertRaises(TimeoutError):
+            await failing
+        # The queued caller passed the fence check before the failure; it must
+        # re-check it under the lock instead of writing over an unknown outcome.
+        with self.assertRaisesRegex(RuntimeError, "reconcil"):
+            await queued
+        self.assertFalse(plugin._loaded)
+        self.assertEqual((plugin.sessions, plugin.messages), before)
+        self.assertEqual(host.data, before_data)
+        host.pause_error = None
+        await plugin.reconcile()
+        self.assertEqual((plugin.sessions, plugin.messages), before)
+
+    async def test_queued_update_cannot_cross_storage_failure_barrier(self):
+        await self._queued_operation_cannot_cross_barrier(
+            lambda plugin: record(plugin, "group_1", "not saved"),
+            lambda plugin: record(plugin, "group_1", "queued"),
+            Action.SET_PLUGIN_STORAGE,
+        )
+
+    async def test_queued_clear_cannot_cross_storage_failure_barrier(self):
+        await self._queued_operation_cannot_cross_barrier(
+            lambda plugin: plugin.clear_all(),
+            lambda plugin: record(plugin, "group_1", "queued"),
+            Action.DELETE_PLUGIN_STORAGE,
+        )
+
+    async def test_queued_update_cannot_clear_after_failed_clear(self):
+        await self._queued_operation_cannot_cross_barrier(
+            lambda plugin: plugin.clear_all(),
+            lambda plugin: plugin.clear_all(),
+            Action.DELETE_PLUGIN_STORAGE,
+        )
+
+    async def test_queued_loader_cannot_clear_failed_load_barrier(self):
+        host = PausableHost()
+        plugin = HumanTakeover()
+        plugin.config = {}
+        plugin.plugin_runtime_handler = host
+        host.pause_action = Action.GET_PLUGIN_STORAGE_KEYS
+        host.pause_error = ConnectionError
+        failing = asyncio.create_task(plugin.load_state())
+        await host.paused.wait()
+        queued = asyncio.create_task(plugin.load_state())
+        await asyncio.sleep(0.01)
+        self.assertFalse(queued.done())
+        host.release.set()
+        with self.assertRaises(ConnectionError):
+            await failing
+        # A plain load must never lift the barrier an earlier load raised, even
+        # though it passed the fence check before that failure.
+        with self.assertRaisesRegex(RuntimeError, "not initialized"):
+            await queued
+        self.assertFalse(plugin._loaded)
+        self.assertEqual(host.data, {})
+        host.pause_error = None
+        await plugin.reconcile()
+        self.assertTrue(plugin._loaded)
 
     async def test_v2_read_failure_blocks_writes_after_failed_initialize(self):
         await record(self.plugin)

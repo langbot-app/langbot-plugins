@@ -146,21 +146,41 @@ class HumanTakeover(BasePlugin):
             self._states[scope] = st
         return st
 
+    def _check_failure_fence(
+        self, st: _InstallationState, *, storage_reconciled: bool = False
+    ) -> None:
+        """Fail closed while an ambiguous storage failure is pending.
+
+        Only ``reconcile()`` may lift the barrier: it is the one entry point that
+        asserts an operator has established the ambiguous remote outcome settled.
+        Ordinary calls must re-check this fence *after* taking the installation
+        lock, because a failure can land while they wait for it.
+        """
+        if storage_reconciled:
+            return
+        if st.storage_uncertain:
+            raise RuntimeError("HumanTakeover storage requires remote reconciliation")
+        if st.load_failed:
+            raise RuntimeError("HumanTakeover storage is not initialized")
+
     async def _ensure_loaded(
         self, st: _InstallationState, *, storage_reconciled: bool = False
     ) -> None:
         """Load one installation's rows exactly once, honoring failure fences."""
-        if st.storage_uncertain and not storage_reconciled:
-            raise RuntimeError("HumanTakeover storage requires remote reconciliation")
-        if st.load_failed and not storage_reconciled:
-            raise RuntimeError("HumanTakeover storage is not initialized")
+        self._check_failure_fence(st, storage_reconciled=storage_reconciled)
         if st.loaded and not storage_reconciled:
             return
         async with st.lock:
+            # A queued loader may have waited while another operation failed; the
+            # barrier is re-checked under the lock so a plain load can never clear
+            # it and silently re-read storage.
+            self._check_failure_fence(st, storage_reconciled=storage_reconciled)
             if st.loaded and not storage_reconciled:
                 return
-            st.storage_uncertain = False
-            st.load_failed = False
+            if storage_reconciled:
+                # Explicit reconciliation is the only path that lifts the barrier.
+                st.storage_uncertain = False
+                st.load_failed = False
             # A (re)load replaces the cache with what storage holds.
             st.sessions = {}
             st.messages = {}
@@ -174,11 +194,48 @@ class HumanTakeover(BasePlugin):
                 st.load_failed = True
                 raise
             st.loaded = True
+            self._report_unscoped_session_keys(st)
             logger.info(
                 "HumanTakeover initialized scope=%s: %d sessions, %d message buckets",
                 st.scope,
                 len(st.sessions),
                 len(st.messages),
+            )
+
+    @classmethod
+    def session_key_has_bot_identity(
+        cls, session_key: str, session: dict[str, Any]
+    ) -> bool:
+        """Whether a stored session key was derived from its own bot identity.
+
+        Rows written before session keys carried the bot identity are left in
+        place: a key that already collided across bots cannot be attributed to one
+        bot afterwards, so migrating it would re-merge the very histories this
+        scoping separates. They stay readable, are never written by another bot's
+        event (new events always use a bot-scoped key), and remain replyable only
+        while their stored bot uuid is known.
+        """
+        bot_uuid = str(session.get("bot_uuid") or "")
+        if not bot_uuid:
+            return False
+        return session_key == cls.make_session_key(
+            str(session.get("type") or ""), session.get("target_id") or "", bot_uuid
+        )
+
+    @classmethod
+    def _report_unscoped_session_keys(cls, st: _InstallationState) -> None:
+        unscoped = [
+            key
+            for key, session in st.sessions.items()
+            if not cls.session_key_has_bot_identity(key, session)
+        ]
+        if unscoped:
+            logger.warning(
+                "HumanTakeover scope %s kept %d session(s) stored before session "
+                "keys carried the bot identity; they are not updated by other bots' "
+                "events and their conversation continues under a bot-scoped key",
+                st.scope,
+                len(unscoped),
             )
 
     async def load_state(self) -> None:
@@ -338,6 +395,10 @@ class HumanTakeover(BasePlugin):
         # installation's lock through I/O so an older snapshot cannot win a race.
         st = await self._state_for_update()
         async with st.lock:
+            # This caller may have passed the fence check before a concurrent
+            # operation failed while it waited for the lock; an ambiguous remote
+            # outcome must never be crossed by a queued writer.
+            self._check_failure_fence(st)
             old_session = deepcopy(st.sessions.get(session_key))
             old_messages = deepcopy(st.messages.get(session_key))
             committed = False
@@ -374,6 +435,9 @@ class HumanTakeover(BasePlugin):
         """Delete only our data, serialized with updates; failures reach the caller."""
         st = await self._state_for_update()
         async with st.lock:
+            # Same lock-crossing rule as updates: a clear must not run while an
+            # earlier ambiguous mutation may still commit remotely.
+            self._check_failure_fence(st)
             await self._finish_operation(self._clear_all(st))
 
     async def _clear_all(self, st: _InstallationState) -> None:
@@ -434,8 +498,18 @@ class HumanTakeover(BasePlugin):
     # ==================== 会话与消息 ====================
 
     @staticmethod
-    def make_session_key(launcher_type: str, launcher_id: Any) -> str:
-        return f"{launcher_type}_{launcher_id}"
+    def make_session_key(launcher_type: str, launcher_id: Any, bot_uuid: str) -> str:
+        """Return the session identity of one event.
+
+        The installation scope separates tenants, but a single installation can
+        serve several bots/adapters. The trusted bot uuid resolved from the event
+        query is therefore part of the key: without it two bots' same-type,
+        same-id conversations would share one history, takeover flag and reply
+        target. An event without a trusted bot identity must not be keyed at all.
+        """
+        if not bot_uuid:
+            raise ValueError("HumanTakeover session key requires a trusted bot uuid")
+        return f"{bot_uuid}:{launcher_type}_{launcher_id}"
 
     def _ensure_session(
         self,
@@ -469,12 +543,25 @@ class HumanTakeover(BasePlugin):
             }
             sessions[session_key] = sess
         else:
-            # 更新可能变化的元数据
-            if bot_uuid:
+            # 更新可能变化的元数据,但身份与会话键绑定:另一个 Bot 的事件绝不
+            # 能覆盖本会话的回复目标。旧记录没有 Bot 身份时才允许补全。
+            stored_bot = str(sess.get("bot_uuid") or "")
+            if stored_bot and bot_uuid and stored_bot != str(bot_uuid):
+                raise RuntimeError(
+                    "HumanTakeover session identity mismatch: refusing to record "
+                    "another bot's event into an existing session"
+                )
+            if bot_uuid and not stored_bot:
                 sess["bot_uuid"] = bot_uuid
             if name:
                 sess["name"] = name
         if adapter:
+            stored_adapter = str(sess.get("adapter") or "")
+            if stored_adapter and stored_adapter != adapter:
+                raise RuntimeError(
+                    "HumanTakeover session identity mismatch: refusing to record "
+                    "another adapter's event into an existing session"
+                )
             sess["adapter"] = adapter
         return sess
 

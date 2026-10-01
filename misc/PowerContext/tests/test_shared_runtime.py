@@ -10,6 +10,13 @@ Both installations are driven through the *same* plugin object and the *same*
 ``ContextBridge`` component object, under the real SDK ``bind_invocation`` /
 ``InstallationBinding`` task-local scope, with only the per-binding config
 differing.
+
+A second pinned pre-fix failure (F-01): ``resolve_settings()`` fell back to the
+process-global ``POWERCONTEXT_CLIENT_API_TOKEN`` when ``api_token`` was empty,
+so any installation could pair that worker credential with a ``server_url`` it
+chose. ``test_process_environment_token_is_never_sent_to_a_tenant_server`` and
+``test_resolve_settings_takes_the_token_only_from_invocation_config`` fail on
+that code.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from components.event_listener.context_bridge import ContextBridge  # noqa: E402
-from main import PowerContextPlugin  # noqa: E402
+from main import PowerContextPlugin, resolve_settings  # noqa: E402
 
 CONFIG_A = {
     "server_url": "http://127.0.0.1:9101",
@@ -89,9 +96,16 @@ class _RecordingAsyncClient:
         return False
 
     async def request(self, method: str, path: str, json: Any = None):
-        token = str(self._headers.get("Authorization", "")).removeprefix("Bearer ")
+        authorization = self._headers.get("Authorization")
+        token = str(authorization or "").removeprefix("Bearer ")
         RECORD.append(
-            {"base_url": self._base_url, "token": token, "path": path, "json": json}
+            {
+                "base_url": self._base_url,
+                "authorization": authorization,
+                "token": token,
+                "path": path,
+                "json": json,
+            }
         )
         return _FakeResponse(_payload_for(path, token))
 
@@ -177,30 +191,49 @@ async def test_each_installation_uses_its_own_server_and_token(recording_transpo
     assert "9102" not in repr(vars(plugin))
 
 
+def test_resolve_settings_takes_the_token_only_from_invocation_config(
+    monkeypatch,
+) -> None:
+    # F-01: a process-global credential must not become any installation's token.
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_API_TOKEN", "env-token-leak")
+
+    empty = resolve_settings({"server_url": "https://tenant.example", "api_token": ""})
+    assert empty.api_token == ""
+    configured = resolve_settings({"api_token": "configured-token"})
+    assert configured.api_token == "configured-token"
+
+
 @pytest.mark.asyncio
-async def test_env_token_fallback_is_evaluated_per_invocation(
+async def test_process_environment_token_is_never_sent_to_a_tenant_server(
     recording_transport, monkeypatch
 ) -> None:
+    """One installation must not exfiltrate the worker's credential to its host.
+
+    Pre-fix failure this test pins: with ``api_token`` empty, ``resolve_settings``
+    fell back to ``os.environ["POWERCONTEXT_CLIENT_API_TOKEN"]`` and the bearer
+    token was paired with whatever ``server_url`` the installation configured, so
+    the recording transport below saw ``Bearer env-token-leak`` on
+    ``http://127.0.0.1:9101`` — a host that installation chose.
+    """
+
     handler = SimpleNamespace()
     plugin = PowerContextPlugin()
     plugin.plugin_runtime_handler = handler
     bridge = ContextBridge()
     bridge.plugin = plugin
 
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_API_TOKEN", "env-token-leak")
     config = {"server_url": "http://127.0.0.1:9101", "api_token": ""}
 
-    monkeypatch.setenv("POWERCONTEXT_CLIENT_API_TOKEN", "env-token-a")
     with bind_invocation(handler, config=config, binding=_binding("installation-a")):
         await bridge._process_turn(_EventContext("hello"))
 
-    monkeypatch.setenv("POWERCONTEXT_CLIENT_API_TOKEN", "env-token-b")
-    with bind_invocation(handler, config=config, binding=_binding("installation-b")):
-        await bridge._process_turn(_EventContext("hello"))
-
-    tokens = [entry["token"] for entry in RECORD]
-    assert tokens.count("env-token-a") == 3
-    assert tokens.count("env-token-b") == 3
-    assert tokens.index("env-token-b") > tokens.index("env-token-a")
+    # The configured Server is still called; it just receives no process credential.
+    assert RECORD
+    assert {entry["base_url"] for entry in RECORD} == {"http://127.0.0.1:9101"}
+    assert [entry["authorization"] for entry in RECORD] == [None] * len(RECORD)
+    assert all(entry["token"] == "" for entry in RECORD)
+    assert "env-token-leak" not in repr(RECORD)
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,30 @@
+import os
 import re
+import sys
+import asyncio
 import logging
-import aiohttp
+import threading
+import weakref
 from html.parser import HTMLParser
 
 from langbot_plugin.api.definition.plugin import BasePlugin
 from langbot_plugin.api.entities.builtin.provider.message import Message, ContentElement
+
+# Allow importing the plugin-level safe_fetch module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import safe_fetch  # noqa: E402
+
+MAX_CONTENT_CHARS = 100_000
+"""Hard cap on the characters extracted from one page."""
+
+MAX_TITLE_CHARS = 500
+"""Hard cap on the extracted page title."""
+
+MAX_CONCURRENT_FETCHES = 4
+"""Upper bound on page fetches this plugin keeps in flight."""
+
+FETCH_SLOT_WAIT_SECONDS = 10.0
+"""How long a fetch may wait for a free slot before it is rejected."""
 
 
 class _TextExtractor(HTMLParser):
@@ -43,6 +63,80 @@ LANG_MAP = {
 }
 
 
+_slots_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+_slots_guard = threading.Lock()
+
+
+def _slots() -> asyncio.Semaphore:
+    """Return the bounded fetch-slot pool of the running event loop.
+
+    ``asyncio.Semaphore`` binds to the loop that first waits on it, while the
+    shared runtime and the test suite each drive their own loop, so the pool is
+    keyed by loop. It holds no tenant data.
+    """
+    loop = asyncio.get_running_loop()
+    with _slots_guard:
+        slots = _slots_by_loop.get(loop)
+        if slots is None:
+            slots = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+            _slots_by_loop[loop] = slots
+        return slots
+
+
+def _guarded_fetch(
+    url: str,
+    max_len: int,
+    stop_event: threading.Event,
+    slots: asyncio.Semaphore,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[str, str]:
+    """Run the blocking fetch and release the slot when the thread really ends."""
+    try:
+        return _fetch_and_extract(url, max_len, stop_event)
+    finally:
+        try:
+            loop.call_soon_threadsafe(slots.release)
+        except RuntimeError:
+            # The loop is gone (plugin unloaded); nothing left to bound.
+            pass
+
+
+def _fetch_and_extract(url: str, max_len: int, stop_event: threading.Event | None = None) -> tuple[str, str]:
+    """Download one page under the safe_fetch rules and extract its text."""
+    document = safe_fetch.fetch_document(
+        url,
+        stop_event=stop_event,
+        headers={'User-Agent': 'Mozilla/5.0 (compatible; LangBot-URLSummary/1.0)'},
+    )
+
+    if document.status_code != 200:
+        raise Exception(f"HTTP {document.status_code}")
+    content_type = document.content_type
+    if 'text/html' not in content_type and 'application/xhtml' not in content_type:
+        raise Exception(f"Not HTML: {content_type}")
+
+    # Bound the markup handed to the parser, not only the extracted output.
+    html = document.text[: safe_fetch.MAX_PARSE_CHARS]
+
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip()[:MAX_TITLE_CHARS] if title_match else url
+
+    extractor = _TextExtractor()
+    extractor.feed(html)
+    text = extractor.get_text()
+
+    return title, text[:min(max_len, MAX_CONTENT_CHARS)]
+
+
+def redact_url(url: str) -> str:
+    """Drop credentials and the query string before a URL is logged."""
+    parts = re.split(r'([?#])', url, maxsplit=1)[0]
+    parts = re.sub(r'//[^/@]*@', '//', parts)
+    return parts
+
+
 class URLSummary(BasePlugin):
 
     async def initialize(self):
@@ -50,31 +144,30 @@ class URLSummary(BasePlugin):
         self.logger.info("URLSummary plugin initialized")
 
     async def fetch_page(self, url: str, max_len: int) -> tuple[str, str]:
-        """Fetch a web page and return (title, text_content)."""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (compatible; LangBot-URLSummary/1.0)',
-            'Accept': 'text/html,application/xhtml+xml',
-        }
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, allow_redirects=True, ssl=False) as resp:
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-                content_type = resp.headers.get('Content-Type', '')
-                if 'text/html' not in content_type and 'application/xhtml' not in content_type:
-                    raise Exception(f"Not HTML: {content_type}")
-                html = await resp.text(errors='replace')
+        """Fetch a web page and return (title, text_content).
 
-        # Extract title
-        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        title = title_match.group(1).strip() if title_match else url
+        The blocking, target-validated download and the synchronous HTML parse
+        run in a worker thread, so the shared event loop keeps serving other
+        tenants and never parses more than ``safe_fetch.MAX_PARSE_CHARS`` of
+        markup. Fetch concurrency is bounded per process; a call that waits
+        longer than ``FETCH_SLOT_WAIT_SECONDS`` is rejected instead of queueing
+        without limit.
+        """
+        slots = _slots()
+        try:
+            await asyncio.wait_for(slots.acquire(), timeout=FETCH_SLOT_WAIT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise Exception("too many concurrent page fetches, please retry later") from exc
 
-        # Extract text
-        extractor = _TextExtractor()
-        extractor.feed(html)
-        text = extractor.get_text()[:max_len]
-
-        return title, text
+        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
+        try:
+            return await asyncio.to_thread(_guarded_fetch, url, max_len, stop_event, slots, loop)
+        except asyncio.CancelledError:
+            # The worker cannot be interrupted once it is inside the socket
+            # read; the flag makes it stop at the next chunk boundary.
+            stop_event.set()
+            raise
 
     async def summarize(self, url: str, title: str, content: str, model_uuid: str, language: str) -> str:
         """Use LLM to summarize the page content."""
