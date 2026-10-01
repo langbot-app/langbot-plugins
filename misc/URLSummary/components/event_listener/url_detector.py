@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import logging
 import traceback
+from urllib.parse import urlsplit, urlunsplit
 
 from langbot_plugin.api.definition.components.common.event_listener import EventListener
 from langbot_plugin.api.entities import events, context
@@ -26,10 +27,45 @@ def _clamp_max_content_length(value) -> int:
     return max(1, min(length, MAX_CONTENT_LENGTH))
 
 
+def _strip_url_tail(value: str) -> str:
+    """Fallback scrub for a URL that :func:`urlsplit` cannot parse."""
+    head = re.split(r'([?#])', value, maxsplit=1)[0]
+    return re.sub(r'//[^/@]*@', '//', head)
+
+
 def _redact_url(url: str) -> str:
-    """Drop credentials and the query string before a URL is logged."""
-    without_query = re.split(r'([?#])', url, maxsplit=1)[0]
-    return re.sub(r'//[^/@]*@', '//', without_query)
+    """Drop userinfo, the query string and the fragment from a URL."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        try:
+            port = parts.port
+        except ValueError:
+            # A non-numeric port makes ``port`` raise; the host is still known.
+            port = None
+    except (AttributeError, ValueError):
+        return _strip_url_tail(str(url))
+
+    if not host:
+        return _strip_url_tail(str(url))
+
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, '', ''))
+
+
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>()\[\],;]+")
+
+
+def _redact_text(text: str) -> str:
+    """Redact credentials/query/fragment from every URL inside ``text``.
+
+    This is the last boundary before an exception or a traceback goes to the
+    shared logger, so a URL that slipped into a chained cause cannot be logged
+    in its raw form.
+    """
+    if not text:
+        return text
+    return _URL_IN_TEXT.sub(lambda match: _redact_url(match.group(0)), str(text))
 
 
 class URLDetector(EventListener):
@@ -111,7 +147,12 @@ class URLDetector(EventListener):
                     ]))
 
                 except Exception as e:
-                    logger.warning(f"Failed to summarize {_redact_url(url)}: {e}")
+                    logger.warning(
+                        f"Failed to summarize {_redact_url(url)}: {_redact_text(str(e))}"
+                    )
 
         except Exception as e:
-            logger.error(f"Error in _handle_message: {e}\n{traceback.format_exc()}")
+            logger.error(
+                "Error in _handle_message: "
+                f"{_redact_text(str(e))}\n{_redact_text(traceback.format_exc())}"
+            )

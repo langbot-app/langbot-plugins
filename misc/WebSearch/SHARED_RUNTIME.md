@@ -8,10 +8,15 @@ independent review, signer approval, and two-Workspace invocation acceptance.
   configuration is read, cached, or retained on the component object.
 - The whole `mux.process` call runs in a worker thread, so the blocking
   fetch/parse cannot stall the shared event loop. At most
-  `MAX_CONCURRENT_FETCHES` fetches are in flight per process, a call waits at
+  `MAX_CONCURRENT_FETCHES` fetches are in flight per event loop, a call waits at
   most `FETCH_SLOT_WAIT_SECONDS` for a free slot, and cancelling the invocation
-  sets a stop flag that ends the download at the next chunk boundary (the slot
-  is released only when the worker thread really exits).
+  sets a stop flag that ends the I/O. The slot has a single owner: the caller
+  releases it if the executor submission itself fails, and the worker thread
+  releases it in its own `finally` once it has really exited. An
+  await-cancellation cannot cancel the queued executor future (it is awaited
+  under `asyncio.shield`), so a worker that has not started yet still runs and
+  releases the slot exactly once; a worker that is still running is never
+  released early.
 - No binding-keyed caches or detached tasks exist, so
   `on_installation_revoked()` has nothing to release.
 
@@ -49,19 +54,30 @@ certification requirements in the plugin request layer:
   `MAX_RESPONSE_BYTES`, and a body that inflates beyond it, abort the fetch
   without being buffered; the HTML handed to BeautifulSoup is capped at
   `MAX_PARSE_CHARS` and the extracted title/brief lengths are clamped;
-- the whole operation has a deadline plus a cooperative stop flag, and the socket
-  is closed on every exit path;
+- the whole operation has an absolute deadline plus a cooperative stop flag that
+  cover DNS, connect, the TLS handshake, status/header parsing and the body: a
+  watchdog thread shuts the socket down when either fires, because a socket
+  timeout only bounds the idle time between two reads. The socket is closed on
+  every exit path;
 - the socket is opened directly, so no proxy environment variables or netrc
-  credentials are consulted, and TLS keeps the default verification context.
+  credentials are consulted, and TLS keeps the default verification context;
+- userinfo, query string and fragment are stripped from every URL before it
+  reaches an error result, an exception (including chained causes) or a log
+  line.
 
 ## Limits
 
-- A cancelled invocation cannot interrupt a thread that is already inside a
-  socket read; the stop flag plus the total deadline bound how long the
-  abandoned worker can keep its slot and socket (see above).
+- A DNS lookup that the resolver never answers is abandoned on a helper thread:
+  the fetch returns at its deadline and gives the slot back, while the stalled
+  resolver thread dies on its own.
+- A cancelled invocation still cannot un-do I/O that has already been issued,
+  but the stop flag and the absolute deadline shut the socket down, so an
+  abandoned worker ends at the next blocking-socket return (bounded by the
+  watchdog poll interval) instead of waiting for the peer to finish.
 - Fetch concurrency is bounded by the plugin's own slot pool, so a tenant cannot
   occupy the default executor without limit.
 - Tests drive the real fetch path against a local HTTP server (target refusals,
   redirect re-validation, DNS pinning, TLS context, byte/parse caps, deadline,
-  cancellation and the concurrency bound); they do not fetch the public
-  internet.
+  cancellation, a peer that never completes its response headers, the slot
+  ownership cases and the redaction of error results/logs); they do not fetch
+  the public internet.

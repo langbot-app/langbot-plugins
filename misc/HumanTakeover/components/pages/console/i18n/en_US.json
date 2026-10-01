@@ -30,6 +30,7 @@
   "confirmClear": "Clear all sessions and messages? This cannot be undone.",
   "cleared": "Cleared",
   "sendFailed": "Send failed",
+  "sessionNotReady": "This conversation has not finished loading",
   "unhandled": "Unhandled",
   "triggerAlert": "A message needs human handling",
   "confirmTitle": "Confirm",

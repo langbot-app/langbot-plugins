@@ -490,8 +490,11 @@
       sessions: [],
       filter: 'all',
       search: '',
-      current: null,        // 当前 session_key
-      currentData: null,    // 当前会话消息数据
+      current: null,        // 当前选中的 session_key(用户意图)
+      currentData: null,    // 当前会话消息数据(仅当 currentKey === current 时可信)
+      currentKey: null,     // currentData 所属的 session_key(响应归属)
+      loadSeq: 0,           // 会话加载的递增序号,用于丢弃过期响应
+      loading: false,       // 当前会话的消息是否仍在加载
       pendingImage: null,   // base64 data url
       timer: null,          // 倒计时定时器
       remaining: 0,
@@ -601,25 +604,76 @@
 
     // ====== 打开会话 ======
     async function openSession(key) {
+      if (!key) return;
       state.current = key;
+      // 切换会话:立即清空上一个会话的展示状态,并作废所有在途响应,
+      // 否则旧会话迟到的响应会被画到新会话上(显示 A、发送却指向 B)。
+      state.loadSeq++;
+      state.loading = !!key;
+      state.currentData = null;
+      state.currentKey = null;
+      clearPendingImage();
+      clearPendingFile();
+      clearConversationUI();
+      updateComposerEnabled();
       renderSessions();
       document.getElementById('chatEmpty').style.display = 'none';
       document.getElementById('chatHeader').style.display = 'flex';
       document.getElementById('composer').style.display = 'block';
       document.getElementById('messages').style.display = 'flex';
-      await loadMessages();
+      await loadMessages(key);
     }
 
-    async function loadMessages() {
-      if (!state.current) return;
+    // 清空中区/右栏中属于上一个会话的展示状态
+    function clearConversationUI() {
+      document.getElementById('chatTitle').textContent = '';
+      document.getElementById('messages').innerHTML = '';
+      document.getElementById('infoPanel').innerHTML = '';
+      updateTakeoverUI(false, 0);
+    }
+
+    // 当前展示的数据是否确实属于当前选中的会话(发送/接管前必须成立)
+    function currentDataMatches() {
+      return !!(state.current && state.currentData && state.currentKey === state.current);
+    }
+
+    // 消息未加载完成、正在发送,或展示数据与目标会话不一致时禁止发送
+    function updateComposerEnabled() {
+      var btn = document.getElementById('sendBtn');
+      if (!btn) return;
+      btn.disabled = !!(state.loading || state.sending || !currentDataMatches());
+    }
+
+    async function loadMessages(key) {
+      var target = key || state.current;
+      if (!target) return;
+      // 每次加载携带不可变的目标键与递增序号,只有仍属于当前会话
+      // 且未被更新请求取代的响应才允许写入 UI。
+      var seq = ++state.loadSeq;
+      var isCurrent = function () {
+        return seq === state.loadSeq && state.current === target;
+      };
+      if (state.current === target) {
+        state.loading = true;
+        updateComposerEnabled();
+      }
       try {
-        var data = await langbot.api('/messages', { session_key: state.current }, 'GET');
+        var data = await langbot.api('/messages', { session_key: target }, 'GET');
+        if (!isCurrent()) return;  // 过期响应:会话已切换或有更新的加载,直接丢弃
         state.currentData = data;
+        state.currentKey = (data && data.session_key) || target;
         state.timeout = data.takeover_timeout || 600;
         renderMessages(data);
         renderInfoPanel(data);
         updateTakeoverUI(data.takeover_active, data.takeover_remaining);
-      } catch (e) { showToast('加载消息失败: ' + e); }
+      } catch (e) {
+        if (isCurrent()) showToast('加载消息失败: ' + e);
+      } finally {
+        if (isCurrent()) {
+          state.loading = false;
+          updateComposerEnabled();
+        }
+      }
     }
 
     function renderMessages(data) {
@@ -710,9 +764,13 @@
 
     async function toggleTakeover() {
       if (!state.current) return;
+      // 展示数据必须属于当前会话,否则接管操作可能作用在别的会话上
+      if (!currentDataMatches()) return;
+      var target = state.current;
       var active = state.currentData && state.currentData.takeover_active;
       try {
-        var res = await langbot.api('/takeover', { session_key: state.current }, active ? 'DELETE' : 'POST');
+        var res = await langbot.api('/takeover', { session_key: target }, active ? 'DELETE' : 'POST');
+        if (state.current !== target || state.currentKey !== target) return;  // 旧会话的响应,丢弃
         if (state.currentData) {
           state.currentData.takeover_active = res.takeover_active;
           state.currentData.takeover_remaining = res.takeover_remaining;
@@ -720,26 +778,34 @@
         updateTakeoverUI(res.takeover_active, res.takeover_remaining);
         loadSessions();
         showToast(res.takeover_active ? t('takeoverOn','已接管') : t('takeoverOff','已取消接管'));
-      } catch (e) { showToast('操作失败: ' + e); }
+      } catch (e) {
+        if (state.current === target) showToast('操作失败: ' + e);
+      }
     }
 
     // ====== 发送消息 ======
     async function sendMessage() {
       if (!state.current) return;
-      if (state.sending) return;
+      if (state.sending || state.loading) return;
+      // 发送前校验:展示的数据必须属于当前会话,否则人工回复会被投给另一个会话
+      if (!currentDataMatches()) {
+        showToast(t('sessionNotReady', '当前会话尚未加载完成'));
+        return;
+      }
       // 时间戳去抖:500ms 内的重复触发一律忽略(防输入法回车/双重监听)
       var now = Date.now();
       if (state.lastSendAt && now - state.lastSendAt < 500) return;
       var input = document.getElementById('msgInput');
       var text = input.value.trim();
       if (!text && !state.pendingImage && !state.pendingFile) return;
+      var target = state.current;  // 本次发送的不可变目标
       state.lastSendAt = now;
       state.sending = true;
       var btn = document.getElementById('sendBtn');
       btn.disabled = true;
       try {
         var res = await langbot.api('/reply', {
-          session_key: state.current,
+          session_key: target,
           text: text,
           image_base64: state.pendingImage || '',
           file_base64: state.pendingFile ? state.pendingFile.base64 : '',
@@ -749,17 +815,17 @@
         clearPendingImage();
         clearPendingFile();
         autoGrow(input);
-        if (res && res.takeover_active !== undefined && state.currentData) {
+        if (currentDataMatches() && res && res.takeover_active !== undefined) {
           state.currentData.takeover_active = res.takeover_active;
           updateTakeoverUI(res.takeover_active, res.takeover_remaining);
         }
-        await loadMessages();
+        if (state.current === target) await loadMessages(target);
         loadSessions();
       } catch (e) {
         showToast(t('sendFailed','发送失败') + ': ' + e);
       } finally {
-        btn.disabled = false;
         state.sending = false;
+        updateComposerEnabled();
       }
     }
 
@@ -920,6 +986,10 @@
         await langbot.api('/clear', null, 'DELETE');
         state.current = null;
         state.currentData = null;
+        state.currentKey = null;
+        state.loadSeq++;
+        state.loading = false;
+        updateComposerEnabled();
         document.getElementById('chatHeader').style.display = 'none';
         document.getElementById('composer').style.display = 'none';
         document.getElementById('chatEmpty').style.display = 'flex';
@@ -995,21 +1065,22 @@
     function startPolling() {
       state.pollTimer = setInterval(async function() {
         await loadSessions();
-        if (state.current) {
-          try {
-            var st = await langbot.api('/takeover_status', { session_key: state.current }, 'GET');
-            if (state.currentData) {
-              var wasActive = state.currentData.takeover_active;
-              state.currentData.takeover_active = st.takeover_active;
-              state.currentData.takeover_remaining = st.takeover_remaining;
-              // 同步倒计时基准(避免漂移)
-              if (st.takeover_active) state.remaining = st.takeover_remaining;
-              if (wasActive !== st.takeover_active) {
-                updateTakeoverUI(st.takeover_active, st.takeover_remaining);
-              }
-            }
-          } catch (e) { /* ignore */ }
-        }
+        var target = state.current;
+        if (!target) return;
+        try {
+          var st = await langbot.api('/takeover_status', { session_key: target }, 'GET');
+          // 轮询回写必须仍属于当前会话,且当前展示的数据也是该会话,
+          // 否则旧会话的快照会覆盖新会话的状态。
+          if (state.current !== target || !currentDataMatches()) return;
+          var wasActive = state.currentData.takeover_active;
+          state.currentData.takeover_active = st.takeover_active;
+          state.currentData.takeover_remaining = st.takeover_remaining;
+          // 同步倒计时基准(避免漂移)
+          if (st.takeover_active) state.remaining = st.takeover_remaining;
+          if (wasActive !== st.takeover_active) {
+            updateTakeoverUI(st.takeover_active, st.takeover_remaining);
+          }
+        } catch (e) { /* ignore */ }
       }, 5000);
     }
 
@@ -1022,7 +1093,7 @@
     langbot.onLanguageChange(function() {
       langbot.applyI18n();
       renderSessions();
-      if (state.currentData) {
+      if (currentDataMatches()) {
         renderMessages(state.currentData);
         updateTakeoverUI(state.currentData.takeover_active, state.currentData.takeover_remaining);
       }

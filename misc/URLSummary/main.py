@@ -85,22 +85,73 @@ def _slots() -> asyncio.Semaphore:
         return slots
 
 
+class _SlotLease:
+    """One acquired fetch slot, released at most once.
+
+    Ownership of the slot moves from the calling task to the worker thread on a
+    successful executor submission.  Both sides call :meth:`release` on their
+    exit paths - the caller only when the submission itself raised - and the
+    lease makes that release idempotent, so a slot is never given back twice
+    (which would push the pool above its cap) and never leaked.
+    """
+
+    def __init__(self, slots: asyncio.Semaphore, loop: asyncio.AbstractEventLoop) -> None:
+        self._slots = slots
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            # Called from the loop thread (a failed submission): release now.
+            self._slots.release()
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._slots.release)
+        except RuntimeError:
+            # The loop is gone (plugin unloaded); nothing left to bound.
+            pass
+
+
+def _consume_result(future: "asyncio.Future") -> None:
+    """Mark a worker result as retrieved when nobody awaits it.
+
+    A cancelled call stops awaiting the worker, but the worker still finishes;
+    reading the outcome keeps a later failure from being reported as an
+    unretrieved future exception.
+    """
+    if future.cancelled():
+        return
+    try:
+        future.exception()
+    except BaseException:
+        pass
+
+
 def _guarded_fetch(
     url: str,
     max_len: int,
     stop_event: threading.Event,
-    slots: asyncio.Semaphore,
-    loop: asyncio.AbstractEventLoop,
+    lease: _SlotLease,
 ) -> tuple[str, str]:
-    """Run the blocking fetch and release the slot when the thread really ends."""
+    """Run the blocking fetch and release the slot when the thread really ends.
+
+    The worker owns the slot from a successful submit onwards, which is what
+    makes the release happen exactly once - even when the caller was cancelled
+    while the work was still queued.
+    """
     try:
         return _fetch_and_extract(url, max_len, stop_event)
     finally:
-        try:
-            loop.call_soon_threadsafe(slots.release)
-        except RuntimeError:
-            # The loop is gone (plugin unloaded); nothing left to bound.
-            pass
+        lease.release()
 
 
 def _fetch_and_extract(url: str, max_len: int, stop_event: threading.Event | None = None) -> tuple[str, str]:
@@ -115,13 +166,16 @@ def _fetch_and_extract(url: str, max_len: int, stop_event: threading.Event | Non
         raise Exception(f"HTTP {document.status_code}")
     content_type = document.content_type
     if 'text/html' not in content_type and 'application/xhtml' not in content_type:
-        raise Exception(f"Not HTML: {content_type}")
+        # The server controls this header; scrub it before it reaches a log.
+        raise Exception(f"Not HTML: {safe_fetch.redact_text(content_type)}")
 
     # Bound the markup handed to the parser, not only the extracted output.
     html = document.text[: safe_fetch.MAX_PARSE_CHARS]
 
     title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-    title = title_match.group(1).strip()[:MAX_TITLE_CHARS] if title_match else url
+    # The fallback title is the URL, which may carry credentials or a signed
+    # query; never let it travel further in its raw form.
+    title = title_match.group(1).strip()[:MAX_TITLE_CHARS] if title_match else redact_url(url)
 
     extractor = _TextExtractor()
     extractor.feed(html)
@@ -131,10 +185,8 @@ def _fetch_and_extract(url: str, max_len: int, stop_event: threading.Event | Non
 
 
 def redact_url(url: str) -> str:
-    """Drop credentials and the query string before a URL is logged."""
-    parts = re.split(r'([?#])', url, maxsplit=1)[0]
-    parts = re.sub(r'//[^/@]*@', '//', parts)
-    return parts
+    """Drop credentials, the query string and the fragment before a URL is logged."""
+    return safe_fetch.redact_url(url)
 
 
 class URLSummary(BasePlugin):
@@ -161,11 +213,33 @@ class URLSummary(BasePlugin):
 
         loop = asyncio.get_running_loop()
         stop_event = threading.Event()
+        lease = _SlotLease(slots, loop)
+        # Slot ownership, exactly once:
+        #  * before a successful submit the calling task owns the slot;
+        #  * if the submit itself raises, the caller is still the owner and
+        #    releases through the lease (no worker ever existed);
+        #  * after a successful submit the worker thread owns it and releases
+        #    through the same lease in its own ``finally``, once it has ended.
+        # ``release()`` is idempotent, so the two owners can never give the
+        # same slot back twice.
         try:
-            return await asyncio.to_thread(_guarded_fetch, url, max_len, stop_event, slots, loop)
+            worker = loop.run_in_executor(
+                None, _guarded_fetch, url, max_len, stop_event, lease
+            )
+        except BaseException:
+            lease.release()
+            raise
+        worker.add_done_callback(_consume_result)
+        try:
+            # ``shield`` stops an await-cancellation from cancelling the queued
+            # executor future.  Without it a worker that has not started yet is
+            # dropped from the queue, never runs its cleanup and leaks the slot
+            # for every later tenant; with it the worker always reaches its
+            # ``finally`` and the slot is not released while its thread runs.
+            return await asyncio.shield(worker)
         except asyncio.CancelledError:
             # The worker cannot be interrupted once it is inside the socket
-            # read; the flag makes it stop at the next chunk boundary.
+            # read; the flag makes it stop and release the slot when it ends.
             stop_event.set()
             raise
 
@@ -178,7 +252,7 @@ class URLSummary(BasePlugin):
 请总结以下网页内容，生成简洁的摘要。包含关键信息和要点。
 
 网页标题: {title}
-网页链接: {url}
+网页链接: {redact_url(url)}
 
 网页内容:
 {content}"""

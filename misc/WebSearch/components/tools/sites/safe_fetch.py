@@ -24,10 +24,17 @@ This module therefore:
 * reads the body in bounded chunks with a hard cap on the decoded bytes, a
   total deadline and a cooperative stop flag, and closes the socket on every
   exit path;
+* enforces that deadline and stop flag on *every* blocking step - DNS, connect,
+  TLS handshake, status/header parsing and body reads - by shutting the socket
+  down from a watchdog thread, because a socket timeout only bounds the idle
+  time between two reads and a peer that drips bytes can outlive it forever;
 * opens the socket directly, so no proxy environment variables, netrc or
   ``requests``-level authentication defaults are consulted;
 * verifies TLS with the default CA store and the original hostname (the
-  pinned IP is only the transport target).
+  pinned IP is only the transport target);
+* never puts a raw URL back into an error message: :func:`redact_url` drops the
+  userinfo, query string and fragment, and the same scrub is applied to
+  chained exception text so a traceback cannot leak credentials either.
 """
 
 from __future__ import annotations
@@ -36,12 +43,14 @@ import base64
 import dataclasses
 import http.client
 import ipaddress
+import re
 import socket
 import ssl
+import threading
 import time
 import zlib
 from typing import Any, Iterable, Iterator, Mapping
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 """Hard cap on the decoded response body kept for one fetch."""
@@ -84,6 +93,137 @@ class TooManyRedirectsError(FetchError):
     """The redirect chain is longer than :data:`MAX_REDIRECTS`."""
 
 
+def _strip_url_tail(value: str) -> str:
+    """Fallback scrub for a URL that :func:`urlsplit` cannot parse."""
+    head = re.split(r"[?#]", value, maxsplit=1)[0]
+    return re.sub(r"//[^/@]*@", "//", head)
+
+
+def redact_url(url: str) -> str:
+    """Return ``url`` without userinfo, query string or fragment.
+
+    This is the single redaction used by every message and log line of this
+    plugin, so a password embedded in the URL or a signed query token can never
+    be written back out.
+    """
+    try:
+        parts = urlsplit(str(url))
+        host = parts.hostname
+        try:
+            port = parts.port
+        except ValueError:
+            # A non-numeric port makes ``port`` raise; the host is still known.
+            port = None
+    except (AttributeError, ValueError):
+        return _strip_url_tail(str(url))
+
+    if not host:
+        return _strip_url_tail(str(url))
+
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>()\[\],;]+")
+
+
+def redact_text(text: str) -> str:
+    """Redact credentials/query/fragment from every URL inside ``text``.
+
+    Used as the last boundary before exception text (or a traceback built from
+    it) is handed to a logger, so a URL that reached a chained cause or a
+    server-controlled header is still scrubbed.
+    """
+    if not text:
+        return text
+    return _URL_IN_TEXT.sub(lambda match: redact_url(match.group(0)), str(text))
+
+
+def _scrub_exception(exc: BaseException | None) -> BaseException | None:
+    """Strip credentials/query/fragment from an exception's own text.
+
+    ``raise ... from exc`` keeps ``exc`` in the traceback, so the chained
+    exception has to be scrubbed before it is re-raised.
+    """
+    if exc is None:
+        return None
+    try:
+        if exc.args:
+            exc.args = tuple(
+                redact_text(arg) if isinstance(arg, str) else arg for arg in exc.args
+            )
+    except Exception:  # pragma: no cover - exotic exception objects
+        pass
+    return exc
+
+
+class _AbortWatch:
+    """End a blocking socket operation at the deadline or on cancellation.
+
+    ``socket.settimeout`` only bounds the idle time *between* two reads, so a
+    peer that drips one byte before every timeout can keep ``getresponse()``
+    (status and header parsing) or the TLS handshake blocked indefinitely.
+    Shutting the socket down from a helper thread makes every blocked socket
+    call return, which is what lets the worker thread end and give its fetch
+    slot back.
+    """
+
+    _POLL_SECONDS = 0.05
+
+    def __init__(self, deadline: float, stop_event: Any) -> None:
+        self._deadline = deadline
+        self._stop_event = stop_event
+        self._sock: socket.socket | None = None
+        self._lock = threading.Lock()
+        self._finished = threading.Event()
+        self._triggered = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name="safe-fetch-abort", daemon=True
+        )
+
+    @property
+    def triggered(self) -> bool:
+        """``True`` when this watch (not the peer) ended the socket."""
+        return self._triggered.is_set()
+
+    def attach(self, sock: socket.socket) -> None:
+        """Start watching ``sock``; call once, before its first blocking use."""
+        with self._lock:
+            self._sock = sock
+        self._thread.start()
+
+    def _watch(self) -> None:
+        while not self._finished.wait(self._POLL_SECONDS):
+            if self._stop_event is not None and self._stop_event.is_set():
+                self._triggered.set()
+                self._abort()
+                return
+            if time.monotonic() >= self._deadline:
+                self._triggered.set()
+                self._abort()
+                return
+
+    def _abort(self) -> None:
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        """Stop watching; safe to call on every exit path."""
+        self._finished.set()
+        if self._thread.is_alive():
+            self._thread.join(1.0)
+
+
 @dataclasses.dataclass(frozen=True)
 class Document:
     """A bounded, decoded HTTP response."""
@@ -123,12 +263,16 @@ def is_public_address(value: str) -> bool:
     return address.is_global
 
 
-def resolve_public_addresses(host: str, port: int) -> list[str]:
-    """Resolve ``host`` and return its addresses, refusing non-public ones."""
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise BlockedTargetError(f"cannot resolve host {host!r}: {exc}") from exc
+def resolve_public_addresses(
+    host: str, port: int, deadline: float | None = None, stop_event: Any = None
+) -> list[str]:
+    """Resolve ``host`` and return its addresses, refusing non-public ones.
+
+    With a ``deadline`` the lookup runs on a helper thread and this call gives
+    up as soon as the deadline expires or ``stop_event`` is set: a resolver
+    that never answers is another way to pin a fetch slot forever.
+    """
+    infos = _getaddrinfo(host, port, deadline, stop_event)
 
     addresses: list[str] = []
     for info in infos:
@@ -144,22 +288,60 @@ def resolve_public_addresses(host: str, port: int) -> list[str]:
     return addresses
 
 
+def _getaddrinfo(host: str, port: int, deadline: float | None, stop_event: Any) -> list:
+    """Run ``getaddrinfo``, optionally bounded by a deadline/stop flag."""
+    if deadline is None:
+        try:
+            return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise BlockedTargetError(f"cannot resolve host {host!r}: {exc}") from exc
+
+    result: dict[str, Any] = {}
+
+    def lookup() -> None:
+        try:
+            result["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            result["error"] = exc
+
+    thread = threading.Thread(target=lookup, name="safe-fetch-dns", daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if stop_event is not None and stop_event.is_set():
+            raise FetchAbortedError("fetch cancelled while resolving host")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FetchAbortedError("fetch deadline exceeded while resolving host")
+        thread.join(min(0.05, remaining))
+
+    error = result.get("error")
+    if error is not None:
+        raise BlockedTargetError(
+            f"cannot resolve host {host!r}: {redact_text(str(error))}"
+        ) from _scrub_exception(error)
+    return result["infos"]
+
+
 def validate_url(url: str) -> tuple[str, str, int, str]:
     """Validate scheme/host/port and return ``(scheme, host, port, path)``."""
     try:
         parts = urlsplit(url)
     except ValueError as exc:
-        raise BlockedTargetError(f"invalid URL: {url!r}") from exc
+        raise BlockedTargetError(
+            f"invalid URL: {redact_url(url)!r}"
+        ) from _scrub_exception(exc)
     scheme = (parts.scheme or "").lower()
     if scheme not in _DEFAULT_PORTS:
-        raise BlockedTargetError(f"refusing non-HTTP(S) URL: {url!r}")
+        raise BlockedTargetError(f"refusing non-HTTP(S) URL: {redact_url(url)!r}")
     host = parts.hostname
     if not host:
-        raise BlockedTargetError(f"URL has no host: {url!r}")
+        raise BlockedTargetError(f"URL has no host: {redact_url(url)!r}")
     try:
         port = parts.port or _DEFAULT_PORTS[scheme]
     except ValueError as exc:
-        raise BlockedTargetError(f"invalid port in URL: {url!r}") from exc
+        raise BlockedTargetError(
+            f"invalid port in URL: {redact_url(url)!r}"
+        ) from _scrub_exception(exc)
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"
@@ -177,8 +359,9 @@ def fetch_document(
     """Fetch ``url`` under the validation and size rules of this module.
 
     ``stop_event`` is an optional :class:`threading.Event`; when set, the fetch
-    aborts at the next chunk boundary. ``timeout`` is the deadline for the whole
-    operation, redirects included.
+    aborts at the next blocking step. ``timeout`` is the deadline for the whole
+    operation, redirects included, and it is enforced on DNS, connect, the TLS
+    handshake, status/header parsing and the body.
     """
     deadline = time.monotonic() + timeout
     current = url
@@ -186,7 +369,7 @@ def fetch_document(
     for _hop in range(MAX_REDIRECTS + 1):
         scheme, host, port, path = validate_url(current)
         _check_abort(stop_event, deadline)
-        addresses = resolve_public_addresses(host, port)
+        addresses = resolve_public_addresses(host, port, deadline, stop_event)
         _check_abort(stop_event, deadline)
 
         raw = _request_once(
@@ -206,7 +389,9 @@ def fetch_document(
             text=_decode_text(raw.body, raw.charset),
         )
 
-    raise TooManyRedirectsError(f"more than {MAX_REDIRECTS} redirects from {url!r}")
+    raise TooManyRedirectsError(
+        f"more than {MAX_REDIRECTS} redirects from {redact_url(url)!r}"
+    )
 
 
 def _check_abort(stop_event: Any, deadline: float) -> None:
@@ -235,6 +420,8 @@ def _request_once(
     sock = None
     last_error: OSError | None = None
     for address in addresses:
+        # A stalled connect must not outlive the deadline or the cancellation.
+        _check_abort(stop_event, deadline)
         try:
             sock = socket.create_connection(
                 (address, port), timeout=min(CONNECT_TIMEOUT, _remaining(deadline))
@@ -243,16 +430,26 @@ def _request_once(
         except OSError as exc:
             last_error = exc
     if sock is None:
-        raise FetchError(f"cannot connect to {url!r}: {last_error}")
+        _check_abort(stop_event, deadline)
+        raise FetchError(
+            f"cannot connect to {redact_url(url)!r}: {redact_text(str(last_error))}"
+        )
 
     connection = None
+    watch = _AbortWatch(deadline, stop_event)
     try:
+        sock.settimeout(min(READ_TIMEOUT, _remaining(deadline)))
         if scheme == "https":
             context = ssl.create_default_context()
             # The socket goes to the validated IP, the certificate and SNI stay
-            # bound to the requested host name.
-            sock = context.wrap_socket(sock, server_hostname=host)
-        sock.settimeout(min(READ_TIMEOUT, _remaining(deadline)))
+            # bound to the requested host name.  The handshake is deferred so
+            # the abort watch can cover it as well.
+            sock = context.wrap_socket(
+                sock, server_hostname=host, do_handshake_on_connect=False
+            )
+        watch.attach(sock)
+        if scheme == "https":
+            sock.do_handshake()
 
         connection = http.client.HTTPConnection(host, port)
         connection.sock = sock
@@ -269,7 +466,8 @@ def _request_once(
         declared = response.length
         if declared is not None and declared > max_bytes:
             raise ResponseTooLargeError(
-                f"Content-Length {declared} exceeds the {max_bytes}-byte limit for {url!r}"
+                f"Content-Length {declared} exceeds the {max_bytes}-byte limit for "
+                f"{redact_url(url)!r}"
             )
 
         decoder = _BodyDecoder(response_headers.get("Content-Encoding"), max_bytes)
@@ -280,8 +478,17 @@ def _request_once(
     except FetchError:
         raise
     except (http.client.HTTPException, OSError, zlib.error) as exc:
-        raise FetchError(f"request to {url!r} failed: {exc}") from exc
+        if watch.triggered:
+            # The watch shut the socket down: the fetch was cancelled or ran
+            # past its deadline, not a peer failure.
+            raise FetchAbortedError(
+                "fetch cancelled or deadline exceeded"
+            ) from _scrub_exception(exc)
+        raise FetchError(
+            f"request to {redact_url(url)!r} failed: {redact_text(str(exc))}"
+        ) from _scrub_exception(exc)
     finally:
+        watch.stop()
         if connection is not None:
             connection.close()
         else:

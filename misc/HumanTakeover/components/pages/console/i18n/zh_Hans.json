@@ -30,6 +30,7 @@
   "confirmClear": "确定清理所有会话与消息数据吗?此操作不可恢复。",
   "cleared": "已清理",
   "sendFailed": "发送失败",
+  "sessionNotReady": "当前会话尚未加载完成",
   "unhandled": "未处理",
   "triggerAlert": "收到需人工处理的消息",
   "confirmTitle": "确认操作",

@@ -17,11 +17,15 @@ claim of live tenant acceptance.
   model for the event it is handling; when no model is configured it falls back to the
   first model returned by `plugin.get_llm_models()` for that invocation.
 - `URLSummary.fetch_page` runs the blocking download and the HTML parse in a worker thread
-  (`asyncio.to_thread`) so the shared event loop is never blocked; each fetch opens its own
-  connection and closes it on every exit path. At most `MAX_CONCURRENT_FETCHES` fetches are
-  in flight per process, and a call that waits longer than `FETCH_SLOT_WAIT_SECONDS` for a
-  slot is rejected instead of queueing without limit. Cancelling the invocation sets a stop
-  flag that ends the download at the next chunk boundary.
+  (`loop.run_in_executor`) so the shared event loop is never blocked; each fetch opens its
+  own connection and closes it on every exit path. At most `MAX_CONCURRENT_FETCHES` fetches
+  are in flight per event loop, and a call that waits longer than `FETCH_SLOT_WAIT_SECONDS`
+  for a slot is rejected instead of queueing without limit. The slot has a single owner:
+  the caller releases it if the executor submission itself fails, and the worker thread
+  releases it in its own `finally` once it has really ended. An await-cancellation cannot
+  cancel the queued executor future (it is awaited under `asyncio.shield`), so a worker
+  that has not started yet still runs and releases the slot exactly once; a worker that is
+  still running is never released early.
 - `URLSummary.summarize` uses `invoke_llm` under the task-local invocation, so model
   authority comes from the active installation. Replies go through the per-event
   `EventContext`.
@@ -40,11 +44,15 @@ requirements in the plugin request layer:
 - the body is read in bounded chunks: a declared or streamed body above
   `MAX_RESPONSE_BYTES`, and a body that inflates beyond it, abort the fetch without being
   buffered; the markup handed to the parser is capped at `MAX_PARSE_CHARS`;
-- the whole operation has a deadline plus a cooperative stop flag, and the socket is
-  closed on every exit path;
+- the whole operation has an absolute deadline plus a cooperative stop flag that cover DNS,
+  connect, the TLS handshake, status/header parsing and the body: a watchdog thread shuts
+  the socket down when either fires, because a socket timeout only bounds the idle time
+  between two reads. The socket is closed on every exit path;
 - the socket is opened directly, so no proxy environment variables or netrc credentials
   are consulted, and TLS keeps the default verification context (hostname + CA store)
-  rather than being disabled.
+  rather than being disabled;
+- userinfo, query string and fragment are stripped from every URL before it reaches an
+  error message, an exception (including chained causes) or a log line.
 
 ## Identity
 
@@ -63,13 +71,18 @@ covers the blocking findings: non-public targets and non-HTTP(S) schemes are ref
 a connection is made, redirects are re-validated, the connection uses the validated IP,
 TLS keeps the default verification context, oversized/compressed bodies are cut off at the
 cap, the parse input is capped, the fetch runs off the event loop with a bounded number of
-in-flight fetches and the stop flag interrupts an in-flight download. Page content is
-served locally; no vendor account is used.
+in-flight fetches, the stop flag and the absolute deadline end a download that never sends
+a complete status line, a fetch cancelled while queued and a failed executor submission
+still release their slot exactly once, a worker that is still running is never released
+early, and no error message, log record or traceback repeats the URL's userinfo, query or
+fragment. Page content is served locally; no vendor account is used.
 
 ## Known limits
 
 - Fetching and summarization are Host-model and network dependent.
-- The plugin enforces its own target and size policy, but a deployment SHOULD still apply
-  egress policy as defence in depth.
+- A DNS lookup that the resolver never answers is abandoned on a helper thread:
+  the fetch returns at its deadline and gives the slot back, while the stalled
+  resolver thread dies on its own. The plugin enforces its own target and size
+  policy, but a deployment SHOULD still apply egress policy as defence in depth.
 - No claim of certification; independent review and two-Workspace invocation acceptance
   are still required.

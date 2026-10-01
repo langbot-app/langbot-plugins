@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import weakref
 from typing import Any
@@ -42,40 +43,109 @@ def _slots() -> asyncio.Semaphore:
         return slots
 
 
+class _SlotLease:
+    """One acquired fetch slot, released at most once.
+
+    Ownership of the slot moves from the calling task to the worker thread on a
+    successful executor submission.  Both sides call :meth:`release` on their
+    exit paths - the caller only when the submission itself raised - and the
+    lease makes that release idempotent, so a slot is never given back twice
+    (which would push the pool above its cap) and never leaked.
+    """
+
+    def __init__(self, slots: asyncio.Semaphore, loop: asyncio.AbstractEventLoop) -> None:
+        self._slots = slots
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            # Called from the loop thread (a failed submission): release now.
+            self._slots.release()
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._slots.release)
+        except RuntimeError:
+            # The loop is gone (plugin unloaded); nothing left to bound.
+            pass
+
+
+def _consume_result(future: "asyncio.Future") -> None:
+    """Mark a worker result as retrieved when nobody awaits it.
+
+    A cancelled call stops awaiting the worker, but the worker still finishes;
+    reading the outcome keeps a later failure from being reported as an
+    unretrieved future exception.
+    """
+    if future.cancelled():
+        return
+    try:
+        future.exception()
+    except BaseException:
+        pass
+
+
 def _worker(
     url: str,
     brief_len: int,
     stop_event: threading.Event,
-    slots: asyncio.Semaphore,
-    loop: asyncio.AbstractEventLoop,
+    lease: _SlotLease,
 ) -> str:
     """Run the blocking adapter dispatch inside a worker thread.
 
     The slot is released here, not in the async caller: cancelling the
     invocation cannot interrupt a thread that is already downloading, so
     releasing earlier would let abandoned downloads pile up past the bound.
+    The worker owns the slot from a successful submit onwards, which is what
+    makes the release happen exactly once - even when the caller was cancelled
+    while the work was still queued.
     """
     try:
         return process(url, brief_len, stop_event=stop_event)
     finally:
-        try:
-            loop.call_soon_threadsafe(slots.release)
-        except RuntimeError:
-            # The loop is gone (plugin unloaded); nothing left to bound.
-            pass
+        lease.release()
 
 
 def _redact(url: str) -> str:
-    """Drop credentials and the query string before a URL is logged."""
+    """Drop userinfo, the query string and the fragment from a URL."""
     try:
         parts = urlsplit(url)
+        host = parts.hostname
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
     except (TypeError, ValueError, AttributeError):
-        return '<unparsable url>'
-    netloc = parts.hostname or ''
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
-    query = '?…' if parts.query else ''
-    return urlunsplit((parts.scheme, netloc, parts.path, query, ''))
+        return _strip_url_tail(str(url))
+    if not host:
+        return _strip_url_tail(str(url))
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, '', ''))
+
+
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>()\[\],;]+")
+
+
+def _strip_url_tail(value: str) -> str:
+    """Fallback scrub for a URL that :func:`urlsplit` cannot parse."""
+    head = re.split(r'([?#])', value, maxsplit=1)[0]
+    return re.sub(r'//[^/@]*@', '//', head)
+
+
+def _redact_text(text: str) -> str:
+    """Redact credentials/query/fragment from every URL inside ``text``."""
+    if not text:
+        return text
+    return _URL_IN_TEXT.sub(lambda match: _redact(match.group(0)), str(text))
 
 
 class VisitWeb(Tool):
@@ -101,17 +171,34 @@ class VisitWeb(Tool):
                 return "error visit web: too many concurrent page fetches, please retry later"
 
             stop_event = threading.Event()
-            future = loop.run_in_executor(
-                None, _worker, url, params['brief_len'], stop_event, slots, loop
-            )
+            lease = _SlotLease(slots, loop)
+            # Slot ownership, exactly once:
+            #  * before a successful submit the calling task owns the slot;
+            #  * if the submit itself raises, the caller is still the owner and
+            #    releases through the lease (no worker ever existed);
+            #  * after a successful submit the worker thread owns it and
+            #    releases through the same lease in its own ``finally``, once it
+            #    has ended.  ``release()`` is idempotent, so the two owners can
+            #    never give the same slot back twice.
             try:
-                return await future
+                future = loop.run_in_executor(
+                    None, _worker, url, params['brief_len'], stop_event, lease
+                )
+            except BaseException:
+                lease.release()
+                raise
+            future.add_done_callback(_consume_result)
+            try:
+                # ``shield`` stops an await-cancellation from cancelling the
+                # queued executor future: a worker that has not started yet must
+                # still run its cleanup, otherwise its slot would leak forever.
+                return await asyncio.shield(future)
             except asyncio.CancelledError:
                 # Cancelling the future does not stop the already-running
-                # thread; the flag makes the fetch close its socket and return
-                # at the next chunk boundary.
+                # thread; the flag makes the fetch end its I/O and release the
+                # slot when the thread really returns.
                 stop_event.set()
                 raise
         except Exception as e:
-            logging.error("[Webwlkr] error visit web: {}".format(e))
-            return "error visit web:{}".format(e)
+            logging.error("[Webwlkr] error visit web: %s", _redact_text(str(e)))
+            return "error visit web:{}".format(_redact_text(str(e)))

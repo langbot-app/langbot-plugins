@@ -20,7 +20,9 @@ Every assertion here fails against the pre-fix ``requests.get`` implementation.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gzip
+import logging
 import socket
 import ssl
 import sys
@@ -261,15 +263,46 @@ def test_connection_uses_the_validated_ip_so_dns_cannot_rebind(monkeypatch):
 def test_tls_uses_the_default_verification_context(monkeypatch):
     created: list = []
     hostnames: list = []
+    handshakes: list = []
+    deferred: list = []
     real_context = safe_fetch.ssl.create_default_context
+
+    class _PlainTLS:
+        """Minimal SSLSocket double: a plain transport plus a no-op handshake."""
+
+        def __init__(self, sock):
+            self._sock = sock
+
+        def do_handshake(self):
+            handshakes.append("handshake")
+
+        def settimeout(self, value):
+            self._sock.settimeout(value)
+
+        def sendall(self, data):
+            self._sock.sendall(data)
+
+        def makefile(self, *args, **kwargs):
+            return self._sock.makefile(*args, **kwargs)
+
+        def shutdown(self, *args):
+            self._sock.shutdown(*args)
+
+        def close(self):
+            self._sock.close()
+
+        def fileno(self):
+            return self._sock.fileno()
 
     class _RecordingContext:
         def __init__(self, context):
             self.context = context
 
-        def wrap_socket(self, sock, server_hostname=None, **kwargs):
+        def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True, **kwargs):
             hostnames.append(server_hostname)
-            return sock
+            # The handshake is deferred so the abort watch covers it too.
+            deferred.append(do_handshake_on_connect is False)
+            return _PlainTLS(sock)
 
     def fake_create_default_context(*args, **kwargs):
         context = real_context(*args, **kwargs)
@@ -288,6 +321,8 @@ def test_tls_uses_the_default_verification_context(monkeypatch):
     assert created and created[0].verify_mode == ssl.CERT_REQUIRED
     assert created[0].check_hostname is True
     assert hostnames == [PUBLIC_IP]
+    assert deferred == [True]
+    assert handshakes == ["handshake"]
 
 
 def test_public_addresses_are_recognised():
@@ -567,3 +602,265 @@ def test_concurrent_fetches_are_bounded(monkeypatch):
 
     assert busy == "error visit web: too many concurrent page fetches, please retry later"
     assert finished == [f"done:https://example.com/{index}" for index in range(slots)]
+
+
+# --------------------------------------------------------------------------- #
+# F2 (third round) - the shared fetch slot has exactly one owner
+# --------------------------------------------------------------------------- #
+def test_tool_cancelled_while_queued_releases_its_slot_exactly_once(monkeypatch):
+    """A call cancelled before its worker starts must not leak the slot."""
+    gate = threading.Event()
+    worker_ran = threading.Event()
+
+    def fake_worker(url, brief_len, stop_event, lease, *_rest):
+        worker_ran.set()
+        try:
+            return f"done:{url}"
+        finally:
+            lease.release()
+
+    def occupy(*_args):
+        gate.wait(10)
+        return "blocker"
+
+    async def scenario():
+        with mock.patch.object(visit_web_module, "_worker", fake_worker):
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+            slots = visit_web_module._slots()
+            free = slots._value
+            tool = _tool()
+
+            # Occupy the single worker thread so the call below stays queued.
+            blocker = loop.run_in_executor(None, occupy, "u", 1, None, slots, loop)
+            await asyncio.sleep(0.1)
+
+            task = asyncio.create_task(tool.call({"url": "https://example.com/queued"}))
+            await asyncio.sleep(0.3)
+            assert not worker_ran.is_set(), "the worker must still be queued"
+            assert slots._value == free - 1, "the queued call holds its slot"
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert slots._value == free - 1, "the slot was released while still queued/running"
+
+            gate.set()
+            assert await blocker == "blocker"
+            for _ in range(250):
+                if worker_ran.is_set() and slots._value == free:
+                    break
+                await asyncio.sleep(0.02)
+            assert worker_ran.is_set(), "the queued worker never ran"
+            # Exactly one release: a second one would push the pool above its cap.
+            assert slots._value == free
+
+            assert (
+                await tool.call({"url": "https://example.com/next"})
+                == "done:https://example.com/next"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_running_tool_keeps_its_slot_until_the_worker_ends(monkeypatch):
+    """A worker that is still running must never lose its slot early."""
+    started = threading.Event()
+    still_running = threading.Event()
+
+    def fake_worker(url, brief_len, stop_event, lease, *_rest):
+        started.set()
+        stop_event.wait(10)  # the caller's cancellation sets this
+        still_running.set()
+        time.sleep(0.3)  # the thread is undeniably still alive here
+        try:
+            return f"done:{url}"
+        finally:
+            lease.release()
+
+    async def scenario():
+        with mock.patch.object(visit_web_module, "_worker", fake_worker):
+            slots = visit_web_module._slots()
+            free = slots._value
+            tool = _tool()
+
+            task = asyncio.create_task(tool.call({"url": "https://slow.example/"}))
+            await asyncio.sleep(0.3)
+            assert started.is_set()
+            assert slots._value == free - 1
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.1)
+            assert still_running.is_set()
+            assert slots._value == free - 1, "the slot was released while the worker was running"
+
+            for _ in range(250):
+                if slots._value == free:
+                    break
+                await asyncio.sleep(0.02)
+            assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+def test_slot_lease_releases_at_most_once():
+    """The two owners of a slot can never give it back twice."""
+
+    async def scenario():
+        slots = visit_web_module._slots()
+        free = slots._value
+        await slots.acquire()
+        assert slots._value == free - 1
+
+        lease = visit_web_module._SlotLease(slots, asyncio.get_running_loop())
+        lease.release()
+        lease.release()  # a second owner must be a no-op
+        assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+def test_tool_submit_failure_leaks_no_slot(monkeypatch):
+    """A failed executor submission must give the already-acquired slot back."""
+
+    async def scenario():
+        slots = visit_web_module._slots()
+        free = slots._value
+        loop = asyncio.get_running_loop()
+
+        def refuse_submit(*args, **kwargs):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+        monkeypatch.setattr(loop, "run_in_executor", refuse_submit)
+        result = await _tool().call({"url": "https://example.com/"})
+        assert isinstance(result, str) and result.startswith("error visit web:")
+        assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# F1 (third round) - deadline/cancellation cover the status and header phase
+# --------------------------------------------------------------------------- #
+def test_deadline_ends_a_response_whose_headers_never_arrive():
+    """A peer that drips bytes must not outlive the absolute deadline."""
+    finished = threading.Event()
+    errors: list[Exception] = []
+
+    def drip_headers(handler):
+        # One byte at a time, always inside the socket idle timeout, never a
+        # complete status line: ``getresponse()`` would block here forever.
+        try:
+            for _ in range(120):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/drip"] = drip_headers
+        with mock.patch.object(safe_fetch.socket, "create_connection", _connect_to(server.port)):
+
+            def run():
+                try:
+                    safe_fetch.fetch_document(
+                        f"http://{PUBLIC_IP}:{server.port}/drip", timeout=1.0
+                    )
+                except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=run, daemon=True)
+            start = time.monotonic()
+            thread.start()
+            assert finished.wait(8), "the header read outlived the absolute deadline"
+            elapsed = time.monotonic() - start
+
+    assert isinstance(errors[0], FetchAbortedError)
+    assert elapsed < 5
+
+
+def test_stop_event_ends_a_response_whose_headers_never_arrive():
+    """Cancellation must end the status/header phase too, not only the body."""
+    started = threading.Event()
+    finished = threading.Event()
+    errors: list[Exception] = []
+    stop_event = threading.Event()
+
+    def drip_headers(handler):
+        try:
+            for _ in range(120):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/drip"] = drip_headers
+        with mock.patch.object(safe_fetch.socket, "create_connection", _connect_to(server.port)):
+
+            def run():
+                started.set()
+                try:
+                    safe_fetch.fetch_document(
+                        f"http://{PUBLIC_IP}:{server.port}/drip",
+                        timeout=30,
+                        stop_event=stop_event,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            assert started.wait(5)
+            time.sleep(0.4)
+            stop_event.set()
+
+    assert finished.wait(8), "the stop flag did not end the header read"
+    assert isinstance(errors[0], FetchAbortedError)
+
+
+def test_deadline_abandons_a_resolver_that_never_answers(monkeypatch):
+    """A stalled DNS lookup must not hold the fetch past the deadline."""
+    unblock = threading.Event()
+
+    def stalled_getaddrinfo(*args, **kwargs):
+        unblock.wait(8)
+        return []
+
+    monkeypatch.setattr(safe_fetch.socket, "getaddrinfo", stalled_getaddrinfo)
+    start = time.monotonic()
+    try:
+        with pytest.raises(FetchAbortedError):
+            safe_fetch.fetch_document("http://stalled.example/", timeout=1.0)
+        elapsed = time.monotonic() - start
+    finally:
+        unblock.set()
+    assert elapsed < 5
+
+
+def test_tool_error_and_log_never_repeat_url_credentials_or_query(monkeypatch, caplog):
+    raw = f"http://alice:s3cret-pw@{PUBLIC_IP}:1/page?token=s3cret-token#frag"
+
+    def fail_connect(*args, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(safe_fetch.socket, "create_connection", fail_connect)
+
+    with caplog.at_level(logging.ERROR):
+        result = asyncio.run(_tool().call({"url": raw}))
+
+    assert result.startswith("error visit web:")
+    for text in (result, caplog.text):
+        assert "s3cret-pw" not in text, text
+        assert "s3cret-token" not in text, text
+        assert "alice" not in text, text
+    assert PUBLIC_IP in result  # the useful, non-secret part survives
+

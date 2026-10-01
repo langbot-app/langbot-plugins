@@ -23,12 +23,16 @@ Every assertion here fails against the pre-fix ``aiohttp`` implementation.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gzip
+import http.client
+import logging
 import socket
 import ssl
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -281,15 +285,46 @@ def test_tls_uses_the_default_verification_context(monkeypatch):
     plugin = URLSummary()
     created: list = []
     hostnames: list = []
+    handshakes: list = []
+    deferred: list = []
     real_context = safe_fetch.ssl.create_default_context
+
+    class _PlainTLS:
+        """Minimal SSLSocket double: a plain transport plus a no-op handshake."""
+
+        def __init__(self, sock):
+            self._sock = sock
+
+        def do_handshake(self):
+            handshakes.append("handshake")
+
+        def settimeout(self, value):
+            self._sock.settimeout(value)
+
+        def sendall(self, data):
+            self._sock.sendall(data)
+
+        def makefile(self, *args, **kwargs):
+            return self._sock.makefile(*args, **kwargs)
+
+        def shutdown(self, *args):
+            self._sock.shutdown(*args)
+
+        def close(self):
+            self._sock.close()
+
+        def fileno(self):
+            return self._sock.fileno()
 
     class _RecordingContext:
         def __init__(self, context):
             self.context = context
 
-        def wrap_socket(self, sock, server_hostname=None, **kwargs):
+        def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True, **kwargs):
             hostnames.append(server_hostname)
-            return sock
+            # The handshake is deferred so the abort watch covers it too.
+            deferred.append(do_handshake_on_connect is False)
+            return _PlainTLS(sock)
 
     def fake_create_default_context(*args, **kwargs):
         context = real_context(*args, **kwargs)
@@ -310,6 +345,8 @@ def test_tls_uses_the_default_verification_context(monkeypatch):
     assert created and created[0].verify_mode == ssl.CERT_REQUIRED
     assert created[0].check_hostname is True
     assert hostnames == [PUBLIC_IP]
+    assert deferred == [True]
+    assert handshakes == ["handshake"]
 
 
 def test_public_addresses_are_recognised():
@@ -587,7 +624,7 @@ def test_cancelling_the_fetch_sets_the_worker_stop_flag(monkeypatch):
     observed: list[bool] = []
     done = threading.Event()
 
-    def fake_guarded_fetch(url, max_len, stop_event, slots, loop):
+    def fake_guarded_fetch(url, max_len, stop_event, lease, *_rest):
         while not stop_event.is_set():
             time.sleep(0.01)
         observed.append(stop_event.is_set())
@@ -613,12 +650,12 @@ def test_concurrent_fetches_are_bounded(monkeypatch):
     gate = threading.Event()
     slots = main_mod.MAX_CONCURRENT_FETCHES
 
-    def fake_guarded_fetch(url, max_len, stop_event, slot_pool, loop):
+    def fake_guarded_fetch(url, max_len, stop_event, lease, *_rest):
         gate.wait(10)
         try:
             return ("t", url)
         finally:
-            loop.call_soon_threadsafe(slot_pool.release)
+            lease.release()
 
     async def scenario():
         monkeypatch.setattr(main_mod, "_guarded_fetch", fake_guarded_fetch)
@@ -657,3 +694,341 @@ def test_two_fetches_keep_no_shared_state(monkeypatch):
     assert first[0] == "First" and "alpha content" in first[1]
     assert second[0] == "Second" and "beta content" in second[1]
     assert set(vars(plugin)) == before
+# --------------------------------------------------------------------------- #
+# F1 (third round) - the shared fetch slot has exactly one owner
+# --------------------------------------------------------------------------- #
+def test_fetch_cancelled_while_queued_releases_its_slot_exactly_once(monkeypatch):
+    """A fetch cancelled before its worker starts must not leak the slot."""
+    gate = threading.Event()
+    worker_ran = threading.Event()
+
+    def fake_guarded_fetch(url, max_len, stop_event, lease, *_rest):
+        worker_ran.set()
+        try:
+            return ("t", url)
+        finally:
+            lease.release()
+
+    def occupy(*_args):
+        gate.wait(10)
+        return ("t", "blocker")
+
+    async def scenario():
+        monkeypatch.setattr(main_mod, "_guarded_fetch", fake_guarded_fetch)
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        slots = main_mod._slots()
+        free = slots._value
+        plugin = URLSummary()
+
+        # Occupy the single worker thread so the fetch below stays queued.
+        blocker = loop.run_in_executor(None, occupy, "u", 1, None, slots, loop)
+        await asyncio.sleep(0.1)
+
+        task = asyncio.create_task(plugin.fetch_page("https://example.com/queued", 100))
+        await asyncio.sleep(0.3)
+        assert not worker_ran.is_set(), "the worker must still be queued"
+        assert slots._value == free - 1, "the queued call holds its slot"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The queued worker has not ended, so its slot must not be back yet.
+        assert slots._value == free - 1, "the slot was released while still queued/running"
+
+        gate.set()
+        assert await blocker == ("t", "blocker")
+        for _ in range(250):
+            if worker_ran.is_set() and slots._value == free:
+                break
+            await asyncio.sleep(0.02)
+        assert worker_ran.is_set(), "the queued worker never ran"
+        # Exactly one release: a second one would push the pool above its cap.
+        assert slots._value == free
+
+        # ...and the pool is still usable by the next caller.
+        assert await plugin.fetch_page("https://example.com/next", 100) == (
+            "t",
+            "https://example.com/next",
+        )
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_running_fetch_keeps_its_slot_until_the_worker_ends(monkeypatch):
+    """A worker that is still running must never lose its slot early."""
+    started = threading.Event()
+    still_running = threading.Event()
+
+    def fake_guarded_fetch(url, max_len, stop_event, lease, *_rest):
+        started.set()
+        stop_event.wait(10)  # the caller's cancellation sets this
+        still_running.set()
+        time.sleep(0.3)  # the thread is undeniably still alive here
+        try:
+            return ("t", url)
+        finally:
+            lease.release()
+
+    async def scenario():
+        monkeypatch.setattr(main_mod, "_guarded_fetch", fake_guarded_fetch)
+        slots = main_mod._slots()
+        free = slots._value
+        plugin = URLSummary()
+
+        task = asyncio.create_task(plugin.fetch_page("https://slow.example/", 100))
+        await asyncio.sleep(0.3)
+        assert started.is_set()
+        assert slots._value == free - 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.1)
+        assert still_running.is_set()
+        assert slots._value == free - 1, "the slot was released while the worker was running"
+
+        for _ in range(250):
+            if slots._value == free:
+                break
+            await asyncio.sleep(0.02)
+        assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+def test_slot_lease_releases_at_most_once():
+    """The two owners of a slot can never give it back twice."""
+
+    async def scenario():
+        slots = main_mod._slots()
+        free = slots._value
+        await slots.acquire()
+        assert slots._value == free - 1
+
+        lease = main_mod._SlotLease(slots, asyncio.get_running_loop())
+        lease.release()
+        lease.release()  # a second owner must be a no-op
+        assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+def test_fetch_submit_failure_leaks_no_slot(monkeypatch):
+    """A failed executor submission must give the already-acquired slot back."""
+
+    async def scenario():
+        slots = main_mod._slots()
+        free = slots._value
+        loop = asyncio.get_running_loop()
+
+        def refuse_submit(*args, **kwargs):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+        monkeypatch.setattr(loop, "run_in_executor", refuse_submit)
+        plugin = URLSummary()
+        with pytest.raises(RuntimeError):
+            await plugin.fetch_page("https://example.com/", 100)
+        assert slots._value == free
+
+    asyncio.run(scenario())
+
+
+def test_deadline_ends_a_response_whose_headers_never_arrive():
+    """A peer that drips bytes must not outlive the absolute deadline."""
+    finished = threading.Event()
+    errors: list[Exception] = []
+
+    def drip_headers(handler):
+        # One byte at a time, always inside the socket idle timeout, never a
+        # complete status line: ``getresponse()`` would block here forever.
+        try:
+            for _ in range(120):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/drip"] = drip_headers
+        with mock.patch.object(safe_fetch.socket, "create_connection", _connect_to(server.port)):
+
+            def run():
+                try:
+                    safe_fetch.fetch_document(server.url("/drip"), timeout=1.0)
+                except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=run, daemon=True)
+            start = time.monotonic()
+            thread.start()
+            assert finished.wait(8), "the header read outlived the absolute deadline"
+            elapsed = time.monotonic() - start
+
+    assert isinstance(errors[0], FetchAbortedError)
+    assert elapsed < 5
+
+
+def test_stop_event_ends_a_response_whose_headers_never_arrive():
+    """Cancellation must end the header phase too, not only the body."""
+    started = threading.Event()
+    finished = threading.Event()
+    errors: list[Exception] = []
+    stop_event = threading.Event()
+
+    def drip_headers(handler):
+        try:
+            for _ in range(120):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/drip"] = drip_headers
+        with mock.patch.object(safe_fetch.socket, "create_connection", _connect_to(server.port)):
+
+            def run():
+                started.set()
+                try:
+                    safe_fetch.fetch_document(
+                        server.url("/drip"), timeout=30, stop_event=stop_event
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            assert started.wait(5)
+            time.sleep(0.4)
+            stop_event.set()
+
+    assert finished.wait(8), "the stop flag did not end the header read"
+    assert isinstance(errors[0], FetchAbortedError)
+
+
+def test_deadline_abandons_a_resolver_that_never_answers(monkeypatch):
+    """A stalled DNS lookup must not hold the fetch past the deadline."""
+    unblock = threading.Event()
+
+    def stalled_getaddrinfo(*args, **kwargs):
+        unblock.wait(8)
+        return []
+
+    monkeypatch.setattr(safe_fetch.socket, "getaddrinfo", stalled_getaddrinfo)
+    start = time.monotonic()
+    try:
+        with pytest.raises(FetchAbortedError):
+            safe_fetch.fetch_document("http://stalled.example/", timeout=1.0)
+        elapsed = time.monotonic() - start
+    finally:
+        unblock.set()
+    assert elapsed < 5
+
+
+# --------------------------------------------------------------------------- #
+# F2 (third round) - error paths and logs never repeat the raw URL
+# --------------------------------------------------------------------------- #
+def _credential_url(port: int) -> str:
+    return f"http://alice:s3cret-pw@93.184.216.34:{port}/page?token=s3cret-token#frag"
+
+
+def _exception_text(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _assert_no_credentials(text: str) -> None:
+    assert "s3cret-pw" not in text, text
+    assert "s3cret-token" not in text, text
+    assert "alice" not in text, text
+
+
+def test_redaction_helpers_drop_userinfo_query_and_fragment():
+    assert (
+        safe_fetch.redact_url("http://alice:pw@host.example:8443/a/b?token=xyz#frag")
+        == "http://host.example:8443/a/b"
+    )
+    # A malformed port must not break the scrub (or leak the userinfo).
+    assert safe_fetch.redact_url("http://host:bad/x?t=1") == "http://host/x"
+    assert safe_fetch.redact_text("failed http://u:p@h/x?token=s") == "failed http://h/x"
+
+
+def test_connection_errors_never_repeat_url_credentials_or_query(monkeypatch):
+    def fail_connect(*args, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(safe_fetch.socket, "create_connection", fail_connect)
+
+    with pytest.raises(FetchError) as excinfo:
+        safe_fetch.fetch_document(_credential_url(1))
+
+    text = "\n".join(
+        (str(excinfo.value), repr(excinfo.value), _exception_text(excinfo.value))
+    )
+    _assert_no_credentials(text)
+    # The useful, non-secret part of the target is still reported.
+    assert "93.184.216.34" in text
+
+
+def test_chained_exception_text_is_scrubbed_too(monkeypatch):
+    raw = _credential_url(8080)
+
+    def boom(self, *args, **kwargs):
+        raise http.client.HTTPException(f"server rejected {raw}")
+
+    monkeypatch.setattr(safe_fetch.http.client.HTTPConnection, "request", boom)
+
+    with _Server() as server:
+        server.responses["/page"] = lambda handler: _send(handler, b"<html>ok</html>")
+        with mock.patch.object(safe_fetch.socket, "create_connection", _connect_to(server.port)):
+            with pytest.raises(FetchError) as excinfo:
+                safe_fetch.fetch_document(_credential_url(server.port))
+
+    _assert_no_credentials(_exception_text(excinfo.value))
+
+
+def test_listener_logs_never_contain_url_credentials_or_query(monkeypatch, caplog):
+    raw = _credential_url(8080)
+
+    async def failing_fetch_page(url, max_len):
+        raise RuntimeError(f"boom while fetching {url}")
+
+    plugin = URLSummary()
+    plugin.get_config = lambda: {"max_content_length": 8000, "language": "zh_Hans", "model": "m"}
+    monkeypatch.setattr(plugin, "fetch_page", failing_fetch_page)
+
+    listener = URLDetector()
+    listener.plugin = plugin
+    context = _make_context(f"please summarize {raw}")
+
+    with caplog.at_level(logging.WARNING, logger="URLSummary.detector"):
+        asyncio.run(listener._handle_message(context))
+
+    assert "Failed to summarize" in caplog.text
+    _assert_no_credentials(caplog.text)
+
+
+def test_listener_error_traceback_is_scrubbed(monkeypatch, caplog):
+    raw = _credential_url(8080)
+
+    def failing_config():
+        raise RuntimeError(f"config failed for {raw}")
+
+    plugin = URLSummary()
+    plugin.get_config = failing_config
+
+    listener = URLDetector()
+    listener.plugin = plugin
+    context = _make_context(f"please summarize {raw}")
+
+    with caplog.at_level(logging.ERROR, logger="URLSummary.detector"):
+        asyncio.run(listener._handle_message(context))
+
+    assert "Error in _handle_message" in caplog.text
+    _assert_no_credentials(caplog.text)
