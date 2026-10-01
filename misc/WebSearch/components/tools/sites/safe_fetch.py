@@ -21,9 +21,17 @@ This module therefore:
   non-public address, and then connects to the *validated IP literal* - a
   later, different DNS answer can no longer rebind the connection;
 * follows redirects manually, re-running the same validation on every hop;
-* reads the body in bounded chunks with a hard cap on the decoded bytes, a
-  total deadline and a cooperative stop flag, and closes the socket on every
-  exit path;
+* reads the body in bounded chunks with a hard cap on the decoded bytes *and* a
+  cumulative hard cap on the encoded (still compressed) bytes read, a total
+  deadline and a cooperative stop flag, and closes the socket on every exit
+  path;
+* handles the decompression stream's end explicitly: exactly one gzip/deflate
+  member is supported, bytes that follow the member raise
+  :class:`TrailingDataError` instead of accumulating in zlib's ``unused_data``,
+  an end-of-stream decompressor is never fed again, and a body whose compressed
+  stream stops before its end marker raises
+  :class:`IncompleteCompressedStreamError` (so the gzip CRC32 / zlib Adler-32 is
+  validated before the body can become a document);
 * never returns a partial body as if it were complete: every exit path re-checks
   the stop flag and the deadline, and a body shorter than its declared
   ``Content-Length`` fails with :class:`TruncatedResponseError`;
@@ -43,6 +51,16 @@ This module therefore:
 * never puts a raw URL back into an error message: :func:`redact_url` drops the
   userinfo, query string and fragment, and the same scrub is applied to
   chained exception text so a traceback cannot leak credentials either.
+
+Limits and deliberate divergence
+--------------------------------
+The encoded-byte budget (:data:`MAX_ENCODED_BYTES`) covers bytes *after* the
+first compressed member, the trailing-data refusal and the incomplete-stream
+check.  These belong to this plugin's ``safe_fetch.py`` only.  ``misc/URLSummary``
+ships an independent copy of this module whose 0.1.9 artifact is already
+certified; that copy keeps the latent trailing-data hole and is intentionally
+*not* updated here, so the two files diverge on this point by design (flagged to
+the maintainer).
 """
 
 from __future__ import annotations
@@ -63,6 +81,25 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 """Hard cap on the decoded response body kept for one fetch."""
+
+_ENCODED_SLACK = 64 * 1024
+"""Framing slack added on top of a fetch's decoded cap to bound encoded bytes.
+
+A well-formed gzip/DEFLATE stream that inflates to ``N`` bytes is essentially
+``N`` bytes on the wire: DEFLATE stored blocks add ~5 bytes per 64 KiB payload
+and a gzip wrapper adds a fixed ~18 bytes, so the encoding overhead is well
+under 0.1%.  One whole read chunk (:data:`_CHUNK_SIZE`) of slack is therefore
+far more than any legitimate stream needs, while the resulting cumulative
+budget still stops a peer that keeps streaming encoded bytes after the first
+compressed member has ended.
+"""
+
+MAX_ENCODED_BYTES = MAX_RESPONSE_BYTES + _ENCODED_SLACK
+"""Default cumulative hard cap on the encoded bytes read for one fetch.
+
+This is the value at the default 2 MiB decoded cap; a fetch with a smaller
+``max_bytes`` gets a proportionally smaller encoded budget.
+"""
 
 MAX_PARSE_CHARS = 256 * 1024
 """Cap on the HTML text handed to BeautifulSoup."""
@@ -112,19 +149,47 @@ class TruncatedResponseError(FetchError):
     """The peer stopped before delivering the body it declared."""
 
 
+class TrailingDataError(FetchError):
+    """Unpermitted bytes followed the end of the compressed body's stream.
+
+    The decoder supports exactly one gzip/DEFLATE member, so anything after
+    the stream's end is refused rather than buffered in ``unused_data``.
+    """
+
+
+class IncompleteCompressedStreamError(FetchError):
+    """A compressed body ended before its stream's end marker.
+
+    The stream's integrity (gzip CRC32/length, zlib Adler-32) can only be
+    checked at the end of a member, so a body that stops early must fail
+    instead of being handed on as a document.
+"""
+
+
 class ResolverBusyError(FetchError):
     """The bounded resolver budget is exhausted; a lookup was refused."""
 
 
 class _ByteCounter:
-    """Counts raw (still encoded) body bytes as they stream past."""
+    """Counts raw (still encoded) body bytes and enforces a cumulative cap.
 
-    def __init__(self) -> None:
+    The cap is checked before each chunk is handed to the decoder, so a peer
+    that streams encoded bytes without end - chunked or with no
+    ``Content-Length`` - is stopped at the fixed budget instead of feeding the
+    decoding pipeline forever.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
         self.total = 0
+        self._limit = limit
 
     def count(self, chunks: Iterable[bytes]) -> Iterator[bytes]:
         for chunk in chunks:
             self.total += len(chunk)
+            if self._limit is not None and self.total > self._limit:
+                raise ResponseTooLargeError(
+                    f"encoded response exceeds the {self._limit}-byte limit"
+                )
             yield chunk
 
 
@@ -608,7 +673,7 @@ def _request_once(
                 f"{redact_url(url)!r}"
             )
 
-        counter = _ByteCounter()
+        counter = _ByteCounter(max_bytes + _ENCODED_SLACK)
         decoder = _BodyDecoder(response_headers.get("Content-Encoding"), max_bytes)
         chunks = decoder.decode(counter.count(_raw_chunks(response, sock, stop_event, deadline)))
         body = collect_bounded(chunks, max_bytes)
@@ -697,11 +762,21 @@ def collect_bounded(chunks: Iterable[bytes], limit: int) -> bytes:
 
 
 class _BodyDecoder:
-    """Streaming gzip/deflate decoder with a cap on the inflated size."""
+    """Streaming gzip/deflate decoder with a cap on the inflated size.
+
+    Exactly one compressed member is supported.  The decoder tracks zlib's
+    ``eof`` flag and refuses to feed an end-of-stream decompressor again, so
+    bytes that follow the member are neither buffered in ``unused_data`` nor
+    inflated: they raise :class:`TrailingDataError` instead.  A stream that
+    stops before its end marker raises
+    :class:`IncompleteCompressedStreamError`, because only a complete stream
+    can have its gzip CRC32 / zlib Adler-32 (and length) validated.
+    """
 
     def __init__(self, encoding: str | None, limit: int) -> None:
         self.encoding = (encoding or "").strip().lower()
         self._limit = limit
+        self._done = False
         if self.encoding in ("", "identity"):
             self._inflater = None
         elif self.encoding == "gzip":
@@ -716,6 +791,15 @@ class _BodyDecoder:
             yield from chunks
             return
         for chunk in chunks:
+            if not chunk:
+                continue
+            if self._done:
+                # The member already ended; do not feed the EOF'd decompressor
+                # the trailing bytes and do not let them reach the decoder's
+                # internal buffer.
+                raise TrailingDataError(
+                    "compressed response has data after the end of its stream"
+                )
             out = self._inflater.decompress(chunk, self._limit)
             if self._inflater.unconsumed_tail:
                 # More inflated bytes are pending than the cap allows: stop
@@ -725,6 +809,18 @@ class _BodyDecoder:
                 )
             if out:
                 yield out
+            if self._inflater.eof:
+                if self._inflater.unused_data:
+                    # The stream ended inside this chunk and bytes follow it;
+                    # refuse them instead of retaining them in ``unused_data``.
+                    raise TrailingDataError(
+                        "compressed response has data after the end of its stream"
+                    )
+                self._done = True
+        if not self._done:
+            raise IncompleteCompressedStreamError(
+                "compressed response ended before the end of its stream"
+            )
         tail = self._inflater.flush()
         if tail:
             yield tail

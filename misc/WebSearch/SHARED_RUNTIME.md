@@ -54,6 +54,14 @@ certification requirements in the plugin request layer:
   `MAX_RESPONSE_BYTES`, and a body that inflates beyond it, abort the fetch
   without being buffered; the HTML handed to BeautifulSoup is capped at
   `MAX_PARSE_CHARS` and the extracted title/brief lengths are clamped;
+- the *encoded* bytes read are bounded too: a cumulative `MAX_RESPONSE_BYTES +
+  64 KiB` budget stops a chunked or length-less peer that keeps streaming
+  bytes after the first compressed member, and the decoder tracks the zlib
+  stream's end explicitly — exactly one gzip/deflate member is supported, bytes
+  after it raise `TrailingDataError` instead of sitting in `unused_data`, an
+  EOF'd decompressor is never fed again, and a stream that stops before its end
+  marker raises `IncompleteCompressedStreamError` so gzip CRC32 / zlib Adler-32
+  is validated before any body becomes a document;
 - the whole operation has an absolute deadline plus a cooperative stop flag that
   cover DNS, connect, the TLS handshake, status/header parsing and the body: a
   watchdog thread shuts the socket down when either fires, because a socket

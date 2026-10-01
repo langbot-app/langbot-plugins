@@ -46,7 +46,9 @@ from components.tools.sites.safe_fetch import (  # noqa: E402
     BlockedTargetError,
     FetchAbortedError,
     FetchError,
+    IncompleteCompressedStreamError,
     ResponseTooLargeError,
+    TrailingDataError,
     TruncatedResponseError,
 )
 
@@ -455,6 +457,138 @@ def test_gzip_inflation_stops_before_the_whole_stream_is_read():
         safe_fetch.collect_bounded(decoder.decode(source()), 8192)
 
     assert 0 < len(pulled) < len(blocks)
+
+
+def test_encoded_body_is_capped_cumulatively():
+    counter = safe_fetch._ByteCounter(1024)
+
+    def source():
+        for _ in range(100):
+            yield b"A" * 512
+
+    with pytest.raises(ResponseTooLargeError):
+        list(counter.count(source()))
+
+
+def test_trailing_bytes_after_the_compressed_stream_are_refused():
+    # The reviewer's probe: a tiny valid gzip stream followed by far more
+    # bytes than the cap.  The old decoder fed the second chunk to the EOF'd
+    # zlib object and returned "OK" while ``unused_data`` grew to 8 MiB.
+    stream = gzip.compress(b"OK")
+    trailing = b"X" * (8 * 1024 * 1024)
+    decoder = safe_fetch._BodyDecoder("gzip", 2 * 1024 * 1024)
+
+    with pytest.raises(TrailingDataError):
+        safe_fetch.collect_bounded(decoder.decode(iter([stream, trailing])), 2 * 1024 * 1024)
+
+    assert not decoder._inflater.unused_data
+
+
+def test_trailing_bytes_inside_the_final_chunk_are_refused():
+    decoder = safe_fetch._BodyDecoder("gzip", 2 * 1024 * 1024)
+    combined = gzip.compress(b"OK") + b"X" * (2 * 1024 * 1024)
+
+    with pytest.raises(TrailingDataError):
+        safe_fetch.collect_bounded(decoder.decode(iter([combined])), 2 * 1024 * 1024)
+
+
+def test_decoder_stops_reading_at_the_first_trailing_chunk():
+    pulled = 0
+
+    def source():
+        nonlocal pulled
+        yield gzip.compress(b"OK")
+        for _ in range(1000):
+            pulled += 1
+            yield b"X" * 8192
+
+    decoder = safe_fetch._BodyDecoder("gzip", 2 * 1024 * 1024)
+    with pytest.raises(TrailingDataError):
+        safe_fetch.collect_bounded(decoder.decode(source()), 2 * 1024 * 1024)
+
+    # Only the first trailing chunk was pulled; the other 999 are never read.
+    assert pulled == 1
+
+
+def test_incomplete_compressed_stream_is_refused():
+    truncated = gzip.compress(b"<html>ok</html>")[:-8]  # no gzip trailer
+    decoder = safe_fetch._BodyDecoder("gzip", 2 * 1024 * 1024)
+
+    with pytest.raises(IncompleteCompressedStreamError):
+        safe_fetch.collect_bounded(decoder.decode(iter([truncated])), 2 * 1024 * 1024)
+
+
+def test_trailing_compressed_data_fails_the_fetch():
+    def trailing_body(handler):
+        payload = gzip.compress(b"<html><head><title>OK</title></head></html>")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html")
+        handler.send_header("Content-Encoding", "gzip")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.end_headers()
+        try:
+            for piece in (payload, b"X" * (4 * 1024 * 1024)):
+                handler.wfile.write(b"%X\r\n" % len(piece) + piece + b"\r\n")
+            handler.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/trailing"] = trailing_body
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(server, "/trailing")
+
+    # A body that did not stop at its compressed stream's end never becomes a
+    # document; it fails as a size/format error instead.
+    assert isinstance(
+        excinfo.value, (TrailingDataError, ResponseTooLargeError)
+    )
+
+
+def test_incomplete_compressed_body_fails_the_fetch():
+    truncated = gzip.compress(b"<html><head><title>OK</title></head></html>")[:-8]
+
+    def body(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html")
+        handler.send_header("Content-Encoding", "gzip")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.end_headers()
+        try:
+            handler.wfile.write(b"%X\r\n" % len(truncated) + truncated + b"\r\n")
+            handler.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/truncated"] = body
+        with pytest.raises(IncompleteCompressedStreamError):
+            _fetch(server, "/truncated")
+
+
+def test_corrupt_compressed_body_fails_the_fetch():
+    corrupted = bytearray(gzip.compress(b"<html><head><title>OK</title></head></html>"))
+    corrupted[-5] ^= 0xFF  # break the gzip CRC32; only an end-of-stream check sees it
+
+    def body(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html")
+        handler.send_header("Content-Encoding", "gzip")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.end_headers()
+        payload = bytes(corrupted)
+        try:
+            handler.wfile.write(b"%X\r\n" % len(payload) + payload + b"\r\n")
+            handler.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass
+
+    with _Server() as server:
+        server.responses["/corrupt"] = body
+        with pytest.raises(FetchError) as excinfo:
+            _fetch(server, "/corrupt")
+
+    assert not isinstance(excinfo.value, (TrailingDataError, IncompleteCompressedStreamError))
 
 
 def test_parse_input_is_capped(monkeypatch):
