@@ -15,6 +15,7 @@ import typing
 import uuid
 from contextlib import aclosing
 
+from langbot_plugin.entities.io.errors import ActionCallError
 from langbot_plugin.api.definition.components.runner.runner import Runner
 from langbot_plugin.api.entities.builtin.provider.message import MessageChunk
 from langbot_plugin.api.entities.builtin.runner import (
@@ -561,14 +562,21 @@ class DefaultRunner(Runner):
         ctx: RunnerContext,
         interaction_id: str,
     ) -> dict[str, typing.Any]:
+        key = _interaction_storage_key(interaction_id)
         try:
-            payload = await self.get_run_api(ctx).get_plugin_storage(_interaction_storage_key(interaction_id))
-            continuation = json.loads(payload.decode("utf-8"))
-        except KeyError as exc:
+            payload = await self.get_run_api(ctx).get_plugin_storage(key)
+        except (KeyError, ActionCallError) as exc:
+            if isinstance(exc, ActionCallError):
+                message = str(exc)
+                while message.startswith("ActionCallError: "):
+                    message = message.removeprefix("ActionCallError: ")
+                if message != f"Storage with key {key} not found":
+                    raise
             raise DifyAPIError(
                 "The Dify human-input request is no longer pending",
                 code="dify.interaction_not_found",
             ) from exc
+        continuation = json.loads(payload.decode("utf-8"))
         if not isinstance(continuation, dict) or continuation.get("interaction_id") != interaction_id:
             raise DifyAPIError(
                 "The Dify human-input continuation is invalid",
