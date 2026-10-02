@@ -37,6 +37,9 @@ jobs:
       - name: LangRAG legacy unit and benchmark fixtures
         working-directory: KnowledgeEngine/LangRAG
         run: ../../.venv/bin/python -m unittest discover -s tests -v
+      - name: LongTermMemory regressions
+        working-directory: KnowledgeEngine/LongTermMemory
+        run: PYTHONPATH=. ../../.venv/bin/python -m pytest tests -q
       - name: Exact archives, real dependency prepare, discovery and RPC
         run: .venv/bin/python KnowledgeEngine/certification-tests/verify_candidates.py --evidence "$RUNNER_TEMP/ke-evidence"
       - name: Retain unsigned candidate evidence

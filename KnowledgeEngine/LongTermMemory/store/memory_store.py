@@ -7,6 +7,7 @@ import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from langbot_plugin.entities.io.errors import ActionCallError
 from store.serialization import FENCE_KEY_PREFIX, BindingWrites, serialized_write
 
 logger = logging.getLogger(__name__)
@@ -688,7 +689,14 @@ class MemoryStore:
     async def _read_json(self, key: str) -> Any:
         try:
             data = await self.plugin.get_plugin_storage(key)
-        except KeyError:
+        except (KeyError, ActionCallError) as exc:
+            if isinstance(exc, ActionCallError):
+                message = str(exc)
+                # RPC hops can prepend the exception name more than once.
+                while message.startswith("ActionCallError: "):
+                    message = message.removeprefix("ActionCallError: ")
+                if message != f"Storage with key {key} not found":
+                    raise
             logger.debug("storage key %s not found", key)
             return None
         if not data:
