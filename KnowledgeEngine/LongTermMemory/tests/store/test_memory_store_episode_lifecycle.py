@@ -13,6 +13,9 @@ class FakeVectorPlugin:
         self.search_calls: list[dict] = []
         self.delete_calls: list[dict] = []
 
+    async def get_plugin_storage_keys(self) -> list[str]:
+        return []
+
     async def invoke_embedding(self, _embedding_model_uuid: str, texts: list[str]) -> list[list[float]]:
         return [[float(index + 1)] for index, _ in enumerate(texts)]
 
@@ -425,6 +428,9 @@ class FakeStorageVectorPlugin(FakeVectorPlugin):
     def __init__(self):
         super().__init__()
         self.storage: dict[str, bytes] = {}
+
+    async def get_plugin_storage_keys(self) -> list[str]:
+        return list(self.storage)
 
     async def get_plugin_storage(self, key: str) -> bytes:
         if key not in self.storage:

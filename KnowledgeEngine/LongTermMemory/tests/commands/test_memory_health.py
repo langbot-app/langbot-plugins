@@ -58,6 +58,9 @@ class FakePlugin:
         self.records: dict[str, dict] = {}
         self.deleted: list[str] = []
 
+    async def get_plugin_storage_keys(self) -> list[str]:
+        return []
+
     async def invoke_embedding(self, _embedding_model_uuid: str, texts: list[str]) -> list[list[float]]:
         return [[float(index + 1)] for index, _ in enumerate(texts)]
 

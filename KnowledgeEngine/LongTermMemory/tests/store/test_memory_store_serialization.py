@@ -235,6 +235,33 @@ async def audit(store: MemoryStore, scope_key: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("persisted_fence", [False, True])
+async def test_restart_refuses_writes_until_persisted_fences_can_be_read(persisted_fence):
+    storage = StorageFixture()
+    if persisted_fence:
+        await MemoryStore(storage)._writes.fence(storage, "scope-a", "unknown prior write")
+    restarted = MemoryStore(storage)
+    list_keys = storage.get_plugin_storage_keys
+    before = dict(storage.storage)
+
+    async def unavailable_keys():
+        raise TimeoutError("storage listing unavailable")
+
+    storage.get_plugin_storage_keys = unavailable_keys
+    with pytest.raises(RuntimeError, match="Could not load persisted memory fences"):
+        await audit(restarted, "scope-a")
+    assert storage.storage == before
+
+    storage.get_plugin_storage_keys = list_keys
+    if persisted_fence:
+        with pytest.raises(RuntimeError, match="fenced"):
+            await audit(restarted, "scope-a")
+        await restarted.clear_fence("scope-a")
+    await audit(restarted, "scope-a")
+    assert (await restarted.list_audit_entries("scope-a"))[1] == 1
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_host_write_fences_only_that_scope_and_survives_restart():
     storage = StorageFixture()
     store = MemoryStore(plugin=storage)

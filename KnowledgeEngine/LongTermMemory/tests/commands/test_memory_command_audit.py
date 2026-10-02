@@ -27,6 +27,9 @@ class FakePlugin:
         self.memory_store = MemoryStore(self)
         self.plugin_runtime_handler = object()
 
+    async def get_plugin_storage_keys(self) -> list[str]:
+        return list(self.storage)
+
     async def get_plugin_storage(self, key: str) -> bytes:
         if key not in self.storage:
             raise KeyError(key)
