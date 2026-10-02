@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -157,6 +158,37 @@ async def test_engine_document_delete_cannot_race_a_status_update():
     finally:
         release.set()
         await asyncio.gather(update, deletion)
+    assert plugin.records == {}
+
+
+@pytest.mark.asyncio
+async def test_engine_document_delete_cannot_split_a_multibatch_import():
+    plugin = VectorStorageFixture()
+    plugin.memory_store = MemoryStore(plugin)
+    engine = LongTermMemoryEngine()
+    engine.plugin = plugin
+    started, release = asyncio.Event(), asyncio.Event()
+    upsert = plugin.vector_upsert
+
+    async def file_stream(_path):
+        return json.dumps([{"content": f"memory {i}"} for i in range(33)]).encode()
+
+    async def write_batch(**kwargs):
+        await upsert(**kwargs)
+        if not started.is_set():
+            started.set()
+            await release.wait()
+
+    plugin.get_knowledge_file_stream = file_stream
+    plugin.vector_upsert = write_batch
+    ingestion = asyncio.create_task(engine.ingest(engine_context()))
+    await started.wait()
+    deletion = asyncio.create_task(engine.delete_document("kb-1", "doc-1"))
+    await asyncio.sleep(0)
+    release.set()
+    result, deleted = await asyncio.gather(ingestion, deletion)
+    assert result.chunks_created == 33
+    assert deleted is True
     assert plugin.records == {}
 
 

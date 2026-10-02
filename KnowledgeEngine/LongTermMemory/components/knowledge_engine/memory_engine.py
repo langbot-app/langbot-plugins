@@ -362,9 +362,22 @@ class LongTermMemoryEngine(KnowledgeEngine):
     # ================================================================
 
     async def ingest(self, context: IngestionContext) -> IngestionResult:
+        audit_entries: list[dict[str, Any]] = []
+        result = await self._ingest(context.get_collection_id(), context, audit_entries)
+        # User-scope audit writes run after releasing the collection lock.
+        for entry in audit_entries:
+            await self.plugin.memory_store.append_audit_entry(**entry)
+        return result
+
+    @serialized_write
+    async def _ingest(
+        self,
+        collection_id: str,
+        context: IngestionContext,
+        audit_entries: list[dict[str, Any]],
+    ) -> IngestionResult:
         doc_id = context.file_object.metadata.document_id
         filename = context.file_object.metadata.filename
-        collection_id = context.get_collection_id()
         settings = context.creation_settings
         embedding_model_uuid = settings.get("embedding_model_uuid", "")
 
@@ -481,7 +494,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
 
         logger.info("Ingestion complete: %d memories stored", total_stored)
         for user_key, count in imported_by_user.items():
-            await self.plugin.memory_store.append_audit_entry(
+            audit_entries.append(dict(
                 scope_key=user_key,
                 user_key=user_key,
                 operation="import_l2",
@@ -493,7 +506,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
                     "filename": filename,
                     "count": count,
                 },
-            )
+            ))
         return IngestionResult(
             document_id=doc_id,
             status=DocumentStatus.COMPLETED,
