@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from main import LongTermMemoryPlugin
+from components.knowledge_engine.memory_engine import LongTermMemoryEngine
+from langbot_plugin.api.entities.builtin.rag.models import IngestionContext
 from store.memory_store import MemoryStore
 
 
@@ -72,6 +74,9 @@ class VectorStorageFixture(StorageFixture):
         super().__init__()
         self.records: dict[str, dict] = {}
 
+    async def get_knowledge_file_stream(self, _path):
+        return b'[{"content":"memory"}]'
+
     async def invoke_embedding(self, _model, texts):
         return [[1.0, 0.0] for _ in texts]
 
@@ -93,6 +98,11 @@ class VectorStorageFixture(StorageFixture):
         return {"items": items[offset: offset + limit], "total": len(items)}
 
     async def vector_delete(self, collection_id, file_ids=None, filters=None):
+        if filters and "document_id" in filters:
+            file_ids = [
+                item_id for item_id, record in self.records.items()
+                if record["metadata"].get("document_id") == filters["document_id"]
+            ]
         if not file_ids:
             return 0
         deleted = 0
@@ -101,6 +111,91 @@ class VectorStorageFixture(StorageFixture):
                 self.records.pop(item_id)
                 deleted += 1
         return deleted
+
+
+def engine_context():
+    return IngestionContext(
+        file_object={
+            "metadata": {
+                "document_id": "doc-1", "filename": "memory.json",
+                "knowledge_base_id": "kb-1", "file_size": 22,
+                "mime_type": "application/json",
+            },
+            "storage_path": "memory.json",
+        },
+        knowledge_base_id="kb-1",
+        creation_settings={"embedding_model_uuid": "embedding-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_document_delete_cannot_race_a_status_update():
+    plugin = VectorStorageFixture()
+    plugin.records["episode-1"] = {"id": "episode-1", "metadata": {
+        "document_id": "doc-1", "content": "memory", "user_key": "user-1",
+    }}
+    plugin.memory_store = MemoryStore(plugin)
+    engine = LongTermMemoryEngine()
+    engine.plugin = plugin
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def embedding(_model, _texts):
+        started.set()
+        await release.wait()
+        return [[1.0, 0.0]]
+
+    plugin.invoke_embedding = embedding
+    update = asyncio.create_task(plugin.memory_store.update_episode_status(
+        "kb-1", "embedding-1", "episode-1", "user-1", "archived",
+    ))
+    await started.wait()
+    deletion = asyncio.create_task(engine.delete_document("kb-1", "doc-1"))
+    try:
+        await asyncio.sleep(0)
+        assert "episode-1" in plugin.records
+        assert not deletion.done()
+    finally:
+        release.set()
+        await asyncio.gather(update, deletion)
+    assert plugin.records == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["ingest", "delete"])
+async def test_engine_collection_writes_respect_existing_fence(operation):
+    plugin = VectorStorageFixture()
+    plugin.memory_store = MemoryStore(plugin)
+    engine = LongTermMemoryEngine()
+    engine.plugin = plugin
+    await plugin.memory_store._writes.fence(plugin, "kb-1", "unknown prior mutation")
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        if operation == "ingest":
+            await engine.ingest(engine_context())
+        else:
+            await engine.delete_document("kb-1", "doc-1")
+    assert plugin.records == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["ingest", "delete"])
+async def test_engine_unknown_mutation_fences_the_collection(operation):
+    plugin = VectorStorageFixture()
+    plugin.memory_store = MemoryStore(plugin)
+    engine = LongTermMemoryEngine()
+    engine.plugin = plugin
+
+    async def unknown_mutation(**_kwargs):
+        raise RuntimeError("host mutation outcome unknown")
+
+    plugin.vector_upsert = unknown_mutation
+    plugin.vector_delete = unknown_mutation
+    with pytest.raises(RuntimeError, match="outcome unknown"):
+        if operation == "ingest":
+            await engine.ingest(engine_context())
+        else:
+            await engine.delete_document("kb-1", "doc-1")
+    assert plugin.memory_store.is_fenced("kb-1")
 
 
 async def audit(store: MemoryStore, scope_key: str) -> None:

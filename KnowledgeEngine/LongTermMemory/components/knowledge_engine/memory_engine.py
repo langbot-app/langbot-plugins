@@ -22,6 +22,7 @@ from langbot_plugin.api.entities.builtin.rag.models import (
     IngestionResult,
 )
 from langbot_plugin.api.entities.builtin.rag.enums import DocumentStatus
+from store.serialization import serialized_write
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ class LongTermMemoryEngine(KnowledgeEngine):
     (embedding model, isolation mode) and handles L2 episodic memory
     retrieval and import.
     """
+
+    @property
+    def _writes(self):
+        return self.plugin.memory_store._writes
 
     @classmethod
     def get_capabilities(cls) -> list[str]:
@@ -495,6 +500,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
             chunks_created=total_stored,
         )
 
+    @serialized_write
     async def _embed_and_upsert(
         self,
         collection_id: str,
@@ -510,12 +516,17 @@ class LongTermMemoryEngine(KnowledgeEngine):
             ids,
         )
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, texts)
-        await self.plugin.vector_upsert(
-            collection_id=collection_id,
-            vectors=vectors,
-            ids=ids,
-            metadata=metas,
-            documents=texts,
+        await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_upsert(
+                collection_id=collection_id,
+                vectors=vectors,
+                ids=ids,
+                metadata=metas,
+                documents=texts,
+            ),
+            "Host vector_upsert outcome unknown",
         )
         return len(texts)
 
@@ -529,10 +540,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
             kb_id,
             document_id,
         )
-        count = await self.plugin.vector_delete(
-            collection_id=kb_id,
-            filters={"document_id": document_id},
-        )
+        count = await self._delete_document_vectors(kb_id, document_id)
         logger.info(
             "[LongTermMemory] delete_document completed: kb_id=%s document_id=%s deleted_count=%s",
             kb_id,
@@ -548,3 +556,15 @@ class LongTermMemoryEngine(KnowledgeEngine):
             metadata={"kb_id": kb_id, "deleted": count},
         )
         return count > 0
+
+    @serialized_write
+    async def _delete_document_vectors(self, kb_id: str, document_id: str) -> int:
+        return await self._writes.mutate(
+            self.plugin,
+            kb_id,
+            lambda: self.plugin.vector_delete(
+                collection_id=kb_id,
+                filters={"document_id": document_id},
+            ),
+            "Host vector_delete outcome unknown",
+        )
