@@ -136,11 +136,10 @@ class BindingWrites:
         )
 
     async def _load_fences(self, plugin, binding):
-        """Read persisted fences once per binding, best effort.
+        """Read persisted fences once per binding before allowing writes.
 
-        A failed fence read must not introduce a new failure mode: a Host write
-        that follows fails closed on its own, and the read is retried rather than
-        cached.
+        An unavailable listing cannot establish that a restarted binding is
+        safe. Refuse this write and retry the read on the next invocation.
         """
         if binding in self._fence_loaded:
             return
@@ -159,9 +158,10 @@ class BindingWrites:
                     fenced.add(key)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.warning("Could not read persisted fences for %r", binding, exc_info=True)
-            return
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not load persisted memory fences; retry after storage recovers"
+            ) from exc
         self._fence_loaded.add(binding)
 
     async def run(self, plugin, identity, operation, *, allow_fenced=False):

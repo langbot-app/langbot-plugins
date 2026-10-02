@@ -22,6 +22,7 @@ from langbot_plugin.api.entities.builtin.rag.models import (
     IngestionResult,
 )
 from langbot_plugin.api.entities.builtin.rag.enums import DocumentStatus
+from store.serialization import serialized_write
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ class LongTermMemoryEngine(KnowledgeEngine):
     (embedding model, isolation mode) and handles L2 episodic memory
     retrieval and import.
     """
+
+    @property
+    def _writes(self):
+        return self.plugin.memory_store._writes
 
     @classmethod
     def get_capabilities(cls) -> list[str]:
@@ -357,9 +362,22 @@ class LongTermMemoryEngine(KnowledgeEngine):
     # ================================================================
 
     async def ingest(self, context: IngestionContext) -> IngestionResult:
+        audit_entries: list[dict[str, Any]] = []
+        result = await self._ingest(context.get_collection_id(), context, audit_entries)
+        # User-scope audit writes run after releasing the collection lock.
+        for entry in audit_entries:
+            await self.plugin.memory_store.append_audit_entry(**entry)
+        return result
+
+    @serialized_write
+    async def _ingest(
+        self,
+        collection_id: str,
+        context: IngestionContext,
+        audit_entries: list[dict[str, Any]],
+    ) -> IngestionResult:
         doc_id = context.file_object.metadata.document_id
         filename = context.file_object.metadata.filename
-        collection_id = context.get_collection_id()
         settings = context.creation_settings
         embedding_model_uuid = settings.get("embedding_model_uuid", "")
 
@@ -476,7 +494,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
 
         logger.info("Ingestion complete: %d memories stored", total_stored)
         for user_key, count in imported_by_user.items():
-            await self.plugin.memory_store.append_audit_entry(
+            audit_entries.append(dict(
                 scope_key=user_key,
                 user_key=user_key,
                 operation="import_l2",
@@ -488,13 +506,14 @@ class LongTermMemoryEngine(KnowledgeEngine):
                     "filename": filename,
                     "count": count,
                 },
-            )
+            ))
         return IngestionResult(
             document_id=doc_id,
             status=DocumentStatus.COMPLETED,
             chunks_created=total_stored,
         )
 
+    @serialized_write
     async def _embed_and_upsert(
         self,
         collection_id: str,
@@ -510,12 +529,17 @@ class LongTermMemoryEngine(KnowledgeEngine):
             ids,
         )
         vectors = await self.plugin.invoke_embedding(embedding_model_uuid, texts)
-        await self.plugin.vector_upsert(
-            collection_id=collection_id,
-            vectors=vectors,
-            ids=ids,
-            metadata=metas,
-            documents=texts,
+        await self._writes.mutate(
+            self.plugin,
+            collection_id,
+            lambda: self.plugin.vector_upsert(
+                collection_id=collection_id,
+                vectors=vectors,
+                ids=ids,
+                metadata=metas,
+                documents=texts,
+            ),
+            "Host vector_upsert outcome unknown",
         )
         return len(texts)
 
@@ -529,10 +553,7 @@ class LongTermMemoryEngine(KnowledgeEngine):
             kb_id,
             document_id,
         )
-        count = await self.plugin.vector_delete(
-            collection_id=kb_id,
-            filters={"document_id": document_id},
-        )
+        count = await self._delete_document_vectors(kb_id, document_id)
         logger.info(
             "[LongTermMemory] delete_document completed: kb_id=%s document_id=%s deleted_count=%s",
             kb_id,
@@ -548,3 +569,15 @@ class LongTermMemoryEngine(KnowledgeEngine):
             metadata={"kb_id": kb_id, "deleted": count},
         )
         return count > 0
+
+    @serialized_write
+    async def _delete_document_vectors(self, kb_id: str, document_id: str) -> int:
+        return await self._writes.mutate(
+            self.plugin,
+            kb_id,
+            lambda: self.plugin.vector_delete(
+                collection_id=kb_id,
+                filters={"document_id": document_id},
+            ),
+            "Host vector_delete outcome unknown",
+        )

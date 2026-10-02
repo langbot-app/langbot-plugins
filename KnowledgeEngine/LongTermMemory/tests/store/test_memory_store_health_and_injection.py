@@ -9,6 +9,9 @@ class FakeStoragePlugin:
     def __init__(self):
         self.storage: dict[str, bytes] = {}
 
+    async def get_plugin_storage_keys(self) -> list[str]:
+        return list(self.storage)
+
     async def get_plugin_storage(self, key: str) -> bytes:
         if key not in self.storage:
             raise KeyError(key)
