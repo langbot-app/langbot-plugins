@@ -11,6 +11,27 @@ from tests.test_runner import make_context
 
 
 @pytest.mark.asyncio
+async def test_slow_ledger_does_not_delay_chunks_or_deadline():
+    calls = 0
+
+    class SlowLedger:
+        async def run_get(self, run_id):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(10)
+
+    context = make_context()
+    context.context.available_apis.run_get = True
+    async with RunInterruptChecker(SlowLedger(), context) as checker:
+        for _ in range(200):
+            assert await checker.wait_for(asyncio.sleep(0, result="chunk"), deadline=RunDeadline(0.1)) == "chunk"
+        assert calls == 1
+        with pytest.raises(asyncio.TimeoutError):
+            await checker.wait_for(asyncio.sleep(10), deadline=RunDeadline(0.02))
+    assert checker._watcher is None
+
+
+@pytest.mark.asyncio
 async def test_operation_timeout_is_not_mistaken_for_poll_timeout():
     checker = RunInterruptChecker(None, make_context())
     operation_error = asyncio.TimeoutError("operation itself timed out")

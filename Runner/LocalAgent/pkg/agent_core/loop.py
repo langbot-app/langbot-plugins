@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import typing
+from contextlib import aclosing
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
@@ -70,12 +71,14 @@ class AgentLoop:
 
     async def run(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         if self.streaming:
-            async for event in self._run_streaming():
-                yield event
+            async with aclosing(self._run_streaming()) as owned_stream:
+                async for event in owned_stream:
+                    yield event
             return
 
-        async for event in self._run_non_streaming():
-            yield event
+        async with aclosing(self._run_non_streaming()) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def _execute_prepared_tool_call(
         self,
@@ -251,17 +254,20 @@ class AgentLoop:
                 try:
                     await self._prepare_model_turn()
                     model_turn: ModelTurnResult | None = None
-                    async for model_event in self.model_adapter.stream_turn(
-                        model_ids=turn_model_ids,
-                        messages=self.messages,
-                        tools=self.tools,
-                        visible_prefix=visible_content_prefix,
-                    ):
-                        if model_event.type == ModelTurnEventType.MESSAGE_DELTA and model_event.chunk is not None:
-                            stream_started = True
-                            yield AgentLoopEvent.message_update(model_event.chunk)
-                        elif model_event.type == ModelTurnEventType.MESSAGE_END and model_event.result is not None:
-                            model_turn = model_event.result
+                    async with aclosing(
+                        self.model_adapter.stream_turn(
+                            model_ids=turn_model_ids,
+                            messages=self.messages,
+                            tools=self.tools,
+                            visible_prefix=visible_content_prefix,
+                        )
+                    ) as owned_stream:
+                        async for model_event in owned_stream:
+                            if model_event.type == ModelTurnEventType.MESSAGE_DELTA and model_event.chunk is not None:
+                                stream_started = True
+                                yield AgentLoopEvent.message_update(model_event.chunk)
+                            elif model_event.type == ModelTurnEventType.MESSAGE_END and model_event.result is not None:
+                                model_turn = model_event.result
                     break
                 except ModelCallError as e:
                     if not stream_started and not context_retry_used and await self._recover_context_overflow(e):

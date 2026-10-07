@@ -1966,8 +1966,11 @@ class TestDefaultRunner:
             models=[ModelResource(model_id="model-1")],
         )
 
+        cancelled = False
+
         async def mock_stream(*args, **kwargs):
             yield MessageChunk(role="assistant", content="partial", is_final=False)
+            await asyncio.sleep(1)
             yield MessageChunk(role="assistant", content=" should-not-complete", is_final=True)
 
         fake_api.invoke_llm_stream = mock_stream
@@ -1979,8 +1982,8 @@ class TestDefaultRunner:
             return {
                 "run_id": run_id,
                 "status": "running",
-                "cancel_requested_at": 123 if run_get_checks >= 5 else None,
-                "status_reason": "user requested" if run_get_checks >= 5 else None,
+                "cancel_requested_at": 123 if cancelled else None,
+                "status_reason": "user requested" if cancelled else None,
             }
 
         fake_api.run_get = AsyncMock(side_effect=run_get)
@@ -1995,6 +1998,8 @@ class TestDefaultRunner:
         results = []
         async for result in runner.run(ctx):
             results.append(result)
+            if result.type == RunnerResultType.MESSAGE_DELTA:
+                cancelled = True
 
         assert [result.type for result in results] == [
             RunnerResultType.MESSAGE_DELTA,
@@ -2006,7 +2011,7 @@ class TestDefaultRunner:
             "retryable": False,
         }
         assert not any(result.type == RunnerResultType.RUN_COMPLETED for result in results)
-        assert fake_api.run_get.await_count >= 5
+        assert fake_api.run_get.await_count < 8
 
     @pytest.mark.asyncio
     async def test_non_streaming_cancel_before_agent_end_does_not_complete(self, runner, monkeypatch):
@@ -2028,7 +2033,7 @@ class TestDefaultRunner:
             return {
                 "run_id": run_id,
                 "status": "running",
-                "cancel_requested_at": 123 if run_get_checks >= 5 else None,
+                "cancel_requested_at": 123 if fake_api.invoke_llm_with_usage.await_count else None,
             }
 
         fake_api.run_get = AsyncMock(side_effect=run_get)
@@ -2585,7 +2590,7 @@ class TestDefaultRunner:
         deltas = [
             result.data["chunk"]["content"] for result in results if result.type == RunnerResultType.MESSAGE_DELTA
         ]
-        assert deltas == ["Hello world"]
+        assert deltas == ["Hello", "Hello world"]
         assert any(r.type == RunnerResultType.RUN_COMPLETED for r in results)
 
     @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import aclosing
 from typing import Any, AsyncGenerator
 
 from langbot_plugin.api.definition.components.runner.runner import Runner
@@ -70,25 +71,44 @@ class RunInterruptChecker:
         self.ctx = ctx
         self.interval_seconds = max(0.1, interval_seconds)
         self._next_check_at = 0.0
+        self._cancelled = asyncio.Event()
+        self._check_lock = asyncio.Lock()
+        self._watcher: asyncio.Task | None = None
         available_apis = getattr(getattr(ctx, "context", None), "available_apis", None)
         self.available = bool(getattr(available_apis, "run_get", False)) and callable(getattr(api, "run_get", None))
 
     async def is_cancelled(self, *, force: bool = False) -> bool:
+        if self._cancelled.is_set():
+            return True
         if not self.available:
             return False
+        # Hot-path checks never wait for a ledger RPC already in flight.
+        if not force:
+            return self._cancelled.is_set()
+        async with self._check_lock:
+            try:
+                run = await asyncio.wait_for(self.api.run_get(self.ctx.run_id), timeout=1.0)
+                if _run_cancel_requested(run):
+                    self._cancelled.set()
+            except Exception:
+                logger.debug("Failed to check AgentRun cancellation state", exc_info=True)
+        return self._cancelled.is_set()
 
-        now = time.monotonic()
-        if not force and now < self._next_check_at:
-            return False
-        self._next_check_at = now + self.interval_seconds
+    async def _watch(self):
+        while not self._cancelled.is_set():
+            await self.is_cancelled(force=True)
+            await asyncio.sleep(self.interval_seconds)
 
-        try:
-            run = await self.api.run_get(self.ctx.run_id)
-        except Exception:
-            logger.debug("Failed to check AgentRun cancellation state", exc_info=True)
-            return False
+    async def __aenter__(self):
+        if self.available:
+            self._watcher = asyncio.create_task(self._watch())
+        return self
 
-        return _run_cancel_requested(run)
+    async def __aexit__(self, *args):
+        if self._watcher is not None:
+            self._watcher.cancel()
+            await asyncio.gather(self._watcher, return_exceptions=True)
+            self._watcher = None
 
     async def wait_for(self, awaitable: Any, *, deadline: RunDeadline | None = None) -> Any:
         """Wait for an awaitable while polling Host cancellation and run timeout."""
@@ -96,39 +116,25 @@ class RunInterruptChecker:
             return await awaitable
 
         task = asyncio.ensure_future(awaitable)
+        cancellation = asyncio.create_task(self._cancelled.wait())
+        temporary_watcher = asyncio.create_task(self._watch()) if self.available and self._watcher is None else None
         try:
-            while True:
-                if self.available and await self.is_cancelled(force=True):
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                    raise RunCancelledError(CANCELLED_ERROR)
-
-                wait_seconds = self.interval_seconds
-                if deadline is not None:
-                    remaining = deadline.remaining()
-                    if remaining <= 0:
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                        raise asyncio.TimeoutError(TIMEOUT_ERROR)
-                    wait_seconds = min(wait_seconds, remaining)
-
-                try:
-                    return await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
-                except asyncio.TimeoutError:
-                    # wait_for also propagates TimeoutError raised by the operation.
-                    # Only a still-pending task indicates a polling timeout.
-                    if task.done():
-                        return task.result()
-                    if deadline is not None and deadline.remaining() <= 0:
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                        raise asyncio.TimeoutError(TIMEOUT_ERROR)
-                    continue
-        except BaseException:
+            await asyncio.wait(
+                {task, cancellation},
+                timeout=deadline.remaining() if deadline else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self._cancelled.is_set():
+                raise RunCancelledError(CANCELLED_ERROR)
             if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            raise
+                raise asyncio.TimeoutError(TIMEOUT_ERROR)
+            return task.result()
+        finally:
+            pending = [task, cancellation] + ([temporary_watcher] if temporary_watcher else [])
+            for future in pending:
+                if not future.done():
+                    future.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 class RunUsageTracker:
@@ -166,6 +172,14 @@ class DefaultRunner(Runner):
     """
 
     async def run(self, ctx: RunnerContext) -> AsyncGenerator[RunnerResult, None]:
+        async with RunInterruptChecker(self.get_run_api(ctx), ctx) as interrupt_checker:
+            async with aclosing(self._run_controlled(ctx, interrupt_checker)) as results:
+                async for result in results:
+                    yield result
+
+    async def _run_controlled(
+        self, ctx: RunnerContext, interrupt_checker: RunInterruptChecker
+    ) -> AsyncGenerator[RunnerResult, None]:
         """Run the agent with full LLM capabilities.
 
         Implementation:
@@ -177,7 +191,6 @@ class DefaultRunner(Runner):
         6. Yield RunnerResult events
         """
         api = self.get_run_api(ctx)
-        interrupt_checker = RunInterruptChecker(api, ctx)
         config = ctx.config if isinstance(ctx.config, dict) else {}
         timeout_seconds = get_run_timeout_seconds(config)
         deadline = RunDeadline(timeout_seconds) if timeout_seconds is not None else None
@@ -241,12 +254,13 @@ class DefaultRunner(Runner):
                 usage_tracker=usage_tracker,
                 reasoning_levels=model_reasoning_levels(config),
             )
-            async for result in _iterate_with_run_controls(results, interrupt_checker, deadline):
-                if box.binding is not None and getattr(result.type, "value", result.type) == "message.completed":
-                    result.data["file_ids"] = await interrupt_checker.wait_for(box.finish(), deadline=deadline)
-                yield result
-                if _is_terminal_result(result):
-                    return
+            async with aclosing(_iterate_with_run_controls(results, interrupt_checker, deadline)) as owned_stream:
+                async for result in owned_stream:
+                    if box.binding is not None and getattr(result.type, "value", result.type) == "message.completed":
+                        result.data["file_ids"] = await interrupt_checker.wait_for(box.finish(), deadline=deadline)
+                    yield result
+                    if _is_terminal_result(result):
+                        return
         except RunCancelledError:
             yield _cancelled_result(ctx.run_id, usage=usage_tracker.current())
         except asyncio.TimeoutError:
@@ -286,29 +300,14 @@ class DefaultRunner(Runner):
 
         final_message: Message | None = None
         terminal_usage: dict[str, Any] | None = None
-        async for event in loop.run():
-            if event.usage is not None:
-                terminal_usage = event.usage
-                if usage_tracker is not None:
-                    usage_tracker.update(event.usage)
+        async with aclosing(loop.run()) as owned_stream:
+            async for event in owned_stream:
+                if event.usage is not None:
+                    terminal_usage = event.usage
+                    if usage_tracker is not None:
+                        usage_tracker.update(event.usage)
 
-            if interrupt_checker is not None and await interrupt_checker.is_cancelled():
-                yield RunnerResult.run_failed(
-                    run_id,
-                    error=CANCELLED_ERROR,
-                    code=CANCELLED_CODE,
-                    retryable=False,
-                    usage=terminal_usage,
-                )
-                return
-
-            result = self._loop_event_to_result(run_id, event, streaming=assembly.streaming)
-            if result is not None:
-                yield result
-                if getattr(result.type, "value", result.type) == "run.failed":
-                    return
-
-                if interrupt_checker is not None and await interrupt_checker.is_cancelled(force=True):
+                if interrupt_checker is not None and await interrupt_checker.is_cancelled():
                     yield RunnerResult.run_failed(
                         run_id,
                         error=CANCELLED_ERROR,
@@ -318,31 +317,47 @@ class DefaultRunner(Runner):
                     )
                     return
 
-            if (
-                event.type == AgentLoopEventType.MESSAGE_END
-                and event.message is not None
-                and event.message.role == "assistant"
-                and not event.message.tool_calls
-            ):
-                final_message = event.message
+                result = self._loop_event_to_result(run_id, event, streaming=assembly.streaming)
+                if result is not None:
+                    yield result
+                    if getattr(result.type, "value", result.type) == "run.failed":
+                        return
 
-            if event.type == AgentLoopEventType.AGENT_END:
-                if interrupt_checker is not None and await interrupt_checker.is_cancelled(force=True):
-                    yield RunnerResult.run_failed(
+                    if interrupt_checker is not None and await interrupt_checker.is_cancelled():
+                        yield RunnerResult.run_failed(
+                            run_id,
+                            error=CANCELLED_ERROR,
+                            code=CANCELLED_CODE,
+                            retryable=False,
+                            usage=terminal_usage,
+                        )
+                        return
+
+                if (
+                    event.type == AgentLoopEventType.MESSAGE_END
+                    and event.message is not None
+                    and event.message.role == "assistant"
+                    and not event.message.tool_calls
+                ):
+                    final_message = event.message
+
+                if event.type == AgentLoopEventType.AGENT_END:
+                    if interrupt_checker is not None and await interrupt_checker.is_cancelled(force=True):
+                        yield RunnerResult.run_failed(
+                            run_id,
+                            error=CANCELLED_ERROR,
+                            code=CANCELLED_CODE,
+                            retryable=False,
+                            usage=terminal_usage,
+                        )
+                        return
+                    if final_message is not None:
+                        yield RunnerResult.message_completed(run_id, final_message)
+                    yield RunnerResult.run_completed(
                         run_id,
-                        error=CANCELLED_ERROR,
-                        code=CANCELLED_CODE,
-                        retryable=False,
-                        usage=terminal_usage,
+                        finish_reason="stop",
+                        usage=event.usage or terminal_usage,
                     )
-                    return
-                if final_message is not None:
-                    yield RunnerResult.message_completed(run_id, final_message)
-                yield RunnerResult.run_completed(
-                    run_id,
-                    finish_reason="stop",
-                    usage=event.usage or terminal_usage,
-                )
 
     def _loop_event_to_result(
         self,

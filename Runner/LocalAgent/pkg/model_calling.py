@@ -7,8 +7,10 @@ import copy
 import json
 import logging
 import re
+import time
 import typing
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
@@ -301,6 +303,8 @@ class StreamingModelCaller:
         self._tool_call_position_keys: dict[str, str] = {}
         self._msg_idx = 0
         self._msg_sequence = 0
+        self._last_emit_at = 0.0
+        self._active_stream = None
         self._usage: dict[str, typing.Any] | None = None
 
     async def _next_model_chunk(self, stream: typing.AsyncIterator[typing.Any]) -> MessageChunk:
@@ -322,6 +326,18 @@ class StreamingModelCaller:
     async def stream(
         self,
     ) -> typing.AsyncGenerator[tuple[MessageChunk, bool], None]:
+        try:
+            async with aclosing(self._stream()) as output:
+                async for item in output:
+                    yield item
+        finally:
+            if self._active_stream is not None:
+                close = getattr(self._active_stream, "aclose", None)
+                if close is not None:
+                    await close()
+                self._active_stream = None
+
+    async def _stream(self) -> typing.AsyncGenerator[tuple[MessageChunk, bool], None]:
         """Stream chunks with accumulation.
 
         Fallback rules:
@@ -343,6 +359,10 @@ class StreamingModelCaller:
         for model_id in self.model_ids:
             self._provider_specific_fields = {}
             try:
+                if self._active_stream is not None:
+                    close = getattr(self._active_stream, "aclose", None)
+                    if close is not None:
+                        await close()
                 # Try to get first chunk to verify stream works
                 stream_invoke = getattr(self.api, "invoke_llm_stream_events", None)
                 if not callable(stream_invoke):
@@ -354,6 +374,7 @@ class StreamingModelCaller:
                     remove_think=self.remove_think,
                     reasoning_level=self.reasoning_levels.get(model_id, "provider_default"),
                 )
+                self._active_stream = stream
                 first_chunk = await self._next_model_chunk(stream)
                 # First chunk received - model is now committed
                 self._committed_model_id = model_id
@@ -482,8 +503,11 @@ class StreamingModelCaller:
                     if tc.function.arguments:
                         self._tool_calls_map[key]["function_arguments"] += tc.function.arguments
 
-        # Yield every 8 chunks or on final
-        if self._msg_idx % 8 == 0 or raw_chunk.is_final:
+        # Coalesce cumulative display snapshots independently of token granularity.
+        # First and final snapshots always flush, including reasoning/tool state.
+        now = time.monotonic()
+        if self._msg_sequence == 0 or now - self._last_emit_at >= 0.05 or raw_chunk.is_final:
+            self._last_emit_at = now
             self._msg_sequence += 1
 
             # Build accumulated chunk

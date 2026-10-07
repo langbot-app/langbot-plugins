@@ -111,9 +111,15 @@ class LangBotModelAdapter:
             reasoning_levels=self.reasoning_levels,
         )
 
-        async for chunk, _is_delta in caller.stream():
-            if chunk.content:
-                yield ModelTurnEvent.message_delta(_prefix_chunk_content(chunk, visible_prefix))
+        from contextlib import aclosing
+
+        last_display = None
+        async with aclosing(caller.stream()) as stream:
+            async for chunk, _is_delta in stream:
+                display = (chunk.content, (chunk.provider_specific_fields or {}).get("reasoning_content"))
+                if display != last_display and (chunk.content or display[1]):
+                    last_display = display
+                    yield ModelTurnEvent.message_delta(_prefix_chunk_content(chunk, visible_prefix))
 
         tool_calls = [ToolCallRequest.from_raw(tool_call) for tool_call in caller.get_tool_calls()]
         content = caller.get_accumulated_content()
