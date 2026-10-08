@@ -86,12 +86,22 @@ class RunInterruptChecker:
         if not force:
             return self._cancelled.is_set()
         async with self._check_lock:
+            request = asyncio.ensure_future(self.api.run_get(self.ctx.run_id))
             try:
-                run = await asyncio.wait_for(self.api.run_get(self.ctx.run_id), timeout=1.0)
+                # wait_for can swallow cancellation when the RPC completes at
+                # the same instant on Python 3.11. Keep task ownership explicit.
+                done, _ = await asyncio.wait({request}, timeout=1.0)
+                if not done:
+                    return self._cancelled.is_set()
+                run = request.result()
                 if _run_cancel_requested(run):
                     self._cancelled.set()
             except Exception:
                 logger.debug("Failed to check AgentRun cancellation state", exc_info=True)
+            finally:
+                if not request.done():
+                    request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
         return self._cancelled.is_set()
 
     async def _watch(self):
