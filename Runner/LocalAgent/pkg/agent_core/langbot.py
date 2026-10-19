@@ -38,6 +38,7 @@ from .types import (
     AgentLoopHooks,
     ModelTurnEvent,
     ModelTurnResult,
+    NonRetryableToolError,
     PreparedToolCall,
     ToolCallRequest,
     ToolExecutionOutcome,
@@ -252,6 +253,8 @@ class LangBotToolExecutor:
                 parameters=prepared.parameters,
             )
             return self.finalize(prepared, result=result, error=None)
+        except NonRetryableToolError:
+            raise
         except PermissionDeniedError as e:
             return self.finalize(prepared, result=None, error=str(e))
         except Exception as e:

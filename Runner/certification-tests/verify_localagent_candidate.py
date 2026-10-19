@@ -34,7 +34,11 @@ def sha(data):
 
 def verify_sdk():
     dist = importlib.metadata.distribution("langbot-plugin")
-    assert dist.version == "0.7.4"
+    from inspect import signature
+
+    from langbot_plugin.api.entities.builtin.runner.context import RunnerContext
+
+    assert "paths" in signature(RunnerContext.export_box_files).parameters
     checked = {}
     for entry in dist.files or []:
         if entry.hash is None:

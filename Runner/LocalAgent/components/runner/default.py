@@ -284,6 +284,7 @@ class DefaultRunner(Runner):
                 error=str(e) or "Agent run failed",
                 code="runner.error",
                 retryable=False,
+                usage=usage_tracker.current(),
             )
 
     async def _run_runner_loop(

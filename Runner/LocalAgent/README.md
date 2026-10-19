@@ -90,6 +90,14 @@ uv run --no-sync ruff check .
 
 本地联调需要使用包含 Runner Protocol v1 的 LangBot Plugin SDK。若 LangBot 固定的 PyPI 版本缺少新实体，请先安装工作区中的本地 SDK，并使用 `uv run --no-sync` 启动，避免同步过程覆盖 editable 安装。
 
+## 文件交付
+
+文件写入 sandbox 后不会自动交付。模型需要显式调用 `export_box_files(paths)`，传入要交付的绝对路径；建议把生成物放在本次 run 的 outbox 中。Core 会先完整校验所选文件，成功后登记附件并仅清理所选文件，其他文件保持不变。导出错误通过对应的工具结果返回同一上下文，重试沿用原来的工具、上下文和时间预算，没有独立的两次自动修复循环。
+
+清理警告不代表导出失败，不应因此重复交付。Core 接收后的平台发送失败会终止运行，避免重新生成或重发可能已经送达的文件。流式文字已发出时不会被撤回。
+
+此分支配合 LangBot #2641 和 SDK #180，开发与 CI 用 `uv.lock` 固定 SDK 提交 `b300830b0e5339e7989be237efa811bedf761d55`。已发布的 SDK 0.7.4/0.7.13 不包含新的路径参数；Core 和 Plugin Runtime 必须使用配套版本，插件会在旧 SDK 上明确拒绝准备文件工具。待对应 SDK 发布后，由维护者统一更新发布版本依赖。
+
 ## 当前边界
 
 - 不负责 EventGateway、事件订阅、调度器或事件广播。

@@ -1,8 +1,16 @@
 """LocalAgent's sandbox policy and explicit file preparation/delivery."""
 
+import asyncio
+import json
+import re
+from inspect import signature
 from string import Formatter
 
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement
+from langbot_plugin.api.entities.builtin.runner.context import RunnerContext
+from langbot_plugin.api.entities.builtin.runner.errors import AgentAPIException
+
+from .agent_core.types import NonRetryableToolError
 
 SANDBOX_TOOLS = frozenset({"exec", "read", "write", "edit", "glob", "grep"})
 
@@ -42,6 +50,9 @@ class LocalAgentBox:
         self.api = api
         self.binding = None
         self.file_ids = []
+        self._delivered = set()
+        self._delivery_failure = None
+        self._export_lock = asyncio.Lock()
 
     def install_tool(self, assembly):
         from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
@@ -54,7 +65,9 @@ class LocalAgentBox:
                 description=description,
                 parameters={
                     "type": "object",
-                    "properties": {"paths": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+                    "properties": {
+                        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20}
+                    },
                     "required": ["paths"],
                     "additionalProperties": False,
                 },
@@ -65,13 +78,47 @@ class LocalAgentBox:
         assembly.tool_executor.local_tools["export_box_files"] = self.export_files
 
     async def export_files(self, paths):
-        files = await self.ctx.export_box_files(paths)
-        ids = [item.id for item in files]
-        if self.ctx.delivery.automatic_reply:
-            self.file_ids = list(dict.fromkeys(self.file_ids + ids))
-        elif ids:
-            await self.ctx.reply_files(ids)
-        return {"status": "accepted", "items": [item.model_dump() for item in files]}
+        # Parallel tool calls share this run's delivery state.
+        async with self._export_lock:
+            if self._delivery_failure is not None:
+                raise self._delivery_failure
+            try:
+                files = await self.ctx.export_box_files(paths)
+            except PermissionError as exc:
+                raise NonRetryableToolError(str(exc)) from exc
+            except Exception as exc:
+                error = exc.error.model_dump() if isinstance(exc, AgentAPIException) else {}
+                # SDK 0.7.13's relay retains the versioned frame in message text.
+                frame = re.fullmatch(
+                    r"(?:(?:ActionCallError|BoxExportError|BoxValidationError): )*LANGBOT_EXPORT_V1:(\{.*\})",
+                    str(exc)[:16384],
+                    re.DOTALL,
+                )
+                if frame:
+                    try:
+                        error = json.loads(frame[1])
+                    except ValueError:
+                        pass
+                if isinstance(error, dict) and error.get("code") == "box.export.invalid_response":
+                    raise NonRetryableToolError(str(error.get("message", exc))) from exc
+                raise
+            ids = [item.id for item in files if item.id not in self._delivered]
+            if self.ctx.delivery.automatic_reply:
+                self.file_ids = list(dict.fromkeys(self.file_ids + ids))
+            elif ids:
+                try:
+                    await self.ctx.reply_files(ids)
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        self._delivery_failure = NonRetryableToolError(
+                            "Files were accepted by Core, but platform delivery failed; do not regenerate or resend them. "
+                            + str(exc)
+                        )
+                    else:
+                        self._delivery_failure = exc
+                    raise self._delivery_failure from exc
+                self._delivered.update(ids)
+            return {"status": "accepted", "items": [item.model_dump() for item in files]}
 
     def needed(self):
         tools = {t.tool_name for t in self.api.get_allowed_tools()}
@@ -82,6 +129,10 @@ class LocalAgentBox:
         )
 
     async def prepare(self):
+        if "paths" not in signature(RunnerContext.export_box_files).parameters:
+            raise RuntimeError(
+                "Explicit file export requires a matching Core and Plugin Runtime SDK; upgrade them together."
+            )
         status = await self.api.get_box_status()
         if not status.available:
             raise RuntimeError(status.reason or "Box is unavailable")

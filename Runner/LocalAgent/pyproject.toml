@@ -34,3 +34,7 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501"]
+
+# Explicit export is coordinated with Core and SDK PR #180.
+[tool.uv.sources]
+langbot-plugin = { git = "https://github.com/langbot-app/langbot-plugin-sdk.git", rev = "b300830b0e5339e7989be237efa811bedf761d55" }

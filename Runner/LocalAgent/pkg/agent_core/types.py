@@ -16,6 +16,10 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 )
 
 
+class NonRetryableToolError(RuntimeError):
+    """A tool failed after a side effect that must not be automatically repeated."""
+
+
 class AgentLoopEventType(StrEnum):
     AGENT_START = "agent_start"
     AGENT_END = "agent_end"
