@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from langbot_plugin.api.entities.builtin.runner.box import BoxFile
-from pkg.box import LocalAgentBox
+
 from pkg.agent_core.langbot import LangBotToolExecutor
 from pkg.agent_core.types import ToolCallRequest
+from pkg.box import LocalAgentBox
 
 
 @pytest.mark.asyncio
