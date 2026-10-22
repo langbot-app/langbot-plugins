@@ -33,6 +33,7 @@ DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
 DEFAULT_CONTEXT_KEEP_RECENT_TOKENS = 20_000
 DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
 RAG_CONTEXT_MAX_INPUT_FRACTION = 4
+_MAX_ASSEMBLY_TOKEN_COUNTS = 128
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
 ESTIMATED_ATTACHMENT_TOKENS = 1600
@@ -289,6 +290,42 @@ class ContextTokenCounter(typing.Protocol):
 
 class ContextTokenCounterRequiredError(RuntimeError):
     """Raised when runtime compaction cannot access Host token counting."""
+
+
+def _token_count_value_key(value: typing.Any) -> tuple:
+    """保留完整 SDK 消息值，避免反复编码大型不可变字符串。"""
+    value_type = type(value)
+    if value_type in (str, int, bool, type(None)):
+        return value_type, value
+    if value_type is float:
+        return value_type, value.hex()
+    if value_type is dict:
+        return value_type, tuple(
+            (_token_count_value_key(key), _token_count_value_key(item)) for key, item in value.items()
+        )
+    if value_type in (list, tuple):
+        return value_type, tuple(_token_count_value_key(item) for item in value)
+    raise TypeError("Unsupported token count cache value")
+
+
+class _AssemblyTokenCounter:
+    def __init__(self, counter: ContextTokenCounter):
+        self.counter = counter
+        self._counts: dict[tuple, int] = {}
+
+    async def count(self, messages: list[Message]) -> int:
+        try:
+            key = tuple(_token_count_value_key(message.model_dump()) for message in messages)
+        except (TypeError, ValueError, RecursionError):
+            return await self.counter.count(messages)
+        cached = self._counts.get(key)
+        if cached is not None:
+            return cached
+
+        tokens = await self.counter.count(messages)
+        if len(self._counts) < _MAX_ASSEMBLY_TOKEN_COUNTS:
+            self._counts[key] = tokens
+        return tokens
 
 
 @dataclass(frozen=True)
@@ -825,6 +862,29 @@ class ContextCompactor:
         rag_chunks: list[RagChunk] | None = None,
     ) -> ContextAssembly:
         self._require_token_counter()
+        worker = ContextCompactor(
+            self.budget,
+            summarizer=self.summarizer,
+            usage_anchor=self.usage_anchor,
+            token_counter=_AssemblyTokenCounter(self.token_counter),
+        )
+        return await worker._compact_async(
+            prompt_messages=prompt_messages,
+            history_messages=history_messages,
+            current_messages=current_messages,
+            rag_messages=rag_messages,
+            rag_chunks=rag_chunks,
+        )
+
+    async def _compact_async(
+        self,
+        *,
+        prompt_messages: list[Message],
+        history_messages: list[Message],
+        current_messages: list[Message],
+        rag_messages: list[Message] | None = None,
+        rag_chunks: list[RagChunk] | None = None,
+    ) -> ContextAssembly:
         prompt = sanitize_provider_messages(prompt_messages)
         prompt, prompt_summaries = _partition_summary_messages(prompt)
         history = sanitize_provider_messages(prompt_summaries + history_messages)
